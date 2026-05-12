@@ -1,0 +1,19 @@
+{
+  "name": "qbr-platform",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "postinstall": "npm --prefix frontend install",
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\" \"npm run dev:worker\"",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "python backend/dev_server.py",
+    "dev:worker": "python worker/jobs/worker_main.py",
+    "build": "npm run build:frontend && npm run check:backend",
+    "build:frontend": "npm --prefix frontend run build",
+    "check:backend": "python -m compileall backend/app",
+    "test": "npm run check:backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

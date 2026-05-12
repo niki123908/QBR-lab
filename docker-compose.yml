@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: qbr-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qbr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qbr}
+      POSTGRES_DB: ${POSTGRES_DB:-qbr}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    container_name: qbr-backend
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+    depends_on:
+      - postgres
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - storage_data:/app/storage
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: qbr-frontend
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    container_name: qbr-worker
+    depends_on:
+      - backend
+      - postgres
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+    volumes:
+      - storage_data:/app/storage
+
+volumes:
+  postgres_data:
+  storage_data:
