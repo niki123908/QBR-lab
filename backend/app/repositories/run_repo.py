@@ -245,13 +245,16 @@ def create_batch_run_enqueued(
 ) -> None:
     init_db()
     with db_session_scope() as session:
+        unique_topology_ids = list(dict.fromkeys(topology_ids))
+        if not unique_topology_ids:
+            raise ValueError("Failed.")
         existing_ids = {
             row.id
             for row in session.scalars(
-                select(Topology).where(Topology.id.in_(topology_ids), Topology.is_deleted.is_(False))
+                select(Topology).where(Topology.id.in_(unique_topology_ids), Topology.is_deleted.is_(False))
             ).all()
         }
-        if len(existing_ids) != len(set(topology_ids)):
+        if len(existing_ids) != len(unique_topology_ids):
             raise ValueError("Failed.")
         session.add(
             BatchRunGroup(

@@ -90,7 +90,7 @@ export default function DashboardSidebar({
         </div>
         <ul>
           {batches.map((batch) => {
-            const isExpanded = expandedBatchIds[batch.batch_id] ?? true;
+            const isExpanded = Boolean(expandedBatchIds[batch.batch_id]);
             return (
               <li key={batch.batch_id} className="batch-item">
                 <button

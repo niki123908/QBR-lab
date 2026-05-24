@@ -1,3 +1,4 @@
+import random as py_random
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -82,6 +83,26 @@ _GREEDY_CONFIG_SCHEMA: dict[str, Any] = {
     "required": [],
 }
 
+_RUN_CONFIG_META_KEYS = frozenset({"run_seed"})
+
+
+def allocate_unique_run_seed() -> int:
+    return py_random.randint(1, 9_999_999)
+
+
+def _resolve_run_seed_value(merged: dict[str, Any]) -> int:
+    raw = merged.get("run_seed")
+    if raw is None:
+        return allocate_unique_run_seed()
+    try:
+        seed = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Failed.") from None
+    if not (0 <= seed <= 9_999_999):
+        raise ValueError("Failed.")
+    return seed
+
+
 _GREEDY_CAPABILITIES: dict[str, bool] = {
     "has_q_table": False,
     "has_policy_trace": False,
@@ -101,7 +122,7 @@ def _resolve_qbr_config(
         preset = {}
 
     merged = {**_QBR_DEFAULT_CONFIG, **preset, **(run_config or {})}
-    allowed_keys = set(_QBR_DEFAULT_CONFIG.keys())
+    allowed_keys = set(_QBR_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
     unknown_keys = [key for key in merged.keys() if key not in allowed_keys]
     if unknown_keys:
         raise ValueError("Failed.")
@@ -186,6 +207,8 @@ def _resolve_qbr_config(
             if temperature_decay > 1.0:
                 raise ValueError("Failed.")
 
+    run_seed = _resolve_run_seed_value(merged)
+
     return {
         "episodes": episodes,
         "alpha": alpha,
@@ -204,6 +227,7 @@ def _resolve_qbr_config(
         "completion_bonus_multiplier": completion_bonus_multiplier,
         "lambda_param": lambda_param,
         "trace_threshold": trace_threshold,
+        "run_seed": run_seed,
     }
 
 
@@ -216,11 +240,12 @@ def _resolve_greedy_config(
         preset = {}
 
     merged = {**_GREEDY_DEFAULT_CONFIG, **preset, **(run_config or {})}
-    allowed_keys = set(_GREEDY_DEFAULT_CONFIG.keys())
+    allowed_keys = set(_GREEDY_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
     unknown_keys = [key for key in merged.keys() if key not in allowed_keys]
     if unknown_keys:
         raise ValueError("Failed.")
-    return {}
+    run_seed = _resolve_run_seed_value(merged)
+    return {"run_seed": run_seed}
 
 
 _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {

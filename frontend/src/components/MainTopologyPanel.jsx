@@ -4,6 +4,8 @@ import {
   FocusedTopologySection,
   TopologyGridSection
 } from "./topology-workspace/TopologyWorkspaceSections";
+import BatchResultDetailBody, { linearAxisTicks } from "./BatchResultDetailBody";
+import CompareWorkspace from "./CompareWorkspace";
 
 function buildEdges(nodes, txRange) {
   if (!nodes || nodes.length === 0) return [];
@@ -312,6 +314,11 @@ function TemperatureToolWorkspace({
   onQValueChange
 }) {
   const totalProbability = rows.reduce((sum, row) => sum + (Number(row.probability) || 0), 0);
+  const totalQValue = rows.reduce((sum, row) => sum + (Number(row.qValue) || 0), 0);
+  const totalLogit = rows.reduce(
+    (sum, row) => sum + (Number.isFinite(Number(row.logit)) ? Number(row.logit) : 0),
+    0
+  );
   return (
     <div
       className="temperature-tool-shell"
@@ -427,6 +434,14 @@ function TemperatureToolWorkspace({
                 </tr>
               ))}
             </tbody>
+            <tfoot>
+              <tr className="temperature-table-total-row">
+                <td>Total</td>
+                <td>{totalQValue.toFixed(2)}</td>
+                <td>{totalLogit.toFixed(4)}</td>
+                <td>{(totalProbability * 100).toFixed(2)}%</td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </section>
@@ -623,533 +638,6 @@ function QProfileEpochBarChart({ chart, actionAxis }) {
   );
 }
 
-function quantile(sortedValues, q) {
-  if (!sortedValues.length) return null;
-  const pos = (sortedValues.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  if (sortedValues[base + 1] !== undefined) {
-    return sortedValues[base] + rest * (sortedValues[base + 1] - sortedValues[base]);
-  }
-  return sortedValues[base];
-}
-
-function computeBoxStats(values) {
-  const nums = values.filter((item) => Number.isFinite(item)).sort((a, b) => a - b);
-  if (!nums.length) return null;
-  return {
-    min: nums[0],
-    q1: quantile(nums, 0.25),
-    median: quantile(nums, 0.5),
-    q3: quantile(nums, 0.75),
-    max: nums[nums.length - 1]
-  };
-}
-
-/** Readable numeric ticks between lo..hi for SVG axes. */
-function linearAxisTicks(lo, hi, maxTicks = 5) {
-  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return [];
-  if (hi <= lo) return [lo];
-  const span = hi - lo;
-  const rough = span / Math.max(1, maxTicks - 1);
-  const exp = Math.floor(Math.log10(rough));
-  const pow10 = 10 ** exp;
-  let inc = Math.ceil(rough / pow10) * pow10;
-  if (!Number.isFinite(inc) || inc <= 0) inc = span;
-  const ticks = [];
-  const start = Math.floor(lo / inc) * inc;
-  for (let v = start; v <= hi + inc * 0.001; v += inc) {
-    if (v >= lo - 1e-9 && v <= hi + 1e-9) {
-      const rounded = Math.abs(v) >= 100 || Number.isInteger(v) ? Math.round(v) : Math.round(v * 1000) / 1000;
-      ticks.push(rounded);
-    }
-  }
-  return ticks.length > 0 ? ticks : [lo, hi];
-}
-
-function BatchSummaryStrip({ result }) {
-  return (
-    <div className="batch-summary-strip">
-      <span>Total: {result?.total_topologies ?? 0}</span>
-      <span>Successful: {result?.successful ?? 0}</span>
-      <span>Failed: {result?.failed ?? 0}</span>
-    </div>
-  );
-}
-
-function DensityBoxplotChart({ densityGroups }) {
-  const rows = (densityGroups ?? []).filter((item) => (item.topologies ?? []).length > 0);
-  if (!rows.length) return <div className="empty-topology-state">No density data.</div>;
-
-  const width = Math.max(680, rows.length * 180);
-  const height = 300;
-  const pad = { left: 62, right: 24, top: 36, bottom: 40 };
-  const plotH = height - pad.top - pad.bottom;
-  const allValues = [];
-  rows.forEach((group) => {
-    group.topologies.forEach((topo) => {
-      [topo.last_delay, topo.best_delay, topo.lower_bound].forEach((v) => {
-        if (Number.isFinite(v)) allValues.push(v);
-      });
-    });
-  });
-  if (!allValues.length) return <div className="empty-topology-state">No delay values.</div>;
-  const minV = Math.min(...allValues);
-  const maxV = Math.max(...allValues);
-  const span = maxV - minV || 1;
-  const yOf = (v) => height - pad.bottom - ((v - minV) / span) * plotH;
-  const yTicks = linearAxisTicks(minV, maxV, 5);
-  const series = [
-    { key: "last_delay", label: "last_delay", color: "#4E79A7", offset: -26 },
-    { key: "best_delay", label: "best_delay", color: "#59A14F", offset: 0 },
-    { key: "lower_bound", label: "lower_bound", color: "#E15759", offset: 26 }
-  ];
-  const colW = (width - pad.left - pad.right) / Math.max(1, rows.length);
-
-  return (
-    <div className="batch-chart-card">
-      <h4>Block A - Density Summary (Boxplot)</h4>
-      <div className="chart-scroll">
-        <svg viewBox={`0 0 ${width} ${height}`} className="batch-chart-svg">
-          <rect x="0" y="0" width={width} height={height} fill="#fbfbff" />
-          <text
-            x={18}
-            y={pad.top + plotH / 2}
-            className="chart-axis-text chart-axis-ylabel"
-            transform={`rotate(-90 18 ${pad.top + plotH / 2})`}
-            textAnchor="middle"
-          >
-            Delay (timeslots)
-          </text>
-          {yTicks.map((tv) => {
-            const y = yOf(tv);
-            return (
-              <g key={`y-${tv}`}>
-                <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} stroke="#e8eaf5" strokeWidth="1" />
-                <text x={pad.left - 8} y={y + 4} textAnchor="end" className="chart-axis-text">
-                  {tv}
-                </text>
-              </g>
-            );
-          })}
-          {rows.map((group, idx) => {
-            const cx = pad.left + colW * idx + colW / 2;
-            const label = Number(group.node_count) > 0 ? group.node_count : "?";
-            return (
-              <g key={`${group.node_count}-${idx}`}>
-                <text x={cx} y={height - 14} textAnchor="middle" className="chart-axis-text">
-                  {label}
-                </text>
-                <title>{`density (node_count): ${label}`}</title>
-                {series.map((s) => {
-                  const stats = computeBoxStats(group.topologies.map((t) => Number(t[s.key])));
-                  if (!stats) return null;
-                  const x = cx + s.offset;
-                  const boxW = 16;
-                  return (
-                    <g key={`${group.node_count}-${s.key}-${idx}`}>
-                      <line x1={x} x2={x} y1={yOf(stats.min)} y2={yOf(stats.max)} stroke={s.color} strokeWidth="1.2" />
-                      <rect
-                        x={x - boxW / 2}
-                        y={yOf(stats.q3)}
-                        width={boxW}
-                        height={Math.max(1, yOf(stats.q1) - yOf(stats.q3))}
-                        fill={s.color}
-                        fillOpacity="0.2"
-                        stroke={s.color}
-                      />
-                      <line x1={x - boxW / 2} x2={x + boxW / 2} y1={yOf(stats.median)} y2={yOf(stats.median)} stroke={s.color} />
-                    </g>
-                  );
-                })}
-              </g>
-            );
-          })}
-        </svg>
-      </div>
-      <div className="chart-legend-row">
-        {series.map((s) => (
-          <span key={s.key} className="chart-legend-item">
-            <i style={{ background: s.color }} /> {s.label}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function densityAxisLabel(group) {
-  const n = Number(group?.node_count);
-  return Number.isFinite(n) && n > 0 ? n : "?";
-}
-
-function DensityDelayScatterChart({ group }) {
-  const points = group.topologies ?? [];
-  if (!points.length) return <div className="empty-topology-state">No topologies in this density.</div>;
-
-  const delayValues = [];
-  points.forEach((p) => [p.last_delay, p.best_delay, p.lower_bound].forEach((v) => Number.isFinite(v) && delayValues.push(v)));
-  const minD = delayValues.length ? Math.min(...delayValues) : 0;
-  const maxD = delayValues.length ? Math.max(...delayValues) : 1;
-  const spanD = maxD - minD || 1;
-  const scatterW = Math.max(680, points.length * 56);
-  const scatterH = 300;
-  const pad = { left: 64, right: 24, top: 36, bottom: 42 };
-  const plotH = scatterH - pad.top - pad.bottom;
-  const innerW = scatterW - pad.left - pad.right;
-  const slotUnit = innerW / Math.max(1, points.length);
-  const xBase = (idx) => pad.left + slotUnit * idx + slotUnit / 2;
-  const xJitter = (idx, frac) => xBase(idx) + frac * slotUnit;
-  const yOf = (v) => scatterH - pad.bottom - ((v - minD) / spanD) * plotH;
-  const yTicksDelay = linearAxisTicks(minD, maxD, 5);
-
-  return (
-    <div className="batch-chart-card batch-chart-card--nested">
-      <h5 className="batch-chart-subtitle">Delay by topology index</h5>
-      <p className="muted chart-hint">X jitter: best −0.18, last +0.18, lower bound 0 (per slot). Hover points for values.</p>
-      <div className="chart-scroll">
-        <svg viewBox={`0 0 ${scatterW} ${scatterH}`} className="batch-chart-svg">
-          <rect x="0" y="0" width={scatterW} height={scatterH} fill="#fbfbff" />
-          <text
-            x={20}
-            y={pad.top + plotH / 2}
-            className="chart-axis-text chart-axis-ylabel"
-            transform={`rotate(-90 20 ${pad.top + plotH / 2})`}
-            textAnchor="middle"
-          >
-            Delay (timeslots)
-          </text>
-          {yTicksDelay.map((tv) => {
-            const y = yOf(tv);
-            return (
-              <g key={`dly-${tv}`}>
-                <line x1={pad.left} x2={scatterW - pad.right} y1={y} y2={y} stroke="#e8eaf5" strokeWidth="1" />
-                <text x={pad.left - 8} y={y + 4} textAnchor="end" className="chart-axis-text">
-                  {tv}
-                </text>
-              </g>
-            );
-          })}
-          {points.map((p, idx) => (
-            <g key={`${p.topology_id}-${idx}`}>
-              <text x={xBase(idx)} y={scatterH - 14} textAnchor="middle" className="chart-axis-text">
-                {Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx}
-              </text>
-              {Number.isFinite(p.best_delay) ? (
-                <g>
-                  <title>{`best_delay: ${p.best_delay}`}</title>
-                  <circle cx={xJitter(idx, -0.18)} cy={yOf(p.best_delay)} r="4" fill="#59A14F" />
-                </g>
-              ) : null}
-              {Number.isFinite(p.last_delay) ? (
-                <g>
-                  <title>{`last_delay: ${p.last_delay}`}</title>
-                  <circle cx={xJitter(idx, 0.18)} cy={yOf(p.last_delay)} r="4" fill="#4E79A7" />
-                </g>
-              ) : null}
-              {Number.isFinite(p.lower_bound) ? (
-                <g>
-                  <title>{`lower_bound: ${p.lower_bound}`}</title>
-                  <circle cx={xJitter(idx, 0)} cy={yOf(p.lower_bound)} r="4" fill="#E15759" />
-                </g>
-              ) : null}
-            </g>
-          ))}
-        </svg>
-      </div>
-      <div className="chart-legend-row">
-        <span className="chart-legend-item">
-          <i style={{ background: "#4E79A7" }} /> last_delay
-        </span>
-        <span className="chart-legend-item">
-          <i style={{ background: "#59A14F" }} /> best_delay
-        </span>
-        <span className="chart-legend-item">
-          <i style={{ background: "#E15759" }} /> lower_bound
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function DensityPathMetricChart({ group, runLabel, bestDelayOverlayOpacity = 1 }) {
-  const points = group.topologies ?? [];
-  if (!points.length) return <div className="empty-topology-state">No topologies in this density.</div>;
-
-  const pathW = Math.max(680, points.length * 56);
-  const pathH = 280;
-  const pathPad = { left: 52, right: 52, top: 22, bottom: 42 };
-  const pathInnerW = pathW - pathPad.left - pathPad.right;
-  const pathPlotH = pathH - pathPad.top - pathPad.bottom;
-  const pathSlotUnit = pathInnerW / Math.max(1, points.length);
-  const pathX = (idx) => pathPad.left + pathSlotUnit * idx + pathSlotUnit / 2;
-
-  // Normalize the Y-axis for consistency across densities/runs.
-  const axisMax = 1000;
-  const clampAxis = (v) => {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return 0;
-    return Math.max(0, Math.min(axisMax, n));
-  };
-  const yBar = (v) => pathH - pathPad.bottom - (clampAxis(v) / axisMax) * pathPlotH;
-  const hasPathArtifactData = points.some((p) => Number.isFinite(p.unique_path_count));
-  const svgRef = useRef(null);
-  const densityLabel = densityAxisLabel(group);
-  const safeRunLabel = String(runLabel ?? "run")
-    .trim()
-    .replace(/[\\/:*?"<>|]/g, "-")
-    .replace(/\s+/g, " ");
-  const downloadPathMetricsCsv = () => {
-    const lines = [
-      "topology_index,topology_id,unique_path_count,best_delay_unique_path_count",
-      ...points.map(
-        (p, idx) =>
-          `${Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx},${String(p.topology_id ?? "")},${String(p.unique_path_count ?? "")},${String(
-            p.best_delay_unique_path_count ?? ""
-          )}`
-      )
-    ].join("\n");
-    const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `path_metrics_density_${String(group?.density_key ?? "all")}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const downloadPathMetricsJpg = () => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return;
-    const viewBox = svgEl.getAttribute("viewBox") || "";
-    const parts = viewBox.split(/[ ,]+/).map((x) => Number(x)).filter((n) => Number.isFinite(n));
-    const vbW = parts.length >= 3 ? parts[2] : 800;
-    const vbH = parts.length >= 3 ? parts[3] : 280;
-
-    const serializer = new XMLSerializer();
-    let source = serializer.serializeToString(svgEl);
-    if (!source.match(/xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)) {
-      source = source.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
-    }
-
-    const svgBlob = new Blob([source], { type: "image/svg+xml;charset=utf-8" });
-    const url = URL.createObjectURL(svgBlob);
-
-    const img = new Image();
-    img.onload = () => {
-      try {
-        const scale = 2; // improve readability
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.floor(vbW * scale));
-        canvas.height = Math.max(1, Math.floor(vbH * scale));
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-        canvas.toBlob(
-          (blob) => {
-            if (!blob) return;
-            const jpgUrl = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = jpgUrl;
-            link.download = `${safeRunLabel} ${String(densityLabel)}.jpg`;
-            link.click();
-            URL.revokeObjectURL(jpgUrl);
-          },
-          "image/jpeg",
-          0.95
-        );
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
-  };
-
-  return (
-    <div className="batch-chart-card batch-chart-card--nested">
-      <div className="qtable-header">
-        <h5 className="batch-chart-subtitle">Path metrics</h5>
-        <div className="qtable-actions">
-          <button type="button" className="qtable-sort-btn" title="Download path metrics CSV" onClick={downloadPathMetricsCsv}>
-            CSV
-          </button>
-          <button type="button" className="qtable-sort-btn" title="Download path metrics JPG" onClick={downloadPathMetricsJpg}>
-            JPG
-          </button>
-        </div>
-      </div>
-      {!hasPathArtifactData ? (
-        <p className="muted chart-hint">
-          No path CSV data (need <code>path_signatures</code> + <code>delay_per_episode</code>). Enable <strong>Path signature</strong> for
-          batch runs or full artifacts.
-        </p>
-      ) : null}
-      <div className="chart-scroll">
-        <svg ref={svgRef} viewBox={`0 0 ${pathW} ${pathH}`} className="batch-chart-svg batch-chart-svg--dual">
-          <rect x="0" y="0" width={pathW} height={pathH} fill="#fbfbff" />
-          <text x="8" y={pathPad.top + 4} className="chart-axis-text" dominantBaseline="hanging">
-            path count
-          </text>
-          {[0, 200, 400, 600, 800, 1000].map((vb) => {
-            const y = yBar(vb);
-            return (
-              <g key={`bar-tick-${vb}`}>
-                <line x1={pathPad.left - 4} x2={pathW - pathPad.right} y1={y} y2={y} stroke="#e8eaf5" strokeWidth="1" />
-                <text x={pathPad.left - 8} y={y + 3} textAnchor="end" className="chart-axis-text">
-                  {vb}
-                </text>
-              </g>
-            );
-          })}
-          {points.map((p, idx) => {
-            const x = pathX(idx);
-            const rawPath = Number.isFinite(p.unique_path_count) ? p.unique_path_count : 0;
-            const rawBest = Number.isFinite(p.best_delay_unique_path_count) ? p.best_delay_unique_path_count : 0;
-            const vPath = clampAxis(rawPath);
-            const vBest = clampAxis(rawBest);
-            const bestTop = yBar(vBest);
-            const slotW = Math.max(12, pathSlotUnit * 0.7);
-            const barW = Math.max(10, slotW * 0.38);
-            const barX = x - barW / 2;
-            const pathTop = yBar(vPath);
-            const pathHeight = Math.max(1, pathH - pathPad.bottom - pathTop);
-            const bestHeight = Math.max(1, pathH - pathPad.bottom - bestTop);
-            return (
-              <g key={`${p.topology_id}-path-${idx}`}>
-                <text x={x} y={pathH - 14} textAnchor="middle" className="chart-axis-text">
-                  {Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx}
-                </text>
-                <g>
-                  <title>{`path count: ${p.unique_path_count ?? "—"}`}</title>
-                  <rect
-                    x={barX}
-                    y={pathTop}
-                    width={barW}
-                    height={pathHeight}
-                    fill="#4E79A7"
-                    opacity="0.5"
-                  />
-                </g>
-                <g>
-                  <title>{`best delay unique path count: ${p.best_delay_unique_path_count ?? "—"}`}</title>
-                  {vBest > 0 ? (
-                    <rect
-                      x={barX}
-                      y={bestTop}
-                      width={barW}
-                      height={bestHeight}
-                      fill="#E15759"
-                      opacity={Math.max(0, Math.min(1, Number(bestDelayOverlayOpacity) || 0))}
-                    />
-                  ) : null}
-                </g>
-              </g>
-            );
-          })}
-        </svg>
-      </div>
-      <div className="chart-legend-row">
-        <span className="chart-legend-item">
-          <i style={{ background: "#4E79A7" }} /> path count
-        </span>
-        <span className="chart-legend-item">
-          <i style={{ background: "#E15759" }} /> best delay unique path count
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function MiniDelayPerEpisodeChart({ point }) {
-  const series = Array.isArray(point?.delay_per_episode) ? point.delay_per_episode.filter((v) => Number.isFinite(Number(v))).map(Number) : [];
-  if (!series.length) return null;
-  const highlightStableBest =
-    Number.isFinite(Number(point?.last_delay)) &&
-    Number.isFinite(Number(point?.best_delay)) &&
-    Number(point.last_delay) === Number(point.best_delay);
-  const width = 220;
-  const height = 108;
-  const padL = 16;
-  const padR = 10;
-  const padT = 10;
-  const padB = 18;
-  const plotW = width - padL - padR;
-  const plotH = height - padT - padB;
-  const min = Math.min(...series);
-  const max = Math.max(...series);
-  const span = max - min || 1;
-  const points = series
-    .map((value, index) => {
-      const x = padL + (index / Math.max(1, series.length - 1)) * plotW;
-      const y = padT + plotH - ((value - min) / span) * plotH;
-      return `${x},${y}`;
-    })
-    .join(" ");
-
-  return (
-    <div
-      className={`mini-delay-chart-card ${highlightStableBest ? "stable-best" : ""}`}
-      title={point.topology_name}
-    >
-      <div className="mini-delay-chart-header">
-        <span className="mini-delay-chart-title">{point.topology_name}</span>
-        <span className="mini-delay-chart-meta">{series.length} ep</span>
-      </div>
-      <svg viewBox={`0 0 ${width} ${height}`} className="mini-delay-chart-svg">
-        <rect x="0" y="0" width={width} height={height} fill="#fbfbff" />
-        <polyline points={points} fill="none" stroke="#7e6df2" strokeWidth="2" />
-      </svg>
-      <div className="mini-delay-chart-footer">
-        <span>{min}</span>
-        <span>{max}</span>
-      </div>
-    </div>
-  );
-}
-
-function DensityDelayPerEpisodeGrid({ group }) {
-  const points = (group.topologies ?? []).filter((point) => Array.isArray(point.delay_per_episode) && point.delay_per_episode.length > 0);
-  if (!points.length) return null;
-  return (
-    <div className="batch-chart-card batch-chart-card--nested">
-      <div className="qtable-header">
-        <h5 className="batch-chart-subtitle">Delay per episode</h5>
-      </div>
-      <div className="mini-delay-chart-grid">
-        {points.map((point) => (
-          <MiniDelayPerEpisodeChart key={`${point.topology_id}-delay-mini`} point={point} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function BatchDensityBlockCard({ group, artifactFilter, runLabel, bestDelayOverlayOpacity }) {
-  const showDelay = artifactFilter === "all" || artifactFilter === "delay";
-  const showPath = artifactFilter === "all" || artifactFilter === "path";
-  const dLabel = densityAxisLabel(group);
-
-  return (
-    <div className="batch-density-block-card">
-      <h4 className="batch-density-block-title">
-        Density <span className="batch-density-num">{dLabel}</span> nodes
-      </h4>
-      {showDelay ? <DensityDelayScatterChart group={group} /> : null}
-      {showPath ? (
-        <>
-          <DensityPathMetricChart group={group} runLabel={runLabel} bestDelayOverlayOpacity={bestDelayOverlayOpacity} />
-          <DensityDelayPerEpisodeGrid group={group} />
-        </>
-      ) : null}
-    </div>
-  );
-}
 
 function TopologyGraph({
   graph,
@@ -1376,7 +864,15 @@ function TopologyGraph({
   );
 }
 
-function TopologyCard({ topo, selected, onSelect, graph, selectionControl = null }) {
+function TopologyCard({
+  topo,
+  selected,
+  onSelect,
+  graph,
+  selectionControl = null,
+  previewMaxNodes = 80,
+  previewShowEdges = true
+}) {
   const skipGridVisual = topo.node_count >= 500;
   return (
     <button
@@ -1395,8 +891,8 @@ function TopologyCard({ topo, selected, onSelect, graph, selectionControl = null
             graph={graph}
             className="thumb-graph"
             showLabels={false}
-            renderEdges={false}
-            maxNodes={80}
+            renderEdges={previewShowEdges}
+            maxNodes={previewMaxNodes}
           />
         )}
       </div>
@@ -1541,6 +1037,12 @@ export default function MainTopologyPanel({
   resultsSingleRunBatches,
   runMultiForm,
   setRunMultiForm,
+  runMultiSubMode = "multi",
+  setRunMultiSubMode,
+  repeatTopologyId = "",
+  setRepeatTopologyId,
+  repeatRunCount = 5,
+  setRepeatRunCount,
   runBatchTopologies,
   runHistoryItems,
   latestCompletedRun,
@@ -1596,6 +1098,7 @@ export default function MainTopologyPanel({
   onDeleteTopology,
   onOpenTopology,
   onPickTopologyForRun,
+  onRepeatTopologyPick,
   batches,
   statusFilter,
   setStatusFilter,
@@ -1604,6 +1107,8 @@ export default function MainTopologyPanel({
   nodeOptions,
   onCreateBatch,
   onDeleteBatch,
+  previewMaxNodesPercent = 80,
+  previewShowEdges = true,
   onRenameBatch,
   generateMode,
   setGenerateMode,
@@ -1619,7 +1124,10 @@ export default function MainTopologyPanel({
   setSelectedBatchId,
   generateBatches,
   generateSelectedBatch,
-  onToggleBatchLock
+  onToggleBatchLock,
+  apiBase,
+  singleRunTopologyIds,
+  topologyNameById
 }) {
   const BATCH_RESULT_ALIAS_STORAGE_KEY = "qbr_batch_result_alias_map_v1";
   const RUN_TOPO_PRESET_STORAGE_KEY = "qbr_run_topo_presets_v1";
@@ -1629,6 +1137,7 @@ export default function MainTopologyPanel({
   const runTopoViewMode = activeMenu === "run_topo";
   const runMultiViewMode = activeMenu === "run_multi";
   const resultsView = activeMenu === "results";
+  const compareViewMode = activeMenu === "compare";
   const [batchPickerOpen, setBatchPickerOpen] = useState(false);
   const [runPickerOpen, setRunPickerOpen] = useState(false);
   const [generateBatchModalOpen, setGenerateBatchModalOpen] = useState(false);
@@ -1949,6 +1458,56 @@ export default function MainTopologyPanel({
     }));
   }
 
+  const isRunMultiRepeatMode = runMultiSubMode === "repeat";
+
+  function switchRunMultiSubMode(nextMode) {
+    if (!setRunMultiSubMode) return;
+    setRunMultiSubMode(nextMode);
+    setRunMultiForm((prev) => ({
+      ...prev,
+      batch_selected: false,
+      selected_topology_ids: []
+    }));
+    if (setRepeatTopologyId) setRepeatTopologyId("");
+    setFocusedTopologyId(null);
+    setSelectedTopology(null);
+  }
+
+  function openRunMultiBatch(batchId) {
+    const pickedBatch = (runBatchTopologies ?? []).find((item) => item.batch_id === batchId) ?? null;
+    if (isRunMultiRepeatMode) {
+      setRunMultiForm((prev) => ({
+        ...prev,
+        batch_id: batchId,
+        batch_selected: false,
+        selected_topology_ids: []
+      }));
+      if (setRepeatTopologyId) setRepeatTopologyId("");
+    } else {
+      const allTopologyIds = (pickedBatch?.topologies ?? []).map((topo) => topo.topology_id);
+      setRunMultiForm((prev) => ({
+        ...prev,
+        batch_id: batchId,
+        batch_selected: true,
+        selected_topology_ids: allTopologyIds
+      }));
+    }
+    setFocusedTopologyId(null);
+    setSelectedTopology(null);
+  }
+
+  function clearRunMultiBatchSelection() {
+    setRunMultiForm((prev) => ({
+      ...prev,
+      batch_id: "",
+      batch_selected: false,
+      selected_topology_ids: []
+    }));
+    if (setRepeatTopologyId) setRepeatTopologyId("");
+    setFocusedTopologyId(null);
+    setSelectedTopology(null);
+  }
+
   const handleRunMultiVisibleTopologiesChange = useCallback(
     (visibleTopologies) => {
       const visibleIds = visibleTopologies.map((topo) => topo.topology_id).sort();
@@ -1969,7 +1528,7 @@ export default function MainTopologyPanel({
   );
 
   return (
-    <section className="main-panel-shell">
+    <section className={`main-panel-shell${compareViewMode ? " main-panel-shell--compare" : ""}`}>
       <header className="main-panel-header">
         <div>
           <h1>Main Panel 1</h1>
@@ -1997,13 +1556,7 @@ export default function MainTopologyPanel({
               Back to topologies
             </button>
           ) : runMultiViewMode && runMultiForm.batch_id ? (
-            <button
-              type="button"
-              className="back-to-grid-btn"
-              onClick={() =>
-                setRunMultiForm((prev) => ({ ...prev, batch_id: "", batch_selected: false, selected_topology_ids: [] }))
-              }
-            >
+            <button type="button" className="back-to-grid-btn" onClick={clearRunMultiBatchSelection}>
               Back to batches
             </button>
           ) : resultsView && focusedTopologyId ? (
@@ -2320,20 +1873,8 @@ export default function MainTopologyPanel({
                   </>
                 ) : null}
                 <label className="field-label">
-                  Seed
-                  <div className="seed-toggle-row">
-                    <input
-                      type="checkbox"
-                      checked={multiGenerateForm.use_seed}
-                      onChange={(e) => updateMultiGenerateField("use_seed", e.target.checked)}
-                    />
-                    <input
-                      type="number"
-                      disabled={!multiGenerateForm.use_seed}
-                      value={multiGenerateForm.seed}
-                      onChange={(e) => updateMultiGenerateField("seed", Number(e.target.value))}
-                    />
-                  </div>
+                  Seed policy
+                  <small className="muted">Multi-generate uses unique random seed per topology.</small>
                 </label>
                 <label className="field-label">
                   Max retry
@@ -2401,6 +1942,22 @@ export default function MainTopologyPanel({
         </>
       ) : runMultiViewMode ? (
         <section className="generate-workspace">
+          <div className="generate-mode-toggle run-multi-submode-toggle">
+            <button
+              type="button"
+              className={!isRunMultiRepeatMode ? "active" : ""}
+              onClick={() => switchRunMultiSubMode("multi")}
+            >
+              Multi topologies
+            </button>
+            <button
+              type="button"
+              className={isRunMultiRepeatMode ? "active" : ""}
+              onClick={() => switchRunMultiSubMode("repeat")}
+            >
+              Repeat 1 topology
+            </button>
+          </div>
           <div className="generate-form-wrap">
             {focusedTopologyId ? (
               <FocusedTopologySection
@@ -2421,23 +1978,7 @@ export default function MainTopologyPanel({
               <BatchGridSection
                 batches={runBatchTopologies}
                 renderBatchCard={(batch) => (
-                  <BatchCard
-                    key={batch.batch_id}
-                    batch={batch}
-                    onOpen={(batchId) => {
-                      const pickedBatch =
-                        (runBatchTopologies ?? []).find((item) => item.batch_id === batchId) ?? null;
-                      const allTopologyIds = (pickedBatch?.topologies ?? []).map((topo) => topo.topology_id);
-                      setRunMultiForm((prev) => ({
-                        ...prev,
-                        batch_id: batchId,
-                        batch_selected: true,
-                        selected_topology_ids: allTopologyIds
-                      }));
-                      setFocusedTopologyId(null);
-                      setSelectedTopology(null);
-                    }}
-                  />
+                  <BatchCard key={batch.batch_id} batch={batch} onOpen={openRunMultiBatch} />
                 )}
               />
             ) : null}
@@ -2447,44 +1988,45 @@ export default function MainTopologyPanel({
                 title={runMultiSelectedBatch?.batch_name ?? "Batch"}
                 headerRight={
                   <div className="batch-top-actions">
-                    <button type="button" className="secondary-cta" onClick={toggleRunMultiBatchSelection}>
-                      {runMultiForm.batch_selected ? "✓ Batch selected" : "○ Select batch"}
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary-cta"
-                      onClick={() =>
-                        setRunMultiForm((prev) => ({
-                          ...prev,
-                          batch_id: "",
-                          batch_selected: false,
-                          selected_topology_ids: []
-                        }))
-                      }
-                    >
+                    {!isRunMultiRepeatMode ? (
+                      <button type="button" className="secondary-cta" onClick={toggleRunMultiBatchSelection}>
+                        {runMultiForm.batch_selected ? "✓ Batch selected" : "○ Select batch"}
+                      </button>
+                    ) : null}
+                    <button type="button" className="secondary-cta" onClick={clearRunMultiBatchSelection}>
                       Change batch
                     </button>
                   </div>
                 }
               topologies={runMultiTopologies}
               emptyMessage="No topology available in this batch."
-              onVisibleTopologiesChange={handleRunMultiVisibleTopologiesChange}
+              onVisibleTopologiesChange={isRunMultiRepeatMode ? undefined : handleRunMultiVisibleTopologiesChange}
                 renderTopologyCard={(topo) => (
                   <TopologyCard
                     key={topo.topology_id}
                     topo={topo}
-                    selected={selectedTopology?.topology_id === topo.topology_id}
+                    selected={
+                      isRunMultiRepeatMode
+                        ? repeatTopologyId === topo.topology_id
+                        : selectedTopology?.topology_id === topo.topology_id
+                    }
                     graph={graphByTopologyId[topo.topology_id]}
-                    onSelect={() => onPickTopologyForRun(topo)}
+                    onSelect={
+                      isRunMultiRepeatMode
+                        ? () => (onRepeatTopologyPick ? onRepeatTopologyPick(topo) : onPickTopologyForRun(topo))
+                        : () => onPickTopologyForRun(topo)
+                    }
                     selectionControl={
-                      <label className="topology-card-checkbox" onClick={(event) => event.stopPropagation()}>
-                        <input
-                          type="checkbox"
-                          checked={(runMultiForm.selected_topology_ids ?? []).includes(topo.topology_id)}
-                          onChange={() => toggleRunMultiTopology(topo.topology_id)}
-                        />
-                        Selected
-                      </label>
+                      isRunMultiRepeatMode ? null : (
+                        <label className="topology-card-checkbox" onClick={(event) => event.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={(runMultiForm.selected_topology_ids ?? []).includes(topo.topology_id)}
+                            onChange={() => toggleRunMultiTopology(topo.topology_id)}
+                          />
+                          Selected
+                        </label>
+                      )
                     }
                   />
                 )}
@@ -2492,10 +2034,27 @@ export default function MainTopologyPanel({
             ) : null}
 
             <div className="generate-inline-form">
-              <label className="field-label">
-                Selected topologies
-                <input type="text" value={(runMultiForm.selected_topology_ids ?? []).length} disabled />
-              </label>
+              {isRunMultiRepeatMode ? (
+                <>
+                  <label className="field-label">
+                    Selected topology
+                    <input
+                      type="text"
+                      value={selectedTopology?.topology_name ?? (repeatTopologyId ? "1 selected" : "None")}
+                      disabled
+                    />
+                  </label>
+                  <label className="field-label">
+                    Runs (set in Run panel)
+                    <input type="text" value={Math.max(1, Math.min(100, Math.trunc(Number(repeatRunCount) || 0)))} disabled />
+                  </label>
+                </>
+              ) : (
+                <label className="field-label">
+                  Selected topologies
+                  <input type="text" value={(runMultiForm.selected_topology_ids ?? []).length} disabled />
+                </label>
+              )}
             </div>
           </div>
         </section>
@@ -2571,38 +2130,12 @@ export default function MainTopologyPanel({
                     ) : null}
                   </div>
                 ) : null}
-                <BatchSummaryStrip result={focusedBatchRunResult} />
-                <DensityBoxplotChart densityGroups={focusedBatchRunResult.density_groups} />
-                <div className="results-graph-controls batch-artifact-filter-row">
-                  <span className="field-label-span">Charts to show per density:</span>
-                  <div className="segmented-toggle segmented-toggle--dense">
-                    {[
-                      { k: "all", label: "All" },
-                      { k: "delay", label: "Delay only" },
-                      { k: "path", label: "Path metrics only" }
-                    ].map(({ k, label }) => (
-                      <button
-                        key={k}
-                        type="button"
-                        className={`segment-btn ${batchArtifactFilter === k ? "active" : ""}`}
-                        onClick={() => setBatchArtifactFilter(k)}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="batch-density-blocks">
-                  {(focusedBatchRunResult.density_groups ?? []).map((grp, idx) => (
-                    <BatchDensityBlockCard
-                      key={`${String(grp.node_count)}-${idx}`}
-                      group={grp}
-                      artifactFilter={batchArtifactFilter}
-                      runLabel={focusedBatchRunResult?.result_label}
-                      bestDelayOverlayOpacity={bestDelayOverlayOpacity}
-                    />
-                  ))}
-                </div>
+                <BatchResultDetailBody
+                  result={focusedBatchRunResult}
+                  artifactFilter={batchArtifactFilter}
+                  onArtifactFilterChange={setBatchArtifactFilter}
+                  bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+                />
               </div>
             </section>
           )
@@ -3022,6 +2555,17 @@ export default function MainTopologyPanel({
           ) : null}
         </>
         )
+      ) : compareViewMode ? (
+        <CompareWorkspace
+          apiBase={apiBase}
+          batchRunResults={batchRunResults}
+          isLoadingBatchRunResults={isLoadingBatchRunResults}
+          batchRunResultsError={batchRunResultsError}
+          onRetryBatchRunResults={onRetryBatchRunResults}
+          singleRunTopologyIds={singleRunTopologyIds}
+          topologyNameById={topologyNameById}
+          bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+        />
       ) : !topologyViewMode ? (
         <div className="hero-placeholder">
           <p>{mainTitle} is coming soon.</p>
@@ -3159,6 +2703,8 @@ export default function MainTopologyPanel({
                   selected={selectedTopology?.topology_id === topo.topology_id}
                   graph={graphByTopologyId[topo.topology_id]}
                   onSelect={onOpenTopology}
+                  previewShowEdges={previewShowEdges}
+                  previewMaxNodes={Math.max(8, Math.ceil((Number(topo?.node_count) || 0) * (Number(previewMaxNodesPercent) || 0) / 100))}
                 />
               )}
             />

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DashboardSidebar from "./components/DashboardSidebar";
 import MainTopologyPanel from "./components/MainTopologyPanel";
 import RightControlPanel from "./components/RightControlPanel";
@@ -41,14 +41,14 @@ const INITIAL_MULTI_GENERATE_FORM = {
   sink_mode: "manual",
   sink_x: 50,
   sink_y: 50,
-  use_seed: true,
-  seed: 2026,
   max_retry: 200
 };
 const INITIAL_RUN_TOPO_FORM = {
   algorithm_id: "greedy",
   preset_id: "default_v1",
-  preset_name: "default_v1"
+  preset_name: "default_v1",
+  use_run_seed: false,
+  run_seed: 2026
 };
 const INITIAL_RUN_MULTI_FORM = {
   batch_id: "",
@@ -57,11 +57,25 @@ const INITIAL_RUN_MULTI_FORM = {
   preset_id: "default_v1",
   preset_name: "default_v1",
   selected_topology_ids: [],
+  use_run_seed: false,
+  run_seed: 2026,
   artifact_flags: {
     path_signature: false,
     delay_per_episode: false
   }
 };
+
+function buildRunConfigPayload(configForm, runForm) {
+  const base = { ...(configForm ?? {}) };
+  if (runForm?.use_run_seed) {
+    const seed = Math.trunc(Number(runForm.run_seed));
+    if (!Number.isFinite(seed) || seed < 0) {
+      return { ...base, run_seed: null };
+    }
+    return { ...base, run_seed: seed };
+  }
+  return { ...base, run_seed: null };
+}
 const INITIAL_GRAPH_DISPLAY_SETTINGS = {
   node_size: 2,
   label_size: 2.4,
@@ -312,6 +326,9 @@ export default function App() {
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [runTopoForm, setRunTopoForm] = useState(INITIAL_RUN_TOPO_FORM);
   const [runMultiForm, setRunMultiForm] = useState(INITIAL_RUN_MULTI_FORM);
+  const [runMultiSubMode, setRunMultiSubMode] = useState("multi");
+  const [repeatTopologyId, setRepeatTopologyId] = useState("");
+  const [repeatRunCount, setRepeatRunCount] = useState(5);
   const [algorithmOptions, setAlgorithmOptions] = useState([]);
   const [runPresets, setRunPresets] = useState([]);
   const [runTopoWizard, setRunTopoWizard] = useState(IDLE_PRESET_WIZARD);
@@ -342,6 +359,8 @@ export default function App() {
   const [replaySlot, setReplaySlot] = useState(0);
   const [graphDisplaySettings, setGraphDisplaySettings] = useState(INITIAL_GRAPH_DISPLAY_SETTINGS);
   const [bestDelayOverlayOpacity, setBestDelayOverlayOpacity] = useState(1);
+  const [previewMaxNodesPercent, setPreviewMaxNodesPercent] = useState(80);
+  const [previewShowEdges, setPreviewShowEdges] = useState(true);
   const [playgroundState, setPlaygroundState] = useState(INITIAL_PLAYGROUND_STATE);
   const [temperatureTool, setTemperatureTool] = useState(INITIAL_TEMPERATURE_TOOL);
   const [batchRunResults, setBatchRunResults] = useState([]);
@@ -412,6 +431,10 @@ export default function App() {
   const setRunTopoConfigForm = (updater) => setSharedRunConfigForBackbone(runTopoBackbone, updater);
   const setRunMultiConfigForm = (updater) => setSharedRunConfigForBackbone(runMultiBackbone, updater);
   const singleRunTopologyIdSet = useMemo(() => new Set(singleRunTopologyIds), [singleRunTopologyIds]);
+  const topologyNameById = useCallback(
+    (topologyId) => topologies.find((item) => item.topology_id === topologyId)?.topology_name ?? null,
+    [topologies]
+  );
   const runBatchesForSingleResults = useMemo(
     () =>
       (sidebarBatches ?? [])
@@ -685,6 +708,13 @@ export default function App() {
     if (activeMenu !== "results") return;
     fetchBatchRunResults();
     fetchQueueSnapshot();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeMenu]);
+
+  useEffect(() => {
+    if (activeMenu !== "compare") return;
+    fetchBatchRunResults();
+    fetchSingleRunTopologyIds();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeMenu]);
 
@@ -1022,8 +1052,16 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...multiGenerateForm,
-          seed: multiGenerateForm.use_seed ? Number(multiGenerateForm.seed) : null,
+          node_counts: multiGenerateForm.node_counts,
+          count_per_node_count: Number(multiGenerateForm.count_per_node_count),
+          space_width: Number(multiGenerateForm.space_width),
+          space_height: Number(multiGenerateForm.space_height),
+          tx_range: Number(multiGenerateForm.tx_range),
+          sink_mode: multiGenerateForm.sink_mode,
+          sink_x: Number(multiGenerateForm.sink_x),
+          sink_y: Number(multiGenerateForm.sink_y),
+          seed: null,
+          max_retry: Number(multiGenerateForm.max_retry),
           batch_id: selectedBatchId || null
         })
       });
@@ -1539,6 +1577,13 @@ export default function App() {
     setFocusedTopologyId(topo.topology_id);
   }
 
+  function handleRepeatTopologyPick(topo) {
+    if (!maybeApproveHeavyRender(topo)) return;
+    setRepeatTopologyId(topo.topology_id);
+    setSelectedTopology(topo);
+    setFocusedTopologyId(topo.topology_id);
+  }
+
   async function handleRunSingleTopology() {
     if (!selectedTopology) {
       setMessage("Select a topology first.");
@@ -1557,7 +1602,7 @@ export default function App() {
           algorithm_id: runTopoForm.algorithm_id,
           preset_id: runTopoForm.preset_id,
           preset_name: runTopoForm.preset_name || runTopoForm.preset_id,
-          run_config: runTopoConfigForm,
+          run_config: buildRunConfigPayload(runTopoConfigForm, runTopoForm),
           draft_preset_id: draftPresetId
         })
       });
@@ -1652,11 +1697,22 @@ export default function App() {
   }, [pendingSingleRunId, lastSingleRun?.topology_id]);
 
   async function handleRunMultiTopologies() {
+    const isRepeatMode = runMultiSubMode === "repeat";
     if (!runMultiForm.batch_id) {
       setMessage("Select a batch first.");
       return;
     }
-    if (!runMultiForm.selected_topology_ids.length) {
+    if (isRepeatMode) {
+      if (!repeatTopologyId) {
+        setMessage("Select one topology to repeat.");
+        return;
+      }
+      const runCount = Math.max(1, Math.min(100, Math.trunc(Number(repeatRunCount) || 0)));
+      if (runCount < 1) {
+        setMessage("Run count must be at least 1.");
+        return;
+      }
+    } else if (!runMultiForm.selected_topology_ids.length) {
       setMessage("Select at least one topology.");
       return;
     }
@@ -1669,15 +1725,21 @@ export default function App() {
       ];
       const draftPresetId =
         runMultiWizard.phase !== "idle" && runMultiWizard.draftClientId ? runMultiWizard.draftClientId : null;
+      const topologyIds = isRepeatMode
+        ? Array.from(
+            { length: Math.max(1, Math.min(100, Math.trunc(Number(repeatRunCount) || 0))) },
+            () => repeatTopologyId
+          )
+        : runMultiForm.selected_topology_ids;
       const response = await fetch(`${API_BASE}/runs/batch`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          topology_ids: runMultiForm.selected_topology_ids,
+          topology_ids: topologyIds,
           algorithm_id: runMultiForm.algorithm_id,
           preset_id: runMultiForm.preset_id,
           preset_name: runMultiForm.preset_name || runMultiForm.preset_id,
-          run_config: runMultiConfigForm,
+          run_config: buildRunConfigPayload(runMultiConfigForm, runMultiForm),
           draft_preset_id: draftPresetId,
           save_full_artifacts_for_selected_runs: selectedArtifactTypes.length > 0,
           selected_artifact_topology_ids: [],
@@ -1854,8 +1916,10 @@ export default function App() {
     }
   }
 
+  const hideRightPanel = activeMenu === "generate" || activeMenu === "compare";
+
   return (
-    <main className={`dashboard-shell ${activeMenu === "generate" ? "generate-only-layout" : ""}`}>
+    <main className={`dashboard-shell ${hideRightPanel ? "generate-only-layout" : ""}`}>
       <DashboardSidebar
         activeMenu={activeMenu}
         setActiveMenu={setActiveMenu}
@@ -1899,6 +1963,12 @@ export default function App() {
         onToggleBatchLock={handleToggleBatchLock}
         runMultiForm={runMultiForm}
         setRunMultiForm={setRunMultiForm}
+        runMultiSubMode={runMultiSubMode}
+        setRunMultiSubMode={setRunMultiSubMode}
+        repeatTopologyId={repeatTopologyId}
+        setRepeatTopologyId={setRepeatTopologyId}
+        repeatRunCount={repeatRunCount}
+        setRepeatRunCount={setRepeatRunCount}
         runBatchTopologies={sidebarBatches}
         latestCompletedRun={latestCompletedRun}
         runSummaryPayload={runSummaryPayload}
@@ -1965,6 +2035,7 @@ export default function App() {
         onDeleteTopology={handleDeleteTopology}
         onOpenTopology={handleOpenTopology}
         onPickTopologyForRun={handleRunTopoPick}
+        onRepeatTopologyPick={handleRepeatTopologyPick}
         batches={batches}
         statusFilter={statusFilter}
         setStatusFilter={setStatusFilter}
@@ -1973,6 +2044,8 @@ export default function App() {
         nodeOptions={NODE_OPTIONS}
         onCreateBatch={handleCreateBatch}
         onDeleteBatch={handleDeleteBatch}
+        previewMaxNodesPercent={previewMaxNodesPercent}
+        previewShowEdges={previewShowEdges}
         onRenameBatch={async (batchId, name) => {
           const cleanName = name.trim();
           if (!cleanName) return false;
@@ -1997,9 +2070,12 @@ export default function App() {
             return false;
           }
         }}
+        apiBase={API_BASE}
+        singleRunTopologyIds={singleRunTopologyIds}
+        topologyNameById={topologyNameById}
       />
 
-      {activeMenu !== "generate" ? (
+      {!hideRightPanel ? (
         <RightControlPanel
           activePanel2Tab={activePanel2Tab}
           setActivePanel2Tab={setActivePanel2Tab}
@@ -2013,6 +2089,10 @@ export default function App() {
           setRunTopoForm={setRunTopoForm}
         runMultiForm={runMultiForm}
         setRunMultiForm={setRunMultiForm}
+        runMultiSubMode={runMultiSubMode}
+        repeatTopologyId={repeatTopologyId}
+        repeatRunCount={repeatRunCount}
+        setRepeatRunCount={setRepeatRunCount}
           algorithmOptions={algorithmOptions}
           selectedAlgorithmMeta={selectedAlgorithmMeta}
         runTopoConfigForm={runTopoConfigForm}
@@ -2061,6 +2141,10 @@ export default function App() {
           resetGraphDisplaySettings={resetGraphDisplaySettings}
           bestDelayOverlayOpacity={bestDelayOverlayOpacity}
           setBestDelayOverlayOpacity={setBestDelayOverlayOpacity}
+          previewMaxNodesPercent={previewMaxNodesPercent}
+          setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
+          previewShowEdges={previewShowEdges}
+          setPreviewShowEdges={setPreviewShowEdges}
           isLoadingNodes={isLoadingNodes}
           topologyNodes={topologyNodes}
           handleNodeBlur={handleNodeBlur}

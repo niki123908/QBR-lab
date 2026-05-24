@@ -29,8 +29,8 @@ flowchart TB
 | `topologies`   | Batch / topo         | 3 cột; panel phải phụ thuộc `focusedBatchId` / `focusedTopologyId` |
 | `generate`     | Sinh topology        | **2 cột** — `activeMenu === "generate"` → class `generate-only-layout`, **ẩn** `RightControlPanel` |
 | `run_topo`     | Chạy một topo        | 3 cột |
-| `run_multi`    | Chạy nhiều topo      | 3 cột |
-| `compare`      | So sánh              | 3 cột |
+| `run_multi`    | Chạy nhiều topo (sub-mode: Multi topologies / Repeat 1 topology) | 3 cột |
+| `compare`      | So sánh A/B          | **2 cột** (ẩn `RightControlPanel`, class `generate-only-layout`); `CompareWorkspace` — toggle **Batch results** / **Single topology results**, hai cột **A** và **B** chọn kết quả độc lập |
 
 Nếu thêm màn mới: cập nhật bảng này + nút trong `DashboardSidebar.jsx` + nhánh render trong `MainTopologyPanel.jsx` / `RightControlPanel.jsx` nếu cần.
 
@@ -55,5 +55,7 @@ Chỉ áp dụng khi `activeMenu === "topologies"` — logic chi tiết nằm tr
 | `frontend/src/App.jsx` | Shell, `activeMenu`, điều kiện render `RightControlPanel` |
 | `frontend/src/components/DashboardSidebar.jsx` | Menu trái + Topology Tree |
 | `frontend/src/components/MainTopologyPanel.jsx` | Nội dung giữa theo từng màn |
+| `frontend/src/components/CompareWorkspace.jsx` | Màn Compare: hai panel A/B |
+| `frontend/src/components/BatchResultDetailBody.jsx` | Charts batch result (Results + Compare) |
 | `frontend/src/components/RightControlPanel.jsx` | Tab Detail / Edit / Run config |
 | `frontend/src/styles.css` | `dashboard-shell`, `generate-only-layout` |

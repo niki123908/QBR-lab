@@ -18,6 +18,14 @@ function normalizeFieldValue(rawValue, schemaType) {
 function formatConfigLabel(fieldName) {
   if (fieldName === "export_q_table_all_epoch") return "Export q table of all epoch";
   if (fieldName === "action_axis") return "Action axis";
+  if (fieldName === "policy_type") return "Policy type";
+  if (fieldName === "lambda_param") return "Lambda (λ)";
+  if (fieldName === "trace_threshold") return "Trace threshold";
+  if (fieldName === "completion_bonus_multiplier") return "Completion bonus multiplier";
+  if (fieldName === "temperature_decay_mode") return "Temperature decay mode";
+  if (fieldName === "epsilon_start") return "Epsilon start";
+  if (fieldName === "epsilon_end") return "Epsilon end";
+  if (fieldName === "epsilon_decay") return "Epsilon decay";
   return fieldName;
 }
 
@@ -90,6 +98,108 @@ function sortPresetsAlphabetically(presets) {
 
 const POLICY_AXIS_FIELDS = new Set(["policy_type", "action_axis"]);
 
+/** Logical groups for run-config fields (order preserved within each block). */
+const CONFIG_FIELD_BLOCKS = [
+  { id: "training", title: "Training", fields: ["episodes"] },
+  { id: "rl_core", title: "RL core", fields: ["alpha", "gamma"] },
+  { id: "policy", title: "Policy & actions", fields: ["policy_type", "action_axis"] },
+  { id: "epsilon", title: "ε-greedy", fields: ["epsilon_start", "epsilon_end", "epsilon_decay"] },
+  { id: "decay", title: "Decay schedule", fields: ["temperature_decay_mode"] },
+  {
+    id: "temperature",
+    title: "Softmax temperature",
+    fields: ["temperature_start", "temperature_end", "temperature_decay"]
+  },
+  {
+    id: "reward",
+    title: "Reward & trace",
+    fields: ["completion_bonus_multiplier", "lambda_param", "trace_threshold"]
+  },
+  { id: "artifacts", title: "Artifacts", fields: ["export_q_table_all_epoch"] }
+];
+
+function groupConfigFieldNames(fieldNames) {
+  const nameSet = new Set(fieldNames);
+  const used = new Set();
+  const blocks = [];
+  CONFIG_FIELD_BLOCKS.forEach((def) => {
+    const fields = def.fields.filter((f) => nameSet.has(f));
+    if (!fields.length) return;
+    fields.forEach((f) => used.add(f));
+    blocks.push({ id: def.id, title: def.title, fields });
+  });
+  const other = fieldNames.filter((f) => !used.has(f));
+  if (other.length) {
+    blocks.push({ id: "other", title: "Other", fields: other });
+  }
+  return blocks;
+}
+
+function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigForm) {
+  const rawType = fieldSchema?.type;
+  const resolvedType = Array.isArray(rawType) ? rawType.find((t) => t !== "null") || "string" : rawType || "string";
+  const currentValue = runConfigForm?.[fieldName];
+
+  if (resolvedType === "boolean") {
+    return (
+      <label className="field-label inline-checkbox" key={fieldName}>
+        <span>{formatConfigLabel(fieldName)}</span>
+        <input
+          type="checkbox"
+          checked={Boolean(currentValue)}
+          onChange={(e) =>
+            setRunConfigForm((prev) => ({
+              ...prev,
+              [fieldName]: e.target.checked
+            }))
+          }
+        />
+      </label>
+    );
+  }
+
+  const enumOptions = Array.isArray(fieldSchema?.enum) ? fieldSchema.enum : null;
+  if (resolvedType === "string" && enumOptions && enumOptions.length > 0) {
+    return (
+      <label className="field-label" key={fieldName}>
+        {formatConfigLabel(fieldName)}
+        <select
+          value={String(currentValue ?? enumOptions[0])}
+          onChange={(e) =>
+            setRunConfigForm((prev) => ({
+              ...prev,
+              [fieldName]: e.target.value
+            }))
+          }
+        >
+          {enumOptions.map((option) => (
+            <option key={option} value={option}>
+              {formatEnumOptionLabel(fieldName, option)}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  const inputType = resolvedType === "integer" || resolvedType === "number" ? "number" : "text";
+  return (
+    <label className="field-label" key={fieldName}>
+      {formatConfigLabel(fieldName)}
+      <input
+        type={inputType}
+        value={currentValue ?? ""}
+        onChange={(e) =>
+          setRunConfigForm((prev) => ({
+            ...prev,
+            [fieldName]: normalizeFieldValue(e.target.value, resolvedType)
+          }))
+        }
+      />
+    </label>
+  );
+}
+
 function resolveBackboneId(algorithmId) {
   if (algorithmId === "qbr") return "qbr";
   if (algorithmId === "greedy") return "greedy";
@@ -121,110 +231,100 @@ function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm }) {
     if (fieldName === "temperature_start") return !(selectedPolicyType === "softmax" && temperatureStartMode === "node_count_multiplier");
     return true;
   });
-  return (
-    <div className="dynamic-config-grid">
-      {visibleEntries.map(([fieldName, fieldSchema]) => {
-        const rawType = fieldSchema?.type;
-        const resolvedType = Array.isArray(rawType)
-          ? rawType.find((t) => t !== "null") || "string"
-          : rawType || "string";
-        const currentValue = runConfigForm?.[fieldName];
-        if (resolvedType === "boolean") {
-          return (
-            <label className="field-label inline-checkbox" key={fieldName}>
-              <span>{formatConfigLabel(fieldName)}</span>
-              <input
-                type="checkbox"
-                checked={Boolean(currentValue)}
-                onChange={(e) =>
-                  setRunConfigForm((prev) => ({
-                    ...prev,
-                    [fieldName]: e.target.checked
-                  }))
-                }
-              />
-            </label>
-          );
-        }
+  const schemaByName = Object.fromEntries(visibleEntries);
+  const fieldNames = visibleEntries.map(([name]) => name);
+  const blocks = groupConfigFieldNames(fieldNames);
 
-        const enumOptions = Array.isArray(fieldSchema?.enum) ? fieldSchema.enum : null;
-        if (resolvedType === "string" && enumOptions && enumOptions.length > 0) {
-          return (
-            <label className="field-label" key={fieldName}>
-              {formatConfigLabel(fieldName)}
-              <select
-                value={String(currentValue ?? enumOptions[0])}
-                onChange={(e) =>
-                  setRunConfigForm((prev) => ({
-                    ...prev,
-                    [fieldName]: e.target.value
-                  }))
-                }
-              >
-                {enumOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {formatEnumOptionLabel(fieldName, option)}
-            </option>
-          ))}
-        </select>
-      </label>
-          );
-        }
-
-        const inputType = resolvedType === "integer" || resolvedType === "number" ? "number" : "text";
-        return (
-          <label className="field-label" key={fieldName}>
-            {formatConfigLabel(fieldName)}
+  const softmaxExtras =
+    selectedPolicyType === "softmax" ? (
+      <>
+        <label className="field-label">
+          Temperature start mode
+          <select
+            value={temperatureStartMode}
+            onChange={(e) =>
+              setRunConfigForm((prev) => ({
+                ...prev,
+                temperature_start_mode: e.target.value
+              }))
+            }
+          >
+            <option value="manual">Manual</option>
+            <option value="node_count_multiplier">By node count</option>
+          </select>
+        </label>
+        {temperatureStartMode === "node_count_multiplier" ? (
+          <label className="field-label">
+            Temperature multiplier
             <input
-              type={inputType}
-              value={currentValue ?? ""}
+              type="number"
+              step="0.001"
+              min="0.001"
+              value={runConfigForm?.temperature_start_multiplier ?? ""}
               onChange={(e) =>
                 setRunConfigForm((prev) => ({
                   ...prev,
-                  [fieldName]: normalizeFieldValue(e.target.value, resolvedType)
+                  temperature_start_multiplier: normalizeFieldValue(e.target.value, "number")
                 }))
               }
             />
-      </label>
-        );
-      })}
-      {selectedPolicyType === "softmax" ? (
-        <>
-          <label className="field-label">
-            Temperature start mode
-            <select
-              value={temperatureStartMode}
-              onChange={(e) =>
-                setRunConfigForm((prev) => ({
-                  ...prev,
-                  temperature_start_mode: e.target.value
-                }))
-              }
-            >
-              <option value="manual">Manual</option>
-              <option value="node_count_multiplier">By node count</option>
-            </select>
           </label>
-          {temperatureStartMode === "node_count_multiplier" ? (
-            <label className="field-label">
-              Temperature multiplier
-              <input
-                type="number"
-                step="0.001"
-                min="0.001"
-                value={runConfigForm?.temperature_start_multiplier ?? ""}
-                onChange={(e) =>
-                  setRunConfigForm((prev) => ({
-                    ...prev,
-                    temperature_start_multiplier: normalizeFieldValue(e.target.value, "number")
-                  }))
-                }
-              />
-            </label>
-          ) : null}
-        </>
-      ) : null}
+        ) : null}
+      </>
+    ) : null;
+
+  return (
+    <div className="dynamic-config-blocks">
+      {blocks.map((block) => (
+        <section key={block.id} className={`config-field-block config-field-block--${block.id}`}>
+          <h5 className="config-field-block__title">{block.title}</h5>
+          <div className="config-field-block__fields">
+            {block.fields.map((fieldName) =>
+              renderConfigField(fieldName, schemaByName[fieldName], runConfigForm, setRunConfigForm)
+            )}
+            {block.id === "temperature" ? softmaxExtras : null}
+          </div>
+        </section>
+      ))}
     </div>
+  );
+}
+
+function RunSeedField({ form, setForm }) {
+  return (
+    <label className="field-label">
+      Run RNG seed
+      <div className="seed-toggle-row">
+        <input
+          type="checkbox"
+          checked={Boolean(form.use_run_seed)}
+          onChange={(e) =>
+            setForm((prev) => ({
+              ...prev,
+              use_run_seed: e.target.checked
+            }))
+          }
+          title="Use a fixed seed for action randomness during training"
+        />
+        <input
+          type="number"
+          min={0}
+          max={9999999}
+          step={1}
+          disabled={!form.use_run_seed}
+          value={form.run_seed ?? 2026}
+          onChange={(e) =>
+            setForm((prev) => ({
+              ...prev,
+              run_seed: Math.max(0, Math.trunc(Number(e.target.value) || 0))
+            }))
+          }
+        />
+      </div>
+      <small className="muted">
+        {form.use_run_seed ? "Fixed seed — same config can reproduce random actions." : "Auto — server assigns a unique seed per run."}
+      </small>
+    </label>
   );
 }
 
@@ -579,6 +679,11 @@ function RunTopologyPanel({
         )
       ) : null}
 
+      <section className="config-field-block config-field-block--randomness">
+        <h5 className="config-field-block__title">Run randomness</h5>
+        <RunSeedField form={form} setForm={setForm} />
+      </section>
+
       <button className="primary-cta" disabled={isRunningSingle || !selectedTopology || runBlocked} type="submit">
         {isRunningSingle ? "Running..." : "Run now"}
       </button>
@@ -602,7 +707,12 @@ function RunMultiPanel({
   setPresetWizard,
   algorithmDefaultConfigById,
   setSharedRunConfigForBackbone,
-  runBackbone
+  runBackbone,
+  runMultiSubMode = "multi",
+  repeatTopologyId = "",
+  selectedTopology = null,
+  repeatRunCount = 5,
+  setRepeatRunCount
 }) {
   const currentBackbone = runBackbone;
   const sortedRunPresets = useMemo(() => sortPresetsAlphabetically(runPresets), [runPresets]);
@@ -800,6 +910,10 @@ function RunMultiPanel({
   const showWizardPolicy = phase === "add_policy";
   const showWizardParams = phase === "add_params";
   const runBlocked = phase === "add_backbone";
+  const isRepeatMode = runMultiSubMode === "repeat";
+  const safeRepeatRunCount = Math.max(1, Math.min(100, Math.trunc(Number(repeatRunCount) || 0)));
+  const canRunRepeat = Boolean(repeatTopologyId) && safeRepeatRunCount >= 1;
+  const canRunMulti = (form.selected_topology_ids ?? []).length > 0;
 
   return (
     <form
@@ -814,10 +928,38 @@ function RunMultiPanel({
         Selected batch
         <input type="text" value={form.batch_id || ""} disabled placeholder="Pick batch in Panel 1" />
       </label>
-      <label className="field-label">
-        Selected topologies
-        <input type="text" value={(form.selected_topology_ids ?? []).length} disabled />
-      </label>
+      {isRepeatMode ? (
+        <>
+          <label className="field-label">
+            Selected topology
+            <input
+              type="text"
+              value={selectedTopology?.topology_name ?? (repeatTopologyId ? repeatTopologyId : "")}
+              disabled
+              placeholder="Pick one topology in Panel 1"
+            />
+          </label>
+          <label className="field-label">
+            Run count
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={safeRepeatRunCount}
+              onChange={(e) => {
+                const next = Math.max(1, Math.min(100, Math.trunc(Number(e.target.value) || 1)));
+                if (setRepeatRunCount) setRepeatRunCount(next);
+              }}
+            />
+          </label>
+        </>
+      ) : (
+        <label className="field-label">
+          Selected topologies
+          <input type="text" value={(form.selected_topology_ids ?? []).length} disabled />
+        </label>
+      )}
 
       <div className="preset-zone">
         {phase !== "idle" ? (
@@ -976,12 +1118,17 @@ function RunMultiPanel({
         Path signature: lưu path CSV, delay per episode, state/transmission best epoch. Delay per episode: chỉ lưu CSV delay theo episode.
       </p>
 
+      <section className="config-field-block config-field-block--randomness">
+        <h5 className="config-field-block__title">Run randomness</h5>
+        <RunSeedField form={form} setForm={setForm} />
+      </section>
+
       <button
         className="primary-cta"
-        disabled={isRunningBatch || !(form.selected_topology_ids ?? []).length || runBlocked}
+        disabled={isRunningBatch || runBlocked || (isRepeatMode ? !canRunRepeat : !canRunMulti)}
         type="submit"
       >
-        {isRunningBatch ? "Submitting..." : "Run multi"}
+        {isRunningBatch ? "Submitting..." : isRepeatMode ? "Run repeat" : "Run multi"}
       </button>
     </form>
   );
@@ -1618,6 +1765,42 @@ function DisplaySettingsPanel({ settings, setSettings, bestDelayOverlayOpacity, 
   );
 }
 
+function TopologyGridPreviewSettingsPanel({
+  previewMaxNodesPercent,
+  setPreviewMaxNodesPercent,
+  previewShowEdges,
+  setPreviewShowEdges
+}) {
+  const safePercent = Math.max(10, Math.min(100, Number(previewMaxNodesPercent) || 80));
+  return (
+    <div className="edit-panel preview-settings-panel">
+      <div className="edit-panel-header">
+        <h4>Grid preview</h4>
+      </div>
+      <label className="field-label">
+        Max nodes (%)
+        <input
+          type="range"
+          min="10"
+          max="100"
+          step="5"
+          value={safePercent}
+          onChange={(e) => setPreviewMaxNodesPercent(Number(e.target.value))}
+        />
+        <small className="muted">{safePercent}%</small>
+      </label>
+      <label className="field-label inline-checkbox">
+        <span>Show edges in preview</span>
+        <input
+          type="checkbox"
+          checked={Boolean(previewShowEdges)}
+          onChange={(e) => setPreviewShowEdges(e.target.checked)}
+        />
+      </label>
+    </div>
+  );
+}
+
 function EditTopologyPanel({
   selectedTopology,
   isLoadingNodes,
@@ -1781,6 +1964,14 @@ export default function RightControlPanel({
   resetGraphDisplaySettings,
   bestDelayOverlayOpacity,
   setBestDelayOverlayOpacity,
+  previewMaxNodesPercent,
+  setPreviewMaxNodesPercent,
+  previewShowEdges,
+  setPreviewShowEdges,
+  runMultiSubMode,
+  repeatTopologyId,
+  repeatRunCount,
+  setRepeatRunCount,
   isLoadingNodes,
   topologyNodes,
   handleNodeBlur,
@@ -1928,11 +2119,27 @@ export default function RightControlPanel({
             <TopologiesEmptyPanel />
           ) : hasBatchOnly ? (
             topologiesTab === "edit_topo" ? (
-              <div className="placeholder-card">
-                <p className="muted">Chọn một topology trong batch để chỉnh sửa tọa độ.</p>
-              </div>
+              <>
+                <div className="placeholder-card">
+                  <p className="muted">Chọn một topology trong batch để chỉnh sửa tọa độ.</p>
+                </div>
+                <TopologyGridPreviewSettingsPanel
+                  previewMaxNodesPercent={previewMaxNodesPercent}
+                  setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
+                  previewShowEdges={previewShowEdges}
+                  setPreviewShowEdges={setPreviewShowEdges}
+                />
+              </>
             ) : (
-              <BatchDetailPanel batch={focusedBatch} />
+              <>
+                <BatchDetailPanel batch={focusedBatch} />
+                <TopologyGridPreviewSettingsPanel
+                  previewMaxNodesPercent={previewMaxNodesPercent}
+                  setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
+                  previewShowEdges={previewShowEdges}
+                  setPreviewShowEdges={setPreviewShowEdges}
+                />
+              </>
             )
           ) : topologiesTab === "edit_topo" ? (
             <EditTopologyPanel
@@ -1982,6 +2189,11 @@ export default function RightControlPanel({
                 algorithmDefaultConfigById={algorithmDefaultConfigById}
                 setSharedRunConfigForBackbone={setSharedRunConfigForBackbone}
                 runBackbone={runMultiBackbone}
+                runMultiSubMode={runMultiSubMode}
+                repeatTopologyId={repeatTopologyId}
+                selectedTopology={selectedTopology}
+                repeatRunCount={repeatRunCount}
+                setRepeatRunCount={setRepeatRunCount}
               />
             ) : (
               <RunTopologyPanel

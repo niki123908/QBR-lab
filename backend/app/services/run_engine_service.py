@@ -4,6 +4,8 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
+
+import numpy as np
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -159,6 +161,9 @@ def _execute_run(
             run_config=run_config,
             topology_context={"node_count": topology.node_count},
         )
+        run_seed = resolved_config.get("run_seed")
+        if run_seed is not None:
+            np.random.seed(int(run_seed))
         artifact_root = Path(__file__).resolve().parents[3] / "storage" / "artifacts" / run_id
         resolved_config_path = artifact_root / "resolved_run_config.json"
         _write_json(

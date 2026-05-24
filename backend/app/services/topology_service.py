@@ -223,7 +223,6 @@ def generate_multi_topologies(
         return [], "Select at least 1 node_count and set count_per_node_count > 0."
 
     created: list[TopologyRecord] = []
-    base_seed = request.seed
     for node_count in request.node_counts:
         for idx in range(request.count_per_node_count):
             item = GenerateTopologyRequest(
@@ -234,7 +233,8 @@ def generate_multi_topologies(
                 sink_mode=request.sink_mode,
                 sink_x=request.sink_x,
                 sink_y=request.sink_y,
-                seed=(base_seed + len(created) + idx) if base_seed is not None else None,
+                # Multi-generate always uses a unique allocated seed per topology.
+                seed=None,
                 max_retry=request.max_retry,
                 batch_id=request.batch_id,
             )
