@@ -13,8 +13,9 @@ from app.core.errors import AppError
 
 
 def _should_start_embedded_worker() -> bool:
-    flag = str(os.getenv("QBR_AUTO_WORKER", "1")).strip().lower()
-    if flag in {"0", "false", "no", "off"}:
+    """Optional in-process worker for SQLite-only single-process dev (uvicorn without worker/)."""
+    flag = str(os.getenv("QBR_AUTO_WORKER", "0")).strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
         return False
     return DATABASE_URL.startswith("sqlite")
 

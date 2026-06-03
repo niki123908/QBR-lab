@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+
 import numpy as np
 
 from app.algorithms.br_env import Br_Env, hash_state
+from app.services.runners.action_aggregation import ActionGroup
+
+
+def _resolve_q_action_key(action_id: int, q_action_key_fn: Callable[[int], int] | None) -> int:
+    return int(q_action_key_fn(action_id)) if q_action_key_fn is not None else int(action_id)
 
 
 class QbrStateEncoder:
@@ -32,7 +40,12 @@ class EpsilonGreedyActionPolicy:
         return sorted(list(env.rcv_cands if self.action_axis == "receiver" else env.br_cands))
 
     def select_action(
-        self, env: Br_Env, qtable: dict[str, dict[int, float]], state_hash: str, episode: int
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        episode: int,
+        q_action_key_fn: Callable[[int], int] | None = None,
     ) -> int | tuple[int, int]:
         epsilon = self._epsilon_before_episode(episode)
         candidates = self._action_candidates(env)
@@ -43,8 +56,32 @@ class EpsilonGreedyActionPolicy:
         if np.random.rand() < epsilon:
             action = int(np.random.choice(candidates))
         else:
-            action = int(max(candidates, key=lambda a: float(state_actions.get(a, 0.0))))
+            action = int(
+                max(
+                    candidates,
+                    key=lambda a: float(state_actions.get(_resolve_q_action_key(a, q_action_key_fn), 0.0)),
+                )
+            )
         return int(action)
+
+    def select_group(
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        groups: list[ActionGroup],
+        episode: int,
+    ) -> tuple[int, int]:
+        if not groups:
+            fallback = int(env.random_action())
+            return fallback, fallback
+        epsilon = self._epsilon_before_episode(episode)
+        state_actions = qtable.get(state_hash, {})
+        if np.random.rand() < epsilon:
+            group = groups[int(np.random.choice(len(groups)))]
+        else:
+            group = max(groups, key=lambda item: float(state_actions.get(item.group_id, 0.0)))
+        return int(group.group_id), int(group.representative_action)
 
     def episode_trace_row(self, episode: int) -> list[float]:
         return [episode, self._epsilon_before_episode(episode), self._epsilon_after_episode(episode)]
@@ -78,7 +115,12 @@ class SoftmaxActionPolicy:
         return max(self.temperature_end, self.temperature_start - self.temperature_decay * idx)
 
     def select_action(
-        self, env: Br_Env, qtable: dict[str, dict[int, float]], state_hash: str, episode: int
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        episode: int,
+        q_action_key_fn: Callable[[int], int] | None = None,
     ) -> int | tuple[int, int]:
         candidates = sorted(list(env.rcv_cands if self.action_axis == "receiver" else env.br_cands))
         if not candidates:
@@ -86,7 +128,10 @@ class SoftmaxActionPolicy:
 
         temperature = self._temperature_before_episode(episode)
         state_q = qtable.get(state_hash, {})
-        q_values = np.array([float(state_q.get(action, 0.0)) for action in candidates], dtype=float)
+        q_values = np.array(
+            [float(state_q.get(_resolve_q_action_key(action, q_action_key_fn), 0.0)) for action in candidates],
+            dtype=float,
+        )
 
         # Very small temperature behaves like greedy argmax.
         if temperature <= 1e-12:
@@ -101,8 +146,135 @@ class SoftmaxActionPolicy:
         picked_idx = int(np.random.choice(len(candidates), p=probs))
         return int(candidates[picked_idx])
 
+    def select_group(
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        groups: list[ActionGroup],
+        episode: int,
+    ) -> tuple[int, int]:
+        if not groups:
+            fallback = int(env.random_action())
+            return fallback, fallback
+
+        temperature = self._temperature_before_episode(episode)
+        state_q = qtable.get(state_hash, {})
+        q_values = np.array([float(state_q.get(group.group_id, 0.0)) for group in groups], dtype=float)
+
+        if temperature <= 1e-12:
+            max_q = float(np.max(q_values))
+            tied = [group for group, q in zip(groups, q_values) if float(q) == max_q]
+            group = min(tied, key=lambda item: item.group_id)
+            return int(group.group_id), int(group.representative_action)
+
+        logits = q_values / temperature
+        logits = logits - np.max(logits)
+        exp_logits = np.exp(logits)
+        probs = exp_logits / np.sum(exp_logits)
+        picked_idx = int(np.random.choice(len(groups), p=probs))
+        group = groups[picked_idx]
+        return int(group.group_id), int(group.representative_action)
+
     def episode_trace_row(self, episode: int) -> list[float]:
         return [episode, self._temperature_before_episode(episode), self._temperature_after_episode(episode)]
+
+
+class UcbActionPolicy:
+    def __init__(self, ucb_c: float, action_axis: str = "broadcaster") -> None:
+        self.ucb_c = float(ucb_c)
+        self.action_axis = str(action_axis)
+        self.visit_counts: dict[str, dict[int, int]] = {}
+        self.global_t = 0
+        self._current_episode = 0
+        self._t_at_episode_start = 0
+
+    def _action_candidates(self, env: Br_Env) -> list[int]:
+        return sorted(list(env.rcv_cands if self.action_axis == "receiver" else env.br_cands))
+
+    def _visit_count(self, state_hash: str, action: int) -> int:
+        return int(self.visit_counts.get(state_hash, {}).get(action, 0))
+
+    def select_action(
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        episode: int,
+        q_action_key_fn: Callable[[int], int] | None = None,
+    ) -> int | tuple[int, int]:
+        if episode != self._current_episode:
+            self._t_at_episode_start = self.global_t
+            self._current_episode = episode
+
+        candidates = self._action_candidates(env)
+        if not candidates:
+            return int(env.random_action())
+
+        unvisited = [
+            action
+            for action in candidates
+            if self._visit_count(state_hash, _resolve_q_action_key(action, q_action_key_fn)) == 0
+        ]
+        if unvisited:
+            action = int(min(unvisited))
+        else:
+            state_q = qtable.get(state_hash, {})
+            log_t = math.log(max(self.global_t, 1))
+
+            def ucb_score(action: int) -> float:
+                q_key = _resolve_q_action_key(action, q_action_key_fn)
+                n_sa = self._visit_count(state_hash, q_key)
+                q_value = float(state_q.get(q_key, 0.0))
+                bonus = self.ucb_c * math.sqrt(log_t / n_sa)
+                return q_value + bonus
+
+            action = int(max(candidates, key=ucb_score))
+
+        visit_key = _resolve_q_action_key(action, q_action_key_fn)
+        state_visits = self.visit_counts.setdefault(state_hash, {})
+        state_visits[visit_key] = int(state_visits.get(visit_key, 0)) + 1
+        self.global_t += 1
+        return int(action)
+
+    def select_group(
+        self,
+        env: Br_Env,
+        qtable: dict[str, dict[int, float]],
+        state_hash: str,
+        groups: list[ActionGroup],
+        episode: int,
+    ) -> tuple[int, int]:
+        if episode != self._current_episode:
+            self._t_at_episode_start = self.global_t
+            self._current_episode = episode
+
+        if not groups:
+            fallback = int(env.random_action())
+            return fallback, fallback
+
+        unvisited = [group for group in groups if self._visit_count(state_hash, group.group_id) == 0]
+        if unvisited:
+            group = min(unvisited, key=lambda item: item.group_id)
+        else:
+            state_q = qtable.get(state_hash, {})
+            log_t = math.log(max(self.global_t, 1))
+
+            def ucb_score(group: ActionGroup) -> float:
+                n_sa = self._visit_count(state_hash, group.group_id)
+                q_value = float(state_q.get(group.group_id, 0.0))
+                bonus = self.ucb_c * math.sqrt(log_t / n_sa)
+                return q_value + bonus
+
+            group = max(groups, key=ucb_score)
+
+        state_visits = self.visit_counts.setdefault(state_hash, {})
+        state_visits[group.group_id] = int(state_visits.get(group.group_id, 0)) + 1
+        self.global_t += 1
+        return int(group.group_id), int(group.representative_action)
+
+    def episode_trace_row(self, episode: int) -> list[float]:
+        return [episode, float(self._t_at_episode_start), float(self.global_t)]
 
 
 class QLearningUpdateRule:

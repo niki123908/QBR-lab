@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from typing import Any
 import json
 import re
 from collections import Counter
@@ -31,6 +32,11 @@ class RunHistoryRecord:
     best_delay_explored: int | None
     batch_run_id: str | None
     batch_result_label: str | None
+    runtime_sec: float | None = None
+    error_message: str | None = None
+    total_states: int | None = None
+    total_state_actions: int | None = None
+    decision_graph_edges: int | None = None
 
 
 @dataclass
@@ -62,6 +68,9 @@ class RunDetailRecord:
     best_delay_explored: int | None
     reward_final: float | None
     artifacts: list[ArtifactRefRecord]
+    total_states: int | None = None
+    total_state_actions: int | None = None
+    decision_graph_edges: int | None = None
 
 
 @dataclass
@@ -72,6 +81,7 @@ class BatchRunListRecord:
     preset_id: str
     preset_name: str
     result_label: str
+    custom_result_label: str | None
     total_topologies: int
     successful: int
     failed: int
@@ -145,6 +155,9 @@ class BatchRunTopologyPointRecord:
     unique_path_count: int | None
     best_delay_unique_path_count: int | None
     delay_per_episode: list[int]
+    paths_count_by_delay: dict[int, int]
+    total_states: int | None
+    total_state_actions: int | None
 
 
 @dataclass
@@ -163,6 +176,7 @@ class BatchRunResultRecord:
     run_config: dict
     draft_preset_id: str | None
     result_label: str
+    custom_result_label: str | None
     total_topologies: int
     successful: int
     failed: int
@@ -195,6 +209,25 @@ def _resolve_batch_name(topologies: list[Topology], batch_by_id: dict[str, Batch
 
 def _build_label(batch_name: str, preset_name: str) -> str:
     return f"{batch_name} -- {preset_name}"
+
+
+def _batch_run_custom_label(group_row: BatchRunGroup | None) -> str | None:
+    if group_row is None or group_row.result_label is None:
+        return None
+    custom = str(group_row.result_label).strip()
+    return custom or None
+
+
+def _batch_run_display_label(
+    group_row: BatchRunGroup | None,
+    *,
+    batch_name: str,
+    preset_name: str,
+) -> str:
+    custom = _batch_run_custom_label(group_row)
+    if custom:
+        return custom
+    return _build_label(batch_name=batch_name, preset_name=preset_name)
 
 
 def _natural_sort_key(text: str) -> tuple:
@@ -242,6 +275,7 @@ def create_batch_run_enqueued(
     algorithm_id: str,
     preset_id: str,
     payload: dict,
+    result_label: str | None = None,
 ) -> None:
     init_db()
     with db_session_scope() as session:
@@ -256,6 +290,9 @@ def create_batch_run_enqueued(
         }
         if len(existing_ids) != len(unique_topology_ids):
             raise ValueError("Failed.")
+        custom_label = str(result_label).strip() if result_label is not None else None
+        if custom_label == "":
+            custom_label = None
         session.add(
             BatchRunGroup(
                 id=batch_run_id,
@@ -263,6 +300,7 @@ def create_batch_run_enqueued(
                 stop_requested=False,
                 total_topologies=len(topology_ids),
                 payload_json=json.dumps(payload, ensure_ascii=False),
+                result_label=custom_label,
             )
         )
         for topology_id in topology_ids:
@@ -397,6 +435,39 @@ def mark_run_stopped(run_id: str, worker_id: str | None = None) -> bool:
         row.claimed_at = None
         row.ended_at = _utcnow()
         return True
+
+
+def requeue_runs_for_worker(worker_id: str) -> int:
+    init_db()
+    with db_session_scope() as session:
+        rows = session.scalars(select(Run).where(Run.status == "running", Run.worker_id == worker_id)).all()
+        if not rows:
+            return 0
+        for row in rows:
+            row.status = "queued"
+            row.worker_id = None
+            row.claimed_at = None
+            row.heartbeat_at = None
+            row.started_at = None
+            row.ended_at = None
+            topology = session.get(Topology, row.topology_id)
+            if topology is not None and not topology.is_deleted:
+                has_previous_success = (
+                    session.scalars(
+                        select(Run.id).where(Run.topology_id == row.topology_id, Run.status == "done").limit(1)
+                    ).first()
+                    is not None
+                )
+                topology.status = "done" if has_previous_success else "new"
+        group_ids = sorted({row.batch_run_group_id for row in rows if row.batch_run_group_id})
+        for group_id in group_ids:
+            group = session.get(BatchRunGroup, group_id)
+            if group is None:
+                continue
+            group.status = "queued"
+            group.ended_at = None
+            group.stop_requested = False
+        return len(rows)
 
 
 def requeue_stale_runs(*, stale_after_seconds: int) -> list[str]:
@@ -679,7 +750,26 @@ def _path_metrics_from_csvs(path_rows: list[dict[str, str]], delay_rows: list[di
     return unique_path_count, best_delay_unique
 
 
+def _load_run_bundle_episodes(session, run_id: str) -> list[dict[str, Any]]:
+    from app.services.artifact_payload import resolve_artifact_payload
+
+    bundle = resolve_artifact_payload(run_id, "run_bundle", uri_path=None)
+    if isinstance(bundle, dict) and isinstance(bundle.get("episodes"), list):
+        return [row for row in bundle["episodes"] if isinstance(row, dict)]
+    bundle_uri = _artifact_uri(session, run_id, "run_bundle")
+    if bundle_uri:
+        bundle = resolve_artifact_payload(run_id, "run_bundle", uri_path=Path(bundle_uri))
+        if isinstance(bundle, dict) and isinstance(bundle.get("episodes"), list):
+            return [row for row in bundle["episodes"] if isinstance(row, dict)]
+    return []
+
+
 def _batch_run_path_metrics_for_run(session, run_id: str) -> tuple[int | None, int | None]:
+    episodes = _load_run_bundle_episodes(session, run_id)
+    if episodes:
+        from app.services.run_artifacts import path_metrics_from_bundle_episodes
+
+        return path_metrics_from_bundle_episodes(episodes)
     path_uri = _artifact_uri(session, run_id, "path_signatures")
     delay_uri = _artifact_uri(session, run_id, "delay_per_episode")
     path_rows = _read_csv_rows(path_uri)
@@ -687,7 +777,32 @@ def _batch_run_path_metrics_for_run(session, run_id: str) -> tuple[int | None, i
     return _path_metrics_from_csvs(path_rows, delay_rows)
 
 
+def _paths_count_by_delay_for_run(session, run_id: str) -> dict[int, int]:
+    """Unique path_signature count per finished delay (from run_bundle episodes)."""
+    episodes = _load_run_bundle_episodes(session, run_id)
+    if not episodes:
+        return {}
+    by_delay: dict[int, set[str]] = {}
+    for row in episodes:
+        if not isinstance(row, dict):
+            continue
+        try:
+            delay = int(row.get("delay"))
+        except (TypeError, ValueError):
+            continue
+        signature = str(row.get("path_signature") or "").strip()
+        if not signature:
+            continue
+        by_delay.setdefault(delay, set()).add(signature)
+    return {delay: len(signatures) for delay, signatures in sorted(by_delay.items())}
+
+
 def _delay_per_episode_series_for_run(session, run_id: str) -> list[int]:
+    episodes = _load_run_bundle_episodes(session, run_id)
+    if episodes:
+        from app.services.run_artifacts import delay_series_from_bundle_episodes
+
+        return delay_series_from_bundle_episodes(episodes)
     delay_uri = _artifact_uri(session, run_id, "delay_per_episode")
     delay_rows = _read_csv_rows(delay_uri)
     series: list[tuple[int, int]] = []
@@ -734,7 +849,11 @@ def list_run_history(topology_id: str) -> list[RunHistoryRecord]:
                 payload = json.loads(group_row.payload_json) if group_row is not None and group_row.payload_json else {}
                 preset_name = str(payload.get("preset_name") or sample.config_id)
                 group_preset_name_map[group_id] = preset_name
-                group_label_map[group_id] = _build_label(batch_name=batch_name, preset_name=preset_name)
+                group_label_map[group_id] = _batch_run_display_label(
+                    group_row,
+                    batch_name=batch_name,
+                    preset_name=preset_name,
+                )
         result: list[RunHistoryRecord] = []
         for row in rows:
             metric = session.get(RunMetric, row.id)
@@ -769,6 +888,11 @@ def list_run_history(topology_id: str) -> list[RunHistoryRecord]:
                     best_delay_explored=metric.best_delay_explored if metric else None,
                     batch_run_id=row.batch_run_group_id,
                     batch_result_label=group_label_map.get(row.batch_run_group_id or ""),
+                    runtime_sec=float(row.runtime_sec) if row.runtime_sec is not None else None,
+                    error_message=row.error_message,
+                    total_states=metric.total_states if metric else None,
+                    total_state_actions=metric.total_state_actions if metric else None,
+                    decision_graph_edges=metric.decision_graph_edges if metric else None,
                 )
             )
         return result
@@ -827,25 +951,19 @@ def delete_batch_run(batch_run_id: str) -> bool:
 
 
 def get_artifact_payload(run_id: str, artifact_type: str):
+    from app.services.artifact_payload import resolve_artifact_payload
+
     init_db()
     with db_session_scope() as session:
         row = session.scalars(
             select(Artifact).where(Artifact.run_id == run_id, Artifact.artifact_type == artifact_type).limit(1)
         ).first()
-        if row is None:
-            return None
-        path = Path(row.uri)
-        if not path.exists() or not path.is_file():
-            return None
-        if path.suffix.lower() == ".json":
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return None
-        try:
-            return {"text": path.read_text(encoding="utf-8")}
-        except OSError:
-            return None
+        uri_path = Path(row.uri) if row is not None else None
+        if uri_path is not None and uri_path.exists() and uri_path.is_file():
+            direct = resolve_artifact_payload(run_id, artifact_type, uri_path=uri_path)
+            if direct is not None:
+                return direct
+        return resolve_artifact_payload(run_id, artifact_type, uri_path=None)
 
 
 def get_run_detail(run_id: str) -> RunDetailRecord | None:
@@ -886,6 +1004,9 @@ def get_run_detail(run_id: str) -> RunDetailRecord | None:
             lower_bound=metric.lower_bound if metric else None,
             best_delay_explored=metric.best_delay_explored if metric else None,
             reward_final=metric.reward_final if metric else None,
+            total_states=metric.total_states if metric else None,
+            total_state_actions=metric.total_state_actions if metric else None,
+            decision_graph_edges=metric.decision_graph_edges if metric else None,
             artifacts=[
                 ArtifactRefRecord(
                     artifact_type=item.artifact_type,
@@ -934,6 +1055,11 @@ def list_batch_runs() -> list[BatchRunListRecord]:
             batch_status = _resolved_batch_status(group_row.status if group_row is not None else None, run_items_sorted)
             payload = json.loads(group_row.payload_json) if group_row is not None and group_row.payload_json else {}
             preset_name = str(payload.get("preset_name") or sample.config_id)
+            display_label = _batch_run_display_label(
+                group_row,
+                batch_name=batch_name,
+                preset_name=preset_name,
+            )
             result.append(
                 BatchRunListRecord(
                     batch_run_id=batch_run_id,
@@ -941,7 +1067,8 @@ def list_batch_runs() -> list[BatchRunListRecord]:
                     algorithm_id=sample.algorithm_id,
                     preset_id=sample.config_id,
                     preset_name=preset_name,
-                    result_label=_build_label(batch_name=batch_name, preset_name=preset_name),
+                    result_label=display_label,
+                    custom_result_label=_batch_run_custom_label(group_row),
                     total_topologies=total,
                     successful=successful,
                     failed=failed,
@@ -950,6 +1077,19 @@ def list_batch_runs() -> list[BatchRunListRecord]:
                 )
             )
         return sorted(result, key=lambda x: x.created_at, reverse=True)
+
+
+def update_batch_run_result_label(batch_run_id: str, result_label: str | None) -> bool:
+    init_db()
+    clean = str(result_label).strip() if result_label is not None else None
+    if clean == "":
+        clean = None
+    with db_session_scope() as session:
+        row = session.get(BatchRunGroup, batch_run_id)
+        if row is None:
+            return False
+        row.result_label = clean
+        return True
 
 
 def get_queue_snapshot() -> QueueSnapshotRecord:
@@ -1080,6 +1220,7 @@ def get_batch_run_result(batch_run_id: str) -> BatchRunResultRecord | None:
                 _batch_run_path_metrics_for_run(session, run_item.id) if run_item.status == "done" else (None, None)
             )
             delay_per_episode = _delay_per_episode_series_for_run(session, run_item.id) if run_item.status == "done" else []
+            paths_by_delay = _paths_count_by_delay_for_run(session, run_item.id) if run_item.status == "done" else {}
             points.append(
                 BatchRunTopologyPointRecord(
                     topology_id=run_item.topology_id,
@@ -1093,6 +1234,9 @@ def get_batch_run_result(batch_run_id: str) -> BatchRunResultRecord | None:
                     unique_path_count=unique_paths,
                     best_delay_unique_path_count=best_unique_paths,
                     delay_per_episode=delay_per_episode,
+                    paths_count_by_delay=paths_by_delay,
+                    total_states=metric.total_states if metric else None,
+                    total_state_actions=metric.total_state_actions if metric else None,
                 )
             )
 
@@ -1104,6 +1248,11 @@ def get_batch_run_result(batch_run_id: str) -> BatchRunResultRecord | None:
             for node_count, items in sorted(density_buckets.items(), key=lambda x: x[0])
         ]
 
+        display_label = _batch_run_display_label(
+            group_row,
+            batch_name=batch_name,
+            preset_name=preset_name,
+        )
         return BatchRunResultRecord(
             batch_run_id=batch_run_id,
             batch_name=batch_name,
@@ -1112,7 +1261,8 @@ def get_batch_run_result(batch_run_id: str) -> BatchRunResultRecord | None:
             preset_name=preset_name,
             run_config=run_config,
             draft_preset_id=draft_preset_id,
-            result_label=_build_label(batch_name=batch_name, preset_name=preset_name),
+            result_label=display_label,
+            custom_result_label=_batch_run_custom_label(group_row),
             total_topologies=len(display_run_items),
             successful=sum(1 for item in display_run_items if item.status == "done"),
             failed=sum(1 for item in display_run_items if item.status == "failed"),

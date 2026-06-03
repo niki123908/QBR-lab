@@ -37,7 +37,9 @@ From `QBR/`:
 2. Install backend dependencies:
    - `pip install -r backend/requirements.txt`
 3. Start all local services:
-   - `npm run dev`
+   - `npm run dev` (frontend + backend + **one** worker)
+
+**Workers / SQLite:** `npm run dev` already runs a background worker. On the default SQLite DB, do not start extra worker processes (2–3 manual workers often lock the DB and freeze the API). For multiple workers, use PostgreSQL (`DATABASE_URL` in `.env`) or see `worker/README.md`.
 
 Default URLs:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -66,6 +67,17 @@ def _batch_locked(batch: Batch) -> bool:
     return bool(batch.description and LOCK_MARKER in batch.description)
 
 
+def _natural_topology_name_key(name: str) -> tuple[int | str, ...]:
+    """Sort tp_250_00 before tp_250_01 … before tp_250_200 (not lexicographic / created_at)."""
+    value = (name or "").strip().lower()
+    parts: list[int | str] = []
+    for chunk in re.split(r"(\d+)", value):
+        if not chunk:
+            continue
+        parts.append(int(chunk) if chunk.isdigit() else chunk)
+    return tuple(parts)
+
+
 def _next_topology_name(session: Session, node_count: int, batch_id: str) -> str:
     prefix = f"tp_{node_count}_"
     rows = session.scalars(
@@ -123,6 +135,28 @@ def _to_record(topology: Topology, lower_bound: int | None = None) -> TopologyRe
         sink_y=topology.sink_y,
         seed=topology.seed,
         nodes=[NodeRecord(node_id=node.node_id, x=node.x, y=node.y) for node in topology.nodes],
+        finished_delay=None,
+        lower_bound=lower_bound,
+        best_delay_explored=None,
+        created_at=topology.created_at,
+    )
+
+
+def _to_list_record(topology: Topology, lower_bound: int | None = None) -> TopologyRecord:
+    """Lightweight row for list/batch APIs (no per-topology node fetch)."""
+    return TopologyRecord(
+        topology_id=topology.id,
+        topology_name=topology.name,
+        status=topology.status,  # type: ignore[assignment]
+        node_count=topology.node_count,
+        space_width=topology.space_width,
+        space_height=topology.space_height,
+        tx_range=topology.tx_range,
+        sink_mode=topology.sink_mode,
+        sink_x=topology.sink_x,
+        sink_y=topology.sink_y,
+        seed=topology.seed,
+        nodes=[],
         finished_delay=None,
         lower_bound=lower_bound,
         best_delay_explored=None,
@@ -206,15 +240,9 @@ def list_topologies(
 
         topologies = session.scalars(query).all()
         lower_bound_map = _load_lower_bound_map(session, [topology.id for topology in topologies])
-        records: list[TopologyRecord] = []
-        for topology in topologies:
-            topology.nodes = session.scalars(
-                select(TopologyNode)
-                .where(TopologyNode.topology_id == topology.id)
-                .order_by(TopologyNode.node_id.asc())
-            ).all()
-            records.append(_to_record(topology, lower_bound=lower_bound_map.get(topology.id)))
-        return records
+        return [
+            _to_list_record(topology, lower_bound=lower_bound_map.get(topology.id)) for topology in topologies
+        ]
 
 
 def list_batches(
@@ -236,17 +264,12 @@ def list_batches(
                 query = query.join(TopologyMetric, TopologyMetric.topology_id == Topology.id).where(
                     TopologyMetric.lower_bound == lower_bound
                 )
-            query = query.order_by(Topology.created_at.desc())
             topologies = session.scalars(query).all()
+            topologies = sorted(topologies, key=lambda row: _natural_topology_name_key(row.name))
             lower_bound_map = _load_lower_bound_map(session, [topology.id for topology in topologies])
-            topo_records: list[TopologyRecord] = []
-            for topology in topologies:
-                topology.nodes = session.scalars(
-                    select(TopologyNode)
-                    .where(TopologyNode.topology_id == topology.id)
-                    .order_by(TopologyNode.node_id.asc())
-                ).all()
-                topo_records.append(_to_record(topology, lower_bound=lower_bound_map.get(topology.id)))
+            topo_records = [
+                _to_list_record(topology, lower_bound=lower_bound_map.get(topology.id)) for topology in topologies
+            ]
 
             result.append(
                 BatchRecord(

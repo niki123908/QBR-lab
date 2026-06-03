@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import json
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -9,33 +7,24 @@ from typing import Any
 
 from app.algorithms.br_env import Br_Env
 from app.algorithms.common import trees
-from app.services.runners.base import RunExecutionResult, RunnerContext
+from app.services.runners.base import RunExecutionResult, RunnerContext, TOPOLOGY_RUN_TIMEOUT_SEC
 from app.services.runners.qbr_components import (
     BroadcastCandidateFinder,
     EpsilonGreedyActionPolicy,
     QbrStateEncoder,
     QLearningUpdateRule,
     SoftmaxActionPolicy,
+    UcbActionPolicy,
+)
+from app.services.playground_tree_service import build_run_decision_graph_from_episodes
+from app.services.run_artifacts import (
+    build_qbr_run_bundle,
+    build_trace_epochs_payload,
+    decision_graph_counts,
+    q_table_learning_stats,
+    write_gzip_json,
 )
 from app.services.runners.template import train_with_template
-
-
-def _timeout_seconds(node_count: int) -> int:
-    return 300 if node_count < 500 else 900
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
-
-def _write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
 
 
 def _build_path_signature(steps: list[dict[str, Any]]) -> str:
@@ -126,7 +115,23 @@ def _build_q_profile_for_episode(
                 except (TypeError, ValueError):
                     continue
         state_actions = q_snapshot.get(state_hash, {})
-        q_values = [float(state_actions.get(action, 0.0)) for action in candidates]
+        if step.get("action_aggregated"):
+            groups_raw = step.get("action_groups")
+            group_ids: list[int] = []
+            if isinstance(groups_raw, list):
+                for group in groups_raw:
+                    if not isinstance(group, dict):
+                        continue
+                    try:
+                        group_ids.append(int(group.get("group_id")))
+                    except (TypeError, ValueError):
+                        continue
+            if group_ids:
+                q_values = [float(state_actions.get(group_id, 0.0)) for group_id in group_ids]
+            else:
+                q_values = [float(state_actions.get(action, 0.0)) for action in candidates]
+        else:
+            q_values = [float(state_actions.get(action, 0.0)) for action in candidates]
         if q_values:
             max_q = float(max(q_values))
             mean_q = float(sum(q_values) / len(q_values))
@@ -196,8 +201,11 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     temperature_decay_mode = str(config.get("temperature_decay_mode", "linear"))
     action_axis = str(config.get("action_axis", "broadcaster"))
     completion_bonus_multiplier = float(config.get("completion_bonus_multiplier", 1.0))
+    coverage_reward_enabled = bool(config.get("coverage_reward_enabled", True))
     lambda_param = float(config.get("lambda_param", 0.0))
     trace_threshold = float(config.get("trace_threshold", 0.01))
+    ucb_c = float(config.get("ucb_c", 1.414))
+    action_aggregation_mode = str(config.get("action_aggregation_mode", "off"))
 
     if policy_type == "epsilon_greedy":
         action_policy = EpsilonGreedyActionPolicy(
@@ -206,7 +214,6 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
             epsilon_decay=epsilon_decay,
             action_axis=action_axis,
         )
-        policy_trace_header = ["episode", "epsilon_before", "epsilon_after"]
     elif policy_type == "softmax":
         action_policy = SoftmaxActionPolicy(
             temperature_start=temperature_start,
@@ -215,7 +222,11 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
             action_axis=action_axis,
             temperature_decay_mode=temperature_decay_mode,
         )
-        policy_trace_header = ["episode", "temperature_before", "temperature_after"]
+    elif policy_type == "ucb":
+        action_policy = UcbActionPolicy(
+            ucb_c=ucb_c,
+            action_axis=action_axis,
+        )
     else:
         raise ValueError("Failed.")
 
@@ -224,7 +235,7 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     training = train_with_template(
         env=env,
         episodes=episodes,
-        timeout_sec=_timeout_seconds(topology.node_count),
+        timeout_sec=TOPOLOGY_RUN_TIMEOUT_SEC,
         alpha=alpha,
         gamma=gamma,
         state_encoder=QbrStateEncoder(),
@@ -234,9 +245,11 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         on_episode_start=lambda runtime_env: trees.build_bfs(runtime_env.V),
         export_q_table_all_epoch=False,
         completion_bonus_multiplier=completion_bonus_multiplier,
+        coverage_reward_enabled=coverage_reward_enabled,
         lambda_param=lambda_param,
         trace_threshold=trace_threshold,
         action_axis=action_axis,
+        action_aggregation_mode=action_aggregation_mode,
         q_snapshot_episodes={200, 450, 700, 1000, episodes},
     )
     episodes_steps = training.episodes_steps
@@ -245,7 +258,6 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     qtable = training.qtable
     qtable_snapshots_by_episode = training.qtable_snapshots_by_episode
     total_rewards = training.total_rewards
-    policy_rows = training.policy_rows
     best_delay = training.best_delay
     best_episode_index = training.best_episode_index
 
@@ -258,6 +270,17 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     )
     action_space_by_timeslot_rcv = _action_space_by_timeslot_summary(episodes_steps, "rcv_candidate_count", "rcv_cands")
     action_space_by_timeslot_br = _action_space_by_timeslot_summary(episodes_steps, "br_candidate_count", "br_cands")
+    action_space_by_timeslot_group = _action_space_by_timeslot_summary(
+        episodes_steps,
+        "action_group_count",
+        "rcv_cands" if action_axis == "receiver" else "br_cands",
+    )
+    action_space_by_timeslot_group_rcv = _action_space_by_timeslot_summary(
+        episodes_steps, "rcv_group_count", "rcv_cands"
+    )
+    action_space_by_timeslot_group_br = _action_space_by_timeslot_summary(
+        episodes_steps, "br_group_count", "br_cands"
+    )
     q_profile_by_epoch = _q_profile_by_epoch_summary(
         episodes_steps,
         qtable_snapshots_by_episode,
@@ -275,90 +298,72 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         episodes_steps[best_episode_index] if best_episode_index >= 0 else {"episode": 0, "delay": 0, "steps": []}
     )
 
-    run_summary_path = artifact_root / "run_summary.json"
-    q_table_path = artifact_root / "q_table.json"
-    last_state_action_path = artifact_root / "state_action_last_epoch.json"
-    best_state_action_path = artifact_root / "state_action_best_epoch.json"
-    transmission_last_path = artifact_root / "transmission_last_epoch.json"
-    transmission_best_path = artifact_root / "transmission_best_epoch.json"
-    delay_csv_path = artifact_root / "delay_per_episode.csv"
-    policy_csv_path = artifact_root / "policy_trace.csv"
-    signature_csv_path = artifact_root / "path_signatures.csv"
+    run_bundle_path = artifact_root / "run_bundle.json.gz"
+    q_table_path = artifact_root / "q_table.json.gz"
+    trace_epochs_path = artifact_root / "trace_epochs.json.gz"
+    decision_graph_path = artifact_root / "run_decision_graph.json.gz"
 
-    _write_json(
-        run_summary_path,
-        {
-            "algorithm_id": "qbr",
-            "run_id": run_id,
-            "episodes": episodes,
-            "alpha": alpha,
-            "gamma": gamma,
-            "policy_type": policy_type,
-            "action_axis": action_axis,
-            "completion_bonus_multiplier": completion_bonus_multiplier,
-            "lambda_param": lambda_param,
-            "trace_threshold": trace_threshold,
-            "epsilon_end": epsilon_end if policy_type == "epsilon_greedy" else None,
-            "temperature_end": temperature_end if policy_type == "softmax" else None,
-            "temperature_decay_mode": temperature_decay_mode if policy_type == "softmax" else None,
-            "finished_delay": int(last_episode_payload["delay"]),
-            "best_delay_explored": int(best_delay if best_delay is not math.inf else 0),
-            "best_episode": int(best_episode_payload["episode"]),
-            "best_delay_episode_count": int(best_delay_episode_count),
-            "lower_bound": lower_bound,
-            "reward_final": float(total_rewards[-1] if total_rewards else 0.0),
-            "action_space_by_timeslot": action_space_by_timeslot,
-            "action_space_by_timeslot_rcv": action_space_by_timeslot_rcv,
-            "action_space_by_timeslot_br": action_space_by_timeslot_br,
-            "q_profile_by_epoch": q_profile_by_epoch,
-        },
+    bundle_payload = build_qbr_run_bundle(
+        run_id=run_id,
+        episodes=episodes,
+        policy_type=policy_type,
+        action_axis=action_axis,
+        action_aggregation_mode=action_aggregation_mode,
+        alpha=alpha,
+        gamma=gamma,
+        completion_bonus_multiplier=completion_bonus_multiplier,
+        coverage_reward_enabled=coverage_reward_enabled,
+        lambda_param=lambda_param,
+        trace_threshold=trace_threshold,
+        epsilon_end=epsilon_end if policy_type == "epsilon_greedy" else None,
+        temperature_end=temperature_end if policy_type == "softmax" else None,
+        temperature_decay_mode=temperature_decay_mode if policy_type == "softmax" else None,
+        ucb_c=ucb_c if policy_type == "ucb" else None,
+        epsilon_start=epsilon if policy_type == "epsilon_greedy" else None,
+        epsilon_decay=epsilon_decay if policy_type == "epsilon_greedy" else None,
+        temperature_start=temperature_start if policy_type == "softmax" else None,
+        temperature_decay=temperature_decay if policy_type == "softmax" else None,
+        last_episode_payload=last_episode_payload,
+        best_episode_payload=best_episode_payload,
+        best_delay=int(best_delay if best_delay is not math.inf else 0),
+        best_delay_episode_count=int(best_delay_episode_count),
+        lower_bound=lower_bound,
+        total_rewards=total_rewards,
+        action_space_by_timeslot=action_space_by_timeslot,
+        action_space_by_timeslot_rcv=action_space_by_timeslot_rcv,
+        action_space_by_timeslot_br=action_space_by_timeslot_br,
+        action_space_by_timeslot_group=action_space_by_timeslot_group,
+        action_space_by_timeslot_group_rcv=action_space_by_timeslot_group_rcv,
+        action_space_by_timeslot_group_br=action_space_by_timeslot_group_br,
+        q_profile_by_epoch=q_profile_by_epoch,
+        episodes_steps=episodes_steps,
+        timeslot_transmission_fn=_timeslot_transmission,
     )
-    _write_json(q_table_path, qtable)
-    _write_json(last_state_action_path, last_episode_payload)
-    _write_json(best_state_action_path, best_episode_payload)
-    _write_json(
-        transmission_last_path,
-        {
-            "episode": last_episode_payload["episode"],
-            "total_delay": last_episode_payload["delay"],
-            "timeslots": _timeslot_transmission(last_episode_payload["steps"]),
-        },
+    write_gzip_json(run_bundle_path, bundle_payload)
+    write_gzip_json(
+        trace_epochs_path,
+        build_trace_epochs_payload(last_episode_payload, best_episode_payload),
     )
-    _write_json(
-        transmission_best_path,
-        {
-            "episode": best_episode_payload["episode"],
-            "total_delay": best_episode_payload["delay"],
-            "timeslots": _timeslot_transmission(best_episode_payload["steps"]),
-        },
-    )
+    write_gzip_json(q_table_path, qtable)
 
-    _write_csv(
-        delay_csv_path,
-        ["episode", "delay", "total_reward"],
-        [[item["episode"], item["delay"], item["total_reward"]] for item in episodes_steps],
-    )
-    _write_csv(policy_csv_path, policy_trace_header, policy_rows)
-    _write_csv(
-        signature_csv_path,
-        ["episode", "path_signature"],
-        [[item["episode"], item["path_signature"]] for item in episodes_steps],
-    )
+    graph_mode = action_axis if action_axis in {"broadcaster", "receiver"} else "broadcaster"
+    graph_payload = build_run_decision_graph_from_episodes(episodes_steps, default_mode=graph_mode)
+    write_gzip_json(decision_graph_path, graph_payload)
+    total_states, total_state_actions = q_table_learning_stats(qtable)
+    _, decision_graph_edges = decision_graph_counts(graph_payload)
 
     return RunExecutionResult(
         finished_delay=int(last_episode_payload["delay"]),
         best_delay_explored=int(best_delay if best_delay is not math.inf else 0),
         lower_bound=lower_bound,
         reward_final=float(total_rewards[-1] if total_rewards else 0.0),
+        total_states=total_states,
+        total_state_actions=total_state_actions,
+        decision_graph_edges=decision_graph_edges,
         artifact_paths={
-            "run_summary": run_summary_path,
+            "run_bundle": run_bundle_path,
             "q_table": q_table_path,
-            "state_action_last_epoch": last_state_action_path,
-            "state_action_best_epoch": best_state_action_path,
-            "transmission_last_epoch": transmission_last_path,
-            "transmission_best_epoch": transmission_best_path,
-            "delay_per_episode": delay_csv_path,
-            "policy_trace": policy_csv_path,
-            "path_signatures": signature_csv_path,
+            "trace_epochs": trace_epochs_path,
+            "run_decision_graph": decision_graph_path,
         },
     )

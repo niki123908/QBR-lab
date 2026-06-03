@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import CompareChartWorkspace from "./CompareChartWorkspace.jsx";
 import BatchResultDetailBody, {
   boxplotYAxisFromDensityGroups,
+  delayAxisByDensityFromResults,
   scatterYAxisByDensityFromResults
 } from "./BatchResultDetailBody";
 import { MiniDelayPerEpisodeChart } from "./BatchResultDetailBody";
@@ -143,7 +145,8 @@ function CompareColumn({
   onArtifactFilterChange,
   bestDelayOverlayOpacity,
   sharedBoxplotYAxis,
-  sharedScatterYAxisByDensity
+  sharedScatterYAxisByDensity,
+  sharedDelayAxisByDensity
 }) {
   const doneRuns = useMemo(() => (history ?? []).filter((item) => item.status === "done"), [history]);
 
@@ -214,6 +217,7 @@ function CompareColumn({
               boxplotYAxis={sharedBoxplotYAxis}
               boxplotFitWidth
               scatterYAxisByDensity={sharedScatterYAxisByDensity}
+              delayAxisByDensity={sharedDelayAxisByDensity}
             />
           )
         ) : !topoId ? (
@@ -246,9 +250,12 @@ export default function CompareWorkspace({
   onRetryBatchRunResults,
   singleRunTopologyIds,
   topologyNameById,
-  bestDelayOverlayOpacity = 1
+  bestDelayOverlayOpacity = 1,
+  onCompareExportChange
 }) {
   const [compareKind, setCompareKind] = useState("batch");
+  const isChartMode = compareKind === "chart";
+  const isBatchMode = compareKind === "batch";
 
   const [batchIdA, setBatchIdA] = useState("");
   const [batchIdB, setBatchIdB] = useState("");
@@ -401,6 +408,50 @@ export default function CompareWorkspace({
     return scatterYAxisByDensityFromResults(resultA, resultB);
   }, [compareKind, resultA, resultB]);
 
+  const sharedDelayAxisByDensity = useMemo(() => {
+    if (compareKind !== "batch") return null;
+    return delayAxisByDensityFromResults(resultA, resultB);
+  }, [compareKind, resultA, resultB]);
+
+  useEffect(() => {
+    const compareChartInput = {
+      ready: compareKind === "batch" && !!resultA && !!resultB,
+      compareKind,
+      resultA,
+      resultB,
+      batchIdA,
+      batchIdB
+    };
+    onCompareExportChange?.({
+      compareKind,
+      resultA,
+      resultB,
+      batchIdA,
+      batchIdB,
+      selectedRunA,
+      selectedRunB,
+      delayA,
+      delayB,
+      compareChartInput,
+      topoNameA: topologyNameById?.(topoIdA) ?? topoIdA,
+      topoNameB: topologyNameById?.(topoIdB) ?? topoIdB
+    });
+  }, [
+    onCompareExportChange,
+    compareKind,
+    resultA,
+    resultB,
+    batchIdA,
+    batchIdB,
+    selectedRunA,
+    selectedRunB,
+    delayA,
+    delayB,
+    topoIdA,
+    topoIdB,
+    topologyNameById
+  ]);
+
   return (
     <div className="compare-workspace">
       <div className="compare-toolbar">
@@ -419,23 +470,39 @@ export default function CompareWorkspace({
           >
             Single topology results
           </button>
+          <button
+            type="button"
+            className={compareKind === "chart" ? "active" : ""}
+            onClick={() => setCompareKind("chart")}
+          >
+            Chart
+          </button>
         </div>
-        {compareKind === "batch" && isLoadingBatchRunResults ? (
+        {(isBatchMode || isChartMode) && isLoadingBatchRunResults ? (
           <span className="muted compare-toolbar-hint">Loading batch list…</span>
         ) : null}
-        {compareKind === "batch" && batchRunResultsError ? (
+        {(isBatchMode || isChartMode) && batchRunResultsError ? (
           <button type="button" className="secondary-cta small" onClick={onRetryBatchRunResults}>
             Retry list
           </button>
         ) : null}
       </div>
 
-      {compareKind === "batch" && batchRunResultsError ? (
+      {(isBatchMode || isChartMode) && batchRunResultsError ? (
         <div className="empty-topology-state batch-results-error compare-list-error">
           <p>{batchRunResultsError}</p>
         </div>
       ) : null}
 
+      {isChartMode ? (
+        <CompareChartWorkspace
+          apiBase={apiBase}
+          batchRunResults={batchRunResults}
+          isLoadingBatchRunResults={isLoadingBatchRunResults}
+          batchRunResultsError={batchRunResultsError}
+          onRetryBatchRunResults={onRetryBatchRunResults}
+        />
+      ) : (
       <div className="compare-columns">
         <CompareColumn
           sideLabel="A"
@@ -463,6 +530,7 @@ export default function CompareWorkspace({
           bestDelayOverlayOpacity={bestDelayOverlayOpacity}
           sharedBoxplotYAxis={sharedBoxplotYAxis}
           sharedScatterYAxisByDensity={sharedScatterYAxisByDensity}
+          sharedDelayAxisByDensity={sharedDelayAxisByDensity}
         />
         <CompareColumn
           sideLabel="B"
@@ -490,8 +558,10 @@ export default function CompareWorkspace({
           bestDelayOverlayOpacity={bestDelayOverlayOpacity}
           sharedBoxplotYAxis={sharedBoxplotYAxis}
           sharedScatterYAxisByDensity={sharedScatterYAxisByDensity}
+          sharedDelayAxisByDensity={sharedDelayAxisByDensity}
         />
       </div>
+      )}
     </div>
   );
 }

@@ -82,6 +82,56 @@ class TopologyDetailResponse(BaseModel):
     best_delay_explored: int | None = None
 
 
+class PlaygroundTreeNode(BaseModel):
+    state_hash: str
+    state_index: int
+    depth: int
+    covered_node_ids: list[int] = Field(default_factory=list)
+
+
+class PlaygroundTreeEdge(BaseModel):
+    from_state_hash: str
+    to_state_hash: str
+    actions: list[int] = Field(default_factory=list)
+    mode: Literal["broadcaster", "receiver"] = "broadcaster"
+
+
+class PlaygroundTreeResponse(BaseModel):
+    topology_id: str
+    root_state_hash: str = "0"
+    next_state_index: int = 1
+    nodes: list[PlaygroundTreeNode] = Field(default_factory=list)
+    edges: list[PlaygroundTreeEdge] = Field(default_factory=list)
+
+
+class PlaygroundTreeEventRequest(BaseModel):
+    from_state_hash: str
+    to_state_hash: str
+    action: int
+    mode: Literal["broadcaster", "receiver"] = "broadcaster"
+    to_covered_node_ids: list[int] = Field(default_factory=list)
+
+
+class PlaygroundTreeExpandStats(BaseModel):
+    states_expanded: int = 0
+    transitions_applied: int = 0
+    nodes_added: int = 0
+    edges_added: int = 0
+    edges_to_existing_states: int = 0
+    unique_paths: int = 0
+    truncated: bool = False
+
+
+class PlaygroundTreeExpandResponse(PlaygroundTreeResponse):
+    expand_stats: PlaygroundTreeExpandStats = Field(default_factory=PlaygroundTreeExpandStats)
+
+
+class PlaygroundRunTreeResponse(PlaygroundTreeResponse):
+    run_id: str
+    source_artifact: str | None = None
+    message: str | None = None
+
+
 class RunSingleRequest(BaseModel):
     topology_id: str
     algorithm_id: str
@@ -102,6 +152,7 @@ class BatchRunRequest(BaseModel):
     algorithm_id: str
     preset_id: str
     preset_name: str
+    result_label: str | None = None
     run_config: dict[str, Any] = Field(default_factory=dict)
     draft_preset_id: str | None = None
     save_full_artifacts_for_selected_runs: bool = False
@@ -115,6 +166,10 @@ class BatchRunResponse(BaseModel):
     total_topologies: int
 
 
+class BatchRunResultLabelUpdate(BaseModel):
+    result_label: str | None = None
+
+
 class BatchRunListItem(BaseModel):
     batch_run_id: str
     batch_name: str
@@ -122,6 +177,7 @@ class BatchRunListItem(BaseModel):
     preset_id: str
     preset_name: str
     result_label: str
+    custom_result_label: str | None = None
     total_topologies: int
     successful: int
     failed: int
@@ -141,6 +197,9 @@ class BatchRunTopologyPoint(BaseModel):
     unique_path_count: int | None = None
     best_delay_unique_path_count: int | None = None
     delay_per_episode: list[int] = Field(default_factory=list)
+    paths_count_by_delay: dict[int, int] = Field(default_factory=dict)
+    total_states: int | None = None
+    total_state_actions: int | None = None
 
 
 class BatchRunDensityGroup(BaseModel):
@@ -196,14 +255,23 @@ class QueueSnapshotResponse(BaseModel):
     lanes: list[WorkerQueueLane] = Field(default_factory=list)
 
 
+class ManagedWorkerOut(BaseModel):
+    worker_id: str
+    pid: int | None = None
+    alive: bool = False
+    managed: bool = True
+
+
 class BatchRunResultResponse(BaseModel):
     batch_run_id: str
     batch_name: str
     algorithm_id: str
     preset_id: str
     preset_name: str
+    run_config: dict[str, Any] = Field(default_factory=dict)
     resolved_run_config: dict[str, Any] | None = None
     result_label: str
+    custom_result_label: str | None = None
     total_topologies: int
     successful: int
     failed: int
@@ -281,6 +349,11 @@ class RunHistoryItem(BaseModel):
     best_delay_explored: int | None = None
     batch_run_id: str | None = None
     batch_result_label: str | None = None
+    runtime_sec: float | None = None
+    error_message: str | None = None
+    total_states: int | None = None
+    total_state_actions: int | None = None
+    decision_graph_edges: int | None = None
 
 
 class RunArtifactPayloadResponse(BaseModel):
@@ -315,6 +388,9 @@ class RunDetailResponse(BaseModel):
     lower_bound: int | None = None
     best_delay_explored: int | None = None
     reward_final: float | None = None
+    total_states: int | None = None
+    total_state_actions: int | None = None
+    decision_graph_edges: int | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
 
 

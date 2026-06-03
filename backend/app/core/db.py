@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 
@@ -18,10 +19,31 @@ def _default_sqlite_url() -> str:
 
 DATABASE_URL = os.getenv("DATABASE_URL", _default_sqlite_url())
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, future=True, echo=False, connect_args=connect_args)
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+connect_args = {"check_same_thread": False, "timeout": 30} if _IS_SQLITE else {}
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    echo=False,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 Base = declarative_base()
+
+_db_initialized = False
+_db_init_lock = threading.Lock()
+
+
+if _IS_SQLITE:
+
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 
 
 def _ensure_run_queue_columns() -> None:
@@ -52,10 +74,45 @@ def _ensure_run_queue_columns() -> None:
 
 
 def init_db() -> None:
-    import app.models  # noqa: F401
+    global _db_initialized
+    if _db_initialized:
+        return
+    with _db_init_lock:
+        if _db_initialized:
+            return
+        import app.models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
-    _ensure_run_queue_columns()
+        Base.metadata.create_all(bind=engine)
+        _ensure_run_queue_columns()
+        _ensure_batch_run_group_columns()
+        _ensure_run_metrics_columns()
+        _db_initialized = True
+
+
+def _ensure_run_metrics_columns() -> None:
+    inspector = inspect(engine)
+    if "run_metrics" not in inspector.get_table_names():
+        return
+    existing_columns = {column["name"] for column in inspector.get_columns("run_metrics")}
+    ddl_by_column = {
+        "total_states": "ALTER TABLE run_metrics ADD COLUMN total_states INTEGER",
+        "total_state_actions": "ALTER TABLE run_metrics ADD COLUMN total_state_actions INTEGER",
+        "decision_graph_edges": "ALTER TABLE run_metrics ADD COLUMN decision_graph_edges INTEGER",
+    }
+    with engine.begin() as connection:
+        for column_name, ddl in ddl_by_column.items():
+            if column_name not in existing_columns:
+                connection.execute(text(ddl))
+
+
+def _ensure_batch_run_group_columns() -> None:
+    inspector = inspect(engine)
+    if "batch_run_groups" not in inspector.get_table_names():
+        return
+    existing_columns = {column["name"] for column in inspector.get_columns("batch_run_groups")}
+    if "result_label" not in existing_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE batch_run_groups ADD COLUMN result_label VARCHAR(512)"))
 
 
 def get_db_session() -> Session:

@@ -1,4 +1,8 @@
 import { useMemo, useState } from "react";
+import { buildRunConfigResultFromResolved, mergeDisplayConfig } from "../utils/runConfigDisplay.js";
+import { BatchPolicyTraceCard } from "./BatchResultDetailBody.jsx";
+import RunConfigVisibilityTable from "./RunConfigVisibilityTable.jsx";
+import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 
@@ -21,11 +25,14 @@ function formatConfigLabel(fieldName) {
   if (fieldName === "policy_type") return "Policy type";
   if (fieldName === "lambda_param") return "Lambda (λ)";
   if (fieldName === "trace_threshold") return "Trace threshold";
+  if (fieldName === "action_aggregation_mode") return "Action aggregation";
   if (fieldName === "completion_bonus_multiplier") return "Completion bonus multiplier";
+  if (fieldName === "coverage_reward_enabled") return "Enable coverage reward (nodes covered / timeslot)";
   if (fieldName === "temperature_decay_mode") return "Temperature decay mode";
   if (fieldName === "epsilon_start") return "Epsilon start";
   if (fieldName === "epsilon_end") return "Epsilon end";
   if (fieldName === "epsilon_decay") return "Epsilon decay";
+  if (fieldName === "ucb_c") return "UCB exploration constant (c)";
   return fieldName;
 }
 
@@ -33,6 +40,12 @@ function formatEnumOptionLabel(fieldName, option) {
   if (fieldName === "action_axis") {
     if (option === "broadcaster") return "Broadcaster";
     if (option === "receiver") return "Receiver";
+  }
+  if (fieldName === "policy_type" && option === "ucb") return "UCB";
+  if (fieldName === "action_aggregation_mode") {
+    if (option === "off") return "Off";
+    if (option === "exact_next_state") return "Exact next state";
+    if (option === "incremental_merge") return "Incremental merge";
   }
   return option;
 }
@@ -104,6 +117,7 @@ const CONFIG_FIELD_BLOCKS = [
   { id: "rl_core", title: "RL core", fields: ["alpha", "gamma"] },
   { id: "policy", title: "Policy & actions", fields: ["policy_type", "action_axis"] },
   { id: "epsilon", title: "ε-greedy", fields: ["epsilon_start", "epsilon_end", "epsilon_decay"] },
+  { id: "ucb", title: "UCB", fields: ["ucb_c"] },
   { id: "decay", title: "Decay schedule", fields: ["temperature_decay_mode"] },
   {
     id: "temperature",
@@ -113,7 +127,7 @@ const CONFIG_FIELD_BLOCKS = [
   {
     id: "reward",
     title: "Reward & trace",
-    fields: ["completion_bonus_multiplier", "lambda_param", "trace_threshold"]
+    fields: ["coverage_reward_enabled", "completion_bonus_multiplier", "lambda_param", "trace_threshold"]
   },
   { id: "artifacts", title: "Artifacts", fields: ["export_q_table_all_epoch"] }
 ];
@@ -141,12 +155,14 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
   const currentValue = runConfigForm?.[fieldName];
 
   if (resolvedType === "boolean") {
+    const isCoverageRewardToggle = fieldName === "coverage_reward_enabled";
+    const checkedValue = isCoverageRewardToggle ? currentValue !== false : Boolean(currentValue);
     return (
       <label className="field-label inline-checkbox" key={fieldName}>
         <span>{formatConfigLabel(fieldName)}</span>
         <input
           type="checkbox"
-          checked={Boolean(currentValue)}
+          checked={checkedValue}
           onChange={(e) =>
             setRunConfigForm((prev) => ({
               ...prev,
@@ -160,11 +176,39 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
 
   const enumOptions = Array.isArray(fieldSchema?.enum) ? fieldSchema.enum : null;
   if (resolvedType === "string" && enumOptions && enumOptions.length > 0) {
+    const currentEnumValue = String(currentValue ?? enumOptions[0]);
+    if (enumOptions.length === 2) {
+      return (
+        <label className="field-label" key={fieldName}>
+          {formatConfigLabel(fieldName)}
+          <div className="segmented-toggle segmented-toggle--dense">
+            {enumOptions.map((option) => {
+              const optionValue = String(option);
+              return (
+                <button
+                  key={optionValue}
+                  type="button"
+                  className={`segment-btn ${currentEnumValue === optionValue ? "active" : ""}`}
+                  onClick={() =>
+                    setRunConfigForm((prev) => ({
+                      ...prev,
+                      [fieldName]: option
+                    }))
+                  }
+                >
+                  {formatEnumOptionLabel(fieldName, option)}
+                </button>
+              );
+            })}
+          </div>
+        </label>
+      );
+    }
     return (
       <label className="field-label" key={fieldName}>
         {formatConfigLabel(fieldName)}
         <select
-          value={String(currentValue ?? enumOptions[0])}
+          value={currentEnumValue}
           onChange={(e) =>
             setRunConfigForm((prev) => ({
               ...prev,
@@ -214,10 +258,16 @@ function filterEntriesByPolicy(schemaEntries, policyType) {
       "temperature_start_mode",
       "temperature_start_multiplier",
       "temperature_end",
-      "temperature_decay"
+      "temperature_decay",
+      "temperature_decay_mode"
     ].includes(fieldName);
+    const isUcbField = fieldName === "ucb_c";
     if (policyType === "softmax" && isEpsilonField) return false;
+    if (policyType === "softmax" && isUcbField) return false;
     if (policyType === "epsilon_greedy" && isTemperatureField) return false;
+    if (policyType === "epsilon_greedy" && isUcbField) return false;
+    if (policyType === "ucb" && isEpsilonField) return false;
+    if (policyType === "ucb" && isTemperatureField) return false;
     return true;
   });
 }
@@ -240,18 +290,32 @@ function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm }) {
       <>
         <label className="field-label">
           Temperature start mode
-          <select
-            value={temperatureStartMode}
-            onChange={(e) =>
-              setRunConfigForm((prev) => ({
-                ...prev,
-                temperature_start_mode: e.target.value
-              }))
-            }
-          >
-            <option value="manual">Manual</option>
-            <option value="node_count_multiplier">By node count</option>
-          </select>
+          <div className="segmented-toggle segmented-toggle--dense">
+            <button
+              type="button"
+              className={`segment-btn ${temperatureStartMode === "manual" ? "active" : ""}`}
+              onClick={() =>
+                setRunConfigForm((prev) => ({
+                  ...prev,
+                  temperature_start_mode: "manual"
+                }))
+              }
+            >
+              Manual
+            </button>
+            <button
+              type="button"
+              className={`segment-btn ${temperatureStartMode === "node_count_multiplier" ? "active" : ""}`}
+              onClick={() =>
+                setRunConfigForm((prev) => ({
+                  ...prev,
+                  temperature_start_mode: "node_count_multiplier"
+                }))
+              }
+            >
+              By node count
+            </button>
+          </div>
         </label>
         {temperatureStartMode === "node_count_multiplier" ? (
           <label className="field-label">
@@ -565,20 +629,13 @@ function RunTopologyPanel({
             {phase === "add_backbone" ? (
       <label className="field-label">
                 Backbone
-                <select
-                  value=""
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v) onWizardBackbonePick(v);
-                  }}
-                >
-                  <option value="">Chọn backbone…</option>
+                <div className="segmented-toggle segmented-toggle--dense">
                   {BACKBONE_OPTIONS.map((o) => (
-                    <option key={o.id} value={o.id}>
+                    <button key={o.id} type="button" className="segment-btn" onClick={() => onWizardBackbonePick(o.id)}>
                       {o.label}
-                    </option>
+                    </button>
                   ))}
-                </select>
+                </div>
       </label>
             ) : null}
             {showWizardPolicy ? (
@@ -659,13 +716,18 @@ function RunTopologyPanel({
             </div>
       <label className="field-label">
               Backbone
-              <select value={currentBackbone} onChange={(e) => onIdleBackboneChange(e.target.value)}>
+              <div className="segmented-toggle segmented-toggle--dense">
                 {BACKBONE_OPTIONS.map((o) => (
-                  <option key={o.id} value={o.id}>
+                  <button
+                    key={o.id}
+                    type="button"
+                    className={`segment-btn ${currentBackbone === o.id ? "active" : ""}`}
+                    onClick={() => onIdleBackboneChange(o.id)}
+                  >
                     {o.label}
-                  </option>
+                  </button>
                 ))}
-              </select>
+              </div>
       </label>
           </>
         )}
@@ -968,20 +1030,13 @@ function RunMultiPanel({
             {phase === "add_backbone" ? (
       <label className="field-label">
                 Backbone
-                <select
-                  value=""
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v) onWizardBackbonePick(v);
-                  }}
-                >
-                  <option value="">Chọn backbone…</option>
+                <div className="segmented-toggle segmented-toggle--dense">
                   {BACKBONE_OPTIONS.map((o) => (
-                    <option key={o.id} value={o.id}>
+                    <button key={o.id} type="button" className="segment-btn" onClick={() => onWizardBackbonePick(o.id)}>
                       {o.label}
-                    </option>
+                    </button>
                   ))}
-                </select>
+                </div>
       </label>
             ) : null}
             {showWizardPolicy ? (
@@ -1062,13 +1117,18 @@ function RunMultiPanel({
             </div>
             <label className="field-label">
               Backbone
-              <select value={currentBackbone} onChange={(e) => onIdleBackboneChange(e.target.value)}>
+              <div className="segmented-toggle segmented-toggle--dense">
                 {BACKBONE_OPTIONS.map((o) => (
-                  <option key={o.id} value={o.id}>
+                  <button
+                    key={o.id}
+                    type="button"
+                    className={`segment-btn ${currentBackbone === o.id ? "active" : ""}`}
+                    onClick={() => onIdleBackboneChange(o.id)}
+                  >
                     {o.label}
-                  </option>
+                  </button>
                 ))}
-              </select>
+              </div>
             </label>
           </>
         )}
@@ -1115,7 +1175,7 @@ function RunMultiPanel({
         />
       </label>
       <p className="muted batch-artifact-hint">
-        Path signature: lưu path CSV, delay per episode, state/transmission best epoch. Delay per episode: chỉ lưu CSV delay theo episode.
+        Path signature: lưu run bundle (delay/path series), decision graph và trace epochs. Delay per episode: chỉ run bundle (không graph/trace).
       </p>
 
       <section className="config-field-block config-field-block--randomness">
@@ -1175,6 +1235,68 @@ function CsvIconButton({ payload, filename = "artifact.csv" }) {
   );
 }
 
+function buildDelayPathCountRows(delayRows, pathRows) {
+  const episodeDelay = new Map();
+  delayRows.forEach((row) => {
+    const episode = Number(row.episode);
+    const delay = Number(row.delay);
+    if (!Number.isFinite(episode) || !Number.isFinite(delay)) return;
+    episodeDelay.set(episode, delay);
+  });
+  if (episodeDelay.size === 0) return [];
+
+  const pathsByDelay = new Map();
+  pathRows.forEach((row) => {
+    const episode = Number(row.episode);
+    const signature = typeof row.path_signature === "string" ? row.path_signature.trim() : "";
+    if (!Number.isFinite(episode) || !signature) return;
+    const delay = episodeDelay.get(episode);
+    if (!Number.isFinite(delay)) return;
+    if (!pathsByDelay.has(delay)) pathsByDelay.set(delay, new Set());
+    pathsByDelay.get(delay).add(signature);
+  });
+
+  const delays =
+    pathsByDelay.size > 0
+      ? [...pathsByDelay.keys()]
+      : [...new Set(episodeDelay.values())];
+
+  return delays
+    .sort((a, b) => a - b)
+    .map((delay) => {
+      const pathSet = pathsByDelay.get(delay);
+      if (pathSet) {
+        return { delay, pathCount: pathSet.size };
+      }
+      const episodeCount = [...episodeDelay.entries()].filter(([, d]) => d === delay).length;
+      return { delay, pathCount: episodeCount };
+    });
+}
+
+function DelayPathCountTable({ rows, hasPathSignatures }) {
+  if (!rows?.length) return null;
+  return (
+    <div className="delay-path-count-table-wrap">
+      <table className="delay-path-count-table">
+        <thead>
+          <tr>
+            <th>Delay</th>
+            <th>{hasPathSignatures ? "Path count" : "Episodes"}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.delay}>
+              <td>{row.delay}</td>
+              <td>{row.pathCount}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function DelayLineChart({ rows }) {
   if (!rows || rows.length === 0) {
     return <p className="muted">No delay-per-episode data.</p>;
@@ -1204,53 +1326,6 @@ function DelayLineChart({ rows }) {
         <span>Episodes: {values.length}</span>
         <span>
           Delay range: {min} - {max}
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function PolicyTraceLineChart({ rows }) {
-  if (!rows || rows.length === 0) {
-    return <p className="muted">No policy trace data.</p>;
-  }
-  const width = 320;
-  const height = 120;
-  const sampleRow = rows[0] ?? {};
-  const isSoftmaxTrace = "temperature_before" in sampleRow || "temperature_after" in sampleRow;
-  const beforeKey = isSoftmaxTrace ? "temperature_before" : "epsilon_before";
-  const afterKey = isSoftmaxTrace ? "temperature_after" : "epsilon_after";
-  const metricLabel = isSoftmaxTrace ? "Temperature" : "Epsilon";
-  const before = rows.map((row) => Number(row[beforeKey])).filter((n) => Number.isFinite(n));
-  const after = rows.map((row) => Number(row[afterKey])).filter((n) => Number.isFinite(n));
-  const values = [...before, ...after];
-  if (values.length === 0) return <p className="muted">No policy trace data.</p>;
-  const startValue = before.length > 0 ? before[0] : values[0];
-  const endValue = after.length > 0 ? after[after.length - 1] : values[values.length - 1];
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
-  const pointsFor = (series) =>
-    series
-      .map((val, idx) => {
-        const x = (idx / Math.max(1, series.length - 1)) * (width - 16) + 8;
-        const y = height - ((val - min) / span) * (height - 20) - 10;
-        return `${x},${y}`;
-      })
-      .join(" ");
-  return (
-    <div className="delay-chart-wrap">
-      <svg viewBox={`0 0 ${width} ${height}`} className="delay-chart">
-        <rect x="0" y="0" width={width} height={height} fill="#fbfbff" />
-        <polyline points={pointsFor(before)} fill="none" stroke="#4E79A7" strokeWidth="2" />
-        <polyline points={pointsFor(after)} fill="none" stroke="#E15759" strokeWidth="2" />
-      </svg>
-      <div className="delay-chart-meta">
-        <span>Episodes: {rows.length}</span>
-        <span>
-          {isSoftmaxTrace
-            ? `Tem start: ${startValue.toFixed(3)} | Tem end: ${endValue.toFixed(3)}`
-            : `Epsilon start: ${startValue.toFixed(3)} | Epsilon end: ${endValue.toFixed(3)}`}
         </span>
       </div>
     </div>
@@ -1317,7 +1392,7 @@ function ResultsPanel({
           .filter(Boolean)
       ).size
     : 0;
-  const hasPolicyTrace = latestRunCapabilities?.has_policy_trace ?? true;
+  const hasPolicyTrace = (latestRunCapabilities?.has_policy_trace ?? true) && policyRows.length > 0;
   const hasStateActionTrace = latestRunCapabilities?.has_state_action_trace ?? true;
   const hasEpisodeSeries = latestRunCapabilities?.has_episode_series ?? true;
   const hasEpochCompare = latestRunCapabilities?.has_epoch_compare ?? true;
@@ -1330,19 +1405,23 @@ function ResultsPanel({
     replaySlotNum > 0
       ? timeslots.find((item) => Number(item.timeslot) === replaySlotNum) ?? timeslots[replaySlotNum - 1] ?? null
       : null;
+  const singleRunConfigResult = useMemo(
+    () => buildRunConfigResultFromResolved(resolvedRunConfigPayload, latestHistory),
+    [resolvedRunConfigPayload, latestHistory]
+  );
+  const delayPathCountRows = useMemo(
+    () => buildDelayPathCountRows(parseCsvRows(delayPerEpisodePayload), parseCsvRows(pathSignaturesPayload)),
+    [delayPerEpisodePayload, pathSignaturesPayload]
+  );
   return (
     <div className="results-panel">
-      {focusedBatchRunResult?.resolved_run_config ? (
-        <>
-          <h4>Resolved run config</h4>
-          <pre className="run-config-readonly">{JSON.stringify(focusedBatchRunResult.resolved_run_config, null, 2)}</pre>
-          <hr className="results-divider" />
-        </>
-      ) : null}
+      {singleRunConfigResult ? <RunConfigPanel result={singleRunConfigResult} showDivider={false} /> : null}
+      {singleRunConfigResult ? <hr className="results-divider" /> : null}
       {hasEpisodeSeries ? (
         <>
           <h4>Delay per episode</h4>
           <DelayLineChart rows={delayRows} />
+          <DelayPathCountTable rows={delayPathCountRows} hasPathSignatures={hasPathSignatures && pathRows.length > 0} />
         </>
       ) : null}
       {hasPolicyTrace ? (
@@ -1458,6 +1537,12 @@ function ResultsPanel({
           <dd>{latestHistory.lower_bound ?? "-"}</dd>
           <dt>Best delay explored</dt>
           <dd>{latestHistory.best_delay_explored ?? "-"}</dd>
+          <dt>States (Q-table)</dt>
+          <dd>{latestHistory.total_states ?? "-"}</dd>
+          <dt>State–action pairs</dt>
+          <dd>{latestHistory.total_state_actions ?? "-"}</dd>
+          <dt>Decision graph edges</dt>
+          <dd>{latestHistory.decision_graph_edges ?? "-"}</dd>
         </dl>
       ) : (
         <p className="muted">No history yet for this topology.</p>
@@ -1482,13 +1567,6 @@ function ResultsPanel({
             <dt>Reward final</dt>
             <dd>{runSummaryPayload.reward_final ?? "-"}</dd>
           </dl>
-          <hr className="results-divider" />
-          <h4>Resolved run config</h4>
-          {resolvedRunConfigPayload ? (
-            <pre className="run-config-readonly">{JSON.stringify(resolvedRunConfigPayload, null, 2)}</pre>
-          ) : (
-            <p className="muted">No resolved run config snapshot.</p>
-          )}
         </>
       ) : (
         <p className="muted">No artifact summary loaded.</p>
@@ -1564,13 +1642,53 @@ function DetailPanel({ detail, isLoading }) {
   );
 }
 
+function DecisionTreeLayoutControl({ label, value, min, max, step, onChange, formatValue }) {
+  const display = formatValue ? formatValue(value) : `${Number(value).toFixed(2)}×`;
+  return (
+    <label className="field-label">
+      {label}
+      <div className="playground-tree-layout-row">
+        <input
+          type="number"
+          className="playground-tree-layout-input"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(e) => {
+            const next = Number(e.target.value);
+            if (Number.isFinite(next)) onChange(clampLayoutValue(next, min, max));
+          }}
+        />
+        <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} />
+        <span className="playground-tree-layout-value">{display}</span>
+      </div>
+    </label>
+  );
+}
+
+function clampLayoutValue(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function PlaygroundPanel({
   selectedTopology,
   playgroundState,
   playgroundNextStateCount,
   setPlaygroundMode,
   setPlaygroundViewSlot,
-  onReset
+  onReset,
+  decisionTreeRowSpread,
+  setDecisionTreeRowSpread,
+  decisionTreeFontScale,
+  setDecisionTreeFontScale,
+  decisionTreeEdgeScale,
+  setDecisionTreeEdgeScale,
+  decisionTreeNodeScale,
+  setDecisionTreeNodeScale,
+  decisionTreeEdgeOpacity,
+  setDecisionTreeEdgeOpacity,
+  onSaveDecisionTreeLayoutDefaults
 }) {
   const totalCovered = playgroundState?.coveredNodeIds?.length ?? 1;
   const totalSlots = playgroundState?.timeslots?.length ?? 0;
@@ -1637,6 +1755,81 @@ function PlaygroundPanel({
               : "Timeline is in history mode. Move back to the latest slot to continue."}
         </p>
       </div>
+      <div className="playground-side-block playground-tree-layout-block">
+        <h5 className="playground-tree-layout-title">Decision tree layout</h5>
+        <label className="field-label">
+          Vertical spread
+          <div className="playground-tree-layout-row">
+            <input
+              type="number"
+              className="playground-tree-layout-input"
+              min="0.5"
+              max="2.5"
+              step="0.05"
+              value={decisionTreeRowSpread}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                if (Number.isFinite(next)) setDecisionTreeRowSpread(clampLayoutValue(next, 0.5, 2.5));
+              }}
+            />
+            <input
+              type="range"
+              min="0.5"
+              max="2.5"
+              step="0.05"
+              value={decisionTreeRowSpread}
+              onChange={(e) => setDecisionTreeRowSpread(Number(e.target.value))}
+            />
+            <span className="playground-tree-layout-value">{Number(decisionTreeRowSpread).toFixed(2)}×</span>
+          </div>
+        </label>
+        <DecisionTreeLayoutControl
+          label="Font size"
+          value={decisionTreeFontScale}
+          min={0.5}
+          max={3}
+          step={0.05}
+          onChange={setDecisionTreeFontScale}
+        />
+        <DecisionTreeLayoutControl
+          label="Edge size"
+          value={decisionTreeEdgeScale}
+          min={0.4}
+          max={3}
+          step={0.05}
+          onChange={setDecisionTreeEdgeScale}
+        />
+        <DecisionTreeLayoutControl
+          label="Node size"
+          value={decisionTreeNodeScale}
+          min={0.4}
+          max={3}
+          step={0.05}
+          onChange={setDecisionTreeNodeScale}
+        />
+        <label className="field-label">
+          Edge opacity
+          <div className="playground-tree-layout-row">
+            <input
+              type="range"
+              min="0.15"
+              max="1"
+              step="0.05"
+              value={decisionTreeEdgeOpacity}
+              onChange={(e) => setDecisionTreeEdgeOpacity(Number(e.target.value))}
+            />
+            <span className="playground-tree-layout-value">{Math.round(decisionTreeEdgeOpacity * 100)}%</span>
+          </div>
+        </label>
+        <button
+          type="button"
+          className="secondary-cta small playground-tree-layout-save"
+          onClick={onSaveDecisionTreeLayoutDefaults}
+          title="Save current layout values as defaults for future sessions."
+        >
+          Save as default
+        </button>
+      </div>
     </div>
   );
 }
@@ -1662,6 +1855,90 @@ function computeTemperatureRows(qValues = [], tau = 1) {
     action: `A${index + 1}`,
     probability: expSum > 0 ? expValues[index] / expSum : 0
   }));
+}
+
+function computeUcbSummaryRows(qValues = [], visitCounts = [], globalT = 1, ucbC = 1.414) {
+  const values = (qValues ?? []).map((value) => Number(value) || 0);
+  const visits = (visitCounts ?? []).map((value) => Math.max(0, Math.trunc(Number(value) || 0)));
+  const t = Math.max(Number(globalT) || 0, 1);
+  const c = Number(ucbC) || 1.414;
+  const logT = Math.log(t);
+
+  const rows = values.map((qValue, index) => {
+    const visitCount = visits[index] ?? 0;
+    const unvisited = visitCount === 0;
+    const bonus = unvisited ? null : c * Math.sqrt(logT / visitCount);
+    const score = unvisited ? null : qValue + bonus;
+    return {
+      action: `A${index + 1}`,
+      score,
+      unvisited,
+      selected: false
+    };
+  });
+
+  const unvisitedRows = rows.filter((row) => row.unvisited);
+  let selectedAction = null;
+  if (unvisitedRows.length > 0) {
+    selectedAction = unvisitedRows.reduce(
+      (minAction, row) => (minAction == null || row.action < minAction ? row.action : minAction),
+      null
+    );
+  } else if (rows.length > 0) {
+    const bestRow = rows.reduce((best, row) =>
+      best == null || (row.score ?? -Infinity) > (best.score ?? -Infinity) ? row : best
+    );
+    selectedAction = bestRow?.action ?? null;
+  }
+
+  return rows.map((row) => ({ ...row, selected: row.action === selectedAction }));
+}
+
+function HomeUcbSummaryPanel({ ucbTool, onFontScaleChange }) {
+  const rows = useMemo(
+    () =>
+      computeUcbSummaryRows(
+        ucbTool?.qValues ?? [],
+        ucbTool?.visitCounts ?? [],
+        ucbTool?.globalT ?? 1,
+        ucbTool?.ucbC ?? 1.414
+      ),
+    [ucbTool?.qValues, ucbTool?.visitCounts, ucbTool?.globalT, ucbTool?.ucbC]
+  );
+  const selectedRow = rows.find((row) => row.selected) ?? null;
+  const fontScale = Number(ucbTool?.fontScale) || 1;
+  return (
+    <div className="placeholder-card">
+      <h4>UCB tool</h4>
+      <dl>
+        <dt>Global t</dt>
+        <dd>{Math.round(Number(ucbTool?.globalT ?? 0))}</dd>
+        <dt>UCB c</dt>
+        <dd>{Number(ucbTool?.ucbC ?? 0).toFixed(3)}</dd>
+        <dt>Action count</dt>
+        <dd>{ucbTool?.actionCount ?? 0}</dd>
+        <dt>Selected action</dt>
+        <dd>
+          {selectedRow
+            ? `${selectedRow.action}${selectedRow.unvisited ? " (unvisited)" : ` (${Number(selectedRow.score).toFixed(3)})`}`
+            : "-"}
+        </dd>
+      </dl>
+      <label className="field-label temperature-font-control">
+        Font size
+        <input
+          type="range"
+          min="0.8"
+          max="1.8"
+          step="0.05"
+          value={fontScale}
+          onChange={(e) => onFontScaleChange(Number(e.target.value))}
+        />
+        <small className="muted">{fontScale.toFixed(2)}x</small>
+      </label>
+      <p className="muted">Adjust Q, N(s,a), global t, and c in the main panel to see UCB scores update in real time.</p>
+    </div>
+  );
 }
 
 function HomeTemperatureSummaryPanel({ temperatureTool, onFontScaleChange }) {
@@ -1694,7 +1971,7 @@ function HomeTemperatureSummaryPanel({ temperatureTool, onFontScaleChange }) {
         />
         <small className="muted">{fontScale.toFixed(2)}x</small>
       </label>
-      <p className="muted">Adjust tau and q-value sliders in Main Panel 1 to see softmax probabilities update in real time.</p>
+      <p className="muted">Adjust tau and q-value sliders in the main panel to see softmax probabilities update in real time.</p>
     </div>
   );
 }
@@ -1872,6 +2149,27 @@ function ContextPlaceholderPanel({ message }) {
   );
 }
 
+function RunConfigPanel({ result, showDivider = true }) {
+  const { merged } = mergeDisplayConfig(result);
+  const hasConfig = merged && Object.keys(merged).length > 0;
+
+  if (!hasConfig && !result?.algorithm_id && !result?.preset_name) {
+    return null;
+  }
+
+  return (
+    <>
+      {showDivider ? <hr className="results-divider" /> : null}
+      <h4>Run config</h4>
+      <RunConfigVisibilityTable result={result} />
+    </>
+  );
+}
+
+function BatchRunConfigPanel({ result }) {
+  return <RunConfigPanel result={result} />;
+}
+
 function BatchRunResultSummaryPanel({ result }) {
   if (!result) {
     return <ContextPlaceholderPanel message="No batch result selected." />;
@@ -1885,7 +2183,7 @@ function BatchRunResultSummaryPanel({ result }) {
         <dt>Label</dt>
         <dd>{result.result_label ?? "-"}</dd>
         <dt>Batch run ID</dt>
-        <dd>{result.batch_run_id ?? "-"}</dd>
+        <dd className="batch-run-id-dd">{result.batch_run_id ?? "-"}</dd>
         <dt>Status</dt>
         <dd>{result.batch_status ?? "-"}</dd>
         <dt>Topologies with results</dt>
@@ -1893,13 +2191,9 @@ function BatchRunResultSummaryPanel({ result }) {
         <dt>Density groups</dt>
         <dd>{densityGroupCount}</dd>
       </dl>
-      {result.resolved_run_config ? (
-        <>
-          <hr className="results-divider" />
-          <h4>Resolved run config</h4>
-          <pre className="run-config-readonly">{JSON.stringify(result.resolved_run_config, null, 2)}</pre>
-        </>
-      ) : null}
+      <BatchPolicyTraceCard result={result} />
+      <hr className="results-divider" />
+      <BatchRunConfigPanel result={result} />
     </div>
   );
 }
@@ -1984,9 +2278,25 @@ export default function RightControlPanel({
   playgroundNextStateCount,
   temperatureTool,
   updateTemperatureFontScale,
+  homeToolTab,
+  ucbTool,
+  updateUcbFontScale,
   setPlaygroundMode,
   setPlaygroundViewSlot,
-  onResetPlayground
+  onResetPlayground,
+  decisionTreeRowSpread,
+  setDecisionTreeRowSpread,
+  decisionTreeFontScale,
+  setDecisionTreeFontScale,
+  decisionTreeEdgeScale,
+  setDecisionTreeEdgeScale,
+  decisionTreeNodeScale,
+  setDecisionTreeNodeScale,
+  decisionTreeEdgeOpacity,
+  setDecisionTreeEdgeOpacity,
+  onSaveDecisionTreeLayoutDefaults,
+  rightExportContext,
+  onOpenExportModal
 }) {
   const isTopologiesMode = activeMenu === "topologies";
   const isRunTopoMode = activeMenu === "run_topo";
@@ -2106,14 +2416,23 @@ export default function RightControlPanel({
             </>
           )}
         </div>
+        {rightExportContext ? (
+          <button type="button" className="secondary-cta small right-panel-export-btn" onClick={onOpenExportModal}>
+            Export CSV
+          </button>
+        ) : null}
       </header>
 
-      <section className="right-panel-content">
+      <section className="right-panel-content ui-scroll">
         {activeMenu === "home" ? (
-          <HomeTemperatureSummaryPanel
-            temperatureTool={temperatureTool}
-            onFontScaleChange={updateTemperatureFontScale}
-          />
+          homeToolTab === "ucb" ? (
+            <HomeUcbSummaryPanel ucbTool={ucbTool} onFontScaleChange={updateUcbFontScale} />
+          ) : (
+            <HomeTemperatureSummaryPanel
+              temperatureTool={temperatureTool}
+              onFontScaleChange={updateTemperatureFontScale}
+            />
+          )
         ) : isTopologiesMode ? (
           isBatchGridView ? (
             <TopologiesEmptyPanel />
@@ -2159,6 +2478,17 @@ export default function RightControlPanel({
               setPlaygroundMode={setPlaygroundMode}
               setPlaygroundViewSlot={setPlaygroundViewSlot}
               onReset={onResetPlayground}
+              decisionTreeRowSpread={decisionTreeRowSpread}
+              setDecisionTreeRowSpread={setDecisionTreeRowSpread}
+              decisionTreeFontScale={decisionTreeFontScale}
+              setDecisionTreeFontScale={setDecisionTreeFontScale}
+              decisionTreeEdgeScale={decisionTreeEdgeScale}
+              setDecisionTreeEdgeScale={setDecisionTreeEdgeScale}
+              decisionTreeNodeScale={decisionTreeNodeScale}
+              setDecisionTreeNodeScale={setDecisionTreeNodeScale}
+              decisionTreeEdgeOpacity={decisionTreeEdgeOpacity}
+              setDecisionTreeEdgeOpacity={setDecisionTreeEdgeOpacity}
+              onSaveDecisionTreeLayoutDefaults={onSaveDecisionTreeLayoutDefaults}
             />
           ) : (
             <DetailPanel detail={topologyDetail} isLoading={isLoadingDetail} />

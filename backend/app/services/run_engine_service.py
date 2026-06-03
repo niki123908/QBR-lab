@@ -88,6 +88,9 @@ def _persist_run_success(run_id: str, topology_id: str, runtime_sec: float, resu
             lower_bound=result.lower_bound,
             best_delay_explored=result.best_delay_explored,
             reward_final=result.reward_final,
+            total_states=result.total_states,
+            total_state_actions=result.total_state_actions,
+            decision_graph_edges=result.decision_graph_edges,
         )
         session.add(metric)
 
@@ -95,7 +98,14 @@ def _persist_run_success(run_id: str, topology_id: str, runtime_sec: float, resu
             checksum: str | None = None
             if path.exists() and path.is_file():
                 try:
-                    checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        while True:
+                            block = handle.read(1024 * 1024)
+                            if not block:
+                                break
+                            digest.update(block)
+                    checksum = digest.hexdigest()
                 except OSError:
                     checksum = None
             artifact = Artifact(
@@ -108,7 +118,7 @@ def _persist_run_success(run_id: str, topology_id: str, runtime_sec: float, resu
             session.add(artifact)
 
 
-def _persist_run_failure(run_id: str, topology_id: str, started: float) -> None:
+def _persist_run_failure(run_id: str, topology_id: str, started: float, exc: BaseException | None = None) -> None:
     with db_session_scope() as session:
         run = session.get(Run, run_id)
         topology = session.get(Topology, topology_id)
@@ -116,7 +126,7 @@ def _persist_run_failure(run_id: str, topology_id: str, started: float) -> None:
             run.status = "failed"
             run.runtime_sec = time.monotonic() - started
             run.ended_at = _utcnow()
-            run.error_message = "Failed."
+            run.error_message = str(exc)[:500] if exc else "Failed."
             run.worker_id = None
             run.heartbeat_at = None
             run.claimed_at = None
@@ -193,8 +203,8 @@ def _execute_run(
             result.artifact_paths = {k: v for k, v in result.artifact_paths.items() if k in kept_artifact_types}
         runtime_sec = time.monotonic() - started
         _persist_run_success(run_id=run_id, topology_id=topology_id, runtime_sec=runtime_sec, result=result)
-    except Exception:
-        _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started)
+    except Exception as exc:
+        _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started, exc=exc)
         raise
 
 
@@ -251,12 +261,13 @@ def execute_queued_single_run(run_id: str) -> None:
             run_config=payload.get("run_config") or {},
             draft_preset_id=payload.get("draft_preset_id"),
         )
-    except Exception:
+    except Exception as exc:
         with db_session_scope() as session:
             row = session.get(Run, run_id)
             topology_id = row.topology_id if row is not None else ""
-        if topology_id:
-            _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started)
+            already_failed = row is not None and row.status == "failed"
+        if topology_id and not already_failed:
+            _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started, exc=exc)
         raise
 
 def _load_batch_payload_and_pairs(batch_run_id: str) -> tuple[dict[str, Any], list[tuple[str, str]]]:
@@ -314,9 +325,13 @@ def execute_queued_batch_run(run_id: str) -> None:
             kept_artifact_types=keep_types,
             draft_preset_id=draft_preset_id,
         )
-    except Exception:
+    except Exception as exc:
         if topology_id:
-            _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started)
+            with db_session_scope() as session:
+                row = session.get(Run, run_id)
+                already_failed = row is not None and row.status == "failed"
+            if not already_failed:
+                _persist_run_failure(run_id=run_id, topology_id=topology_id, started=started, exc=exc)
         raise
     finally:
         if batch_run_id:
@@ -333,17 +348,10 @@ def _expand_partial_artifact_types(types: list[str]) -> set[str]:
     """Map UI / API artifact names to runner artifact dict keys (see qbr_runner artifact_paths)."""
     expanded: set[str] = {"resolved_run_config"}
     for raw in types:
-        if raw == "path_signature":
-            expanded.update(
-                {
-                    "path_signatures",
-                    "delay_per_episode",
-                    "state_action_best_epoch",
-                    "transmission_best_epoch",
-                }
-            )
+        if raw in {"path_signature", "analytics"}:
+            expanded.update({"run_bundle", "run_decision_graph", "trace_epochs"})
         elif raw == "delay_per_episode":
-            expanded.add("delay_per_episode")
+            expanded.add("run_bundle")
         else:
             expanded.add(raw)
     return expanded
@@ -359,6 +367,7 @@ def run_batch_topologies(
     selected_artifact_topology_ids: list[str],
     selected_artifact_types: list[str],
     draft_preset_id: str | None = None,
+    result_label: str | None = None,
 ) -> str:
     if not topology_ids:
         raise ValueError("Failed.")
@@ -379,5 +388,6 @@ def run_batch_topologies(
         algorithm_id=algorithm_id,
         preset_id=preset_id,
         payload=payload,
+        result_label=result_label,
     )
     return batch_run_id

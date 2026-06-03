@@ -34,6 +34,7 @@ class BatchRunGroup(Base):
     stop_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     total_topologies: Mapped[int] = mapped_column(Integer, nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    result_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -65,6 +66,9 @@ class Topology(Base):
     )
     runs: Mapped[list["Run"]] = relationship(back_populates="topology", passive_deletes=True)
     metric: Mapped["TopologyMetric | None"] = relationship(
+        back_populates="topology", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
+    playground_tree: Mapped["TopologyPlaygroundTree | None"] = relationship(
         back_populates="topology", uselist=False, cascade="all, delete-orphan", passive_deletes=True
     )
 
@@ -99,6 +103,22 @@ class TopologyMetric(Base):
     )
 
     topology: Mapped["Topology"] = relationship(back_populates="metric")
+
+
+class TopologyPlaygroundTree(Base):
+    """Persisted Playground state decision tree per topology."""
+
+    __tablename__ = "topology_playground_trees"
+
+    topology_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("topologies.id", ondelete="CASCADE"), primary_key=True
+    )
+    tree_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    topology: Mapped["Topology"] = relationship(back_populates="playground_tree")
 
 
 class Run(Base):
@@ -141,6 +161,9 @@ class RunMetric(Base):
     lower_bound: Mapped[int | None] = mapped_column(Integer, nullable=True)
     best_delay_explored: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reward_final: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_states: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_state_actions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision_graph_edges: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )

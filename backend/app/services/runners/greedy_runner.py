@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
 
 from app.algorithms.br_env import Br_Env, hash_state
 from app.algorithms.common import trees
-from app.services.runners.base import RunExecutionResult, RunnerContext
-
-
-def _timeout_seconds(node_count: int) -> int:
-    return 300 if node_count < 500 else 900
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+from app.services.run_artifacts import (
+    build_greedy_run_bundle,
+    build_trace_epochs_payload,
+    learning_stats_from_episode_steps,
+    write_gzip_json,
+)
+from app.services.runners.base import RunExecutionResult, RunnerContext, TOPOLOGY_RUN_TIMEOUT_SEC
 
 
 def _pick_first_broadcaster(env: Br_Env) -> int:
@@ -30,12 +25,11 @@ def _pick_first_broadcaster(env: Br_Env) -> int:
 
 def execute_greedy(context: RunnerContext) -> RunExecutionResult:
     run_id = context.run_id
-    topology = context.topology
     nodes = context.nodes
 
     env = Br_Env(nodes, 1)
     lower_bound = int(env.network_diameter())
-    timeout_sec = _timeout_seconds(topology.node_count)
+    timeout_sec = TOPOLOGY_RUN_TIMEOUT_SEC
     started = time.monotonic()
 
     done = env.reset()
@@ -48,7 +42,7 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
 
     while not done:
         if (time.monotonic() - started) > timeout_sec:
-            raise TimeoutError("Failed.")
+            raise TimeoutError(f"Training exceeded {timeout_sec}s wall-clock limit.")
 
         env.cur_time += 1
         env._find_br_rcv_cands()
@@ -90,12 +84,12 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
     artifact_root = Path(__file__).resolve().parents[4] / "storage" / "artifacts" / run_id
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    state_action_path = artifact_root / "state_action_last_epoch.json"
-    transmission_path = artifact_root / "transmission_last_epoch.json"
-    run_summary_path = artifact_root / "run_summary.json"
+    run_bundle_path = artifact_root / "run_bundle.json.gz"
+    trace_epochs_path = artifact_root / "trace_epochs.json.gz"
 
-    state_action_payload = {"delay": int(env.cur_time), "steps": step_rows}
+    state_action_payload = {"episode": 1, "delay": int(env.cur_time), "steps": step_rows}
     transmission_payload = {
+        "episode": 1,
         "total_delay": int(env.cur_time),
         "timeslots": [
             {
@@ -115,18 +109,33 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
         "reward_final": float(total_reward),
     }
 
-    _write_json(state_action_path, state_action_payload)
-    _write_json(transmission_path, transmission_payload)
-    _write_json(run_summary_path, summary_payload)
+    write_gzip_json(
+        run_bundle_path,
+        build_greedy_run_bundle(
+            run_id=run_id,
+            summary_payload=summary_payload,
+            transmission_payload=transmission_payload,
+            state_action_payload=state_action_payload,
+        ),
+    )
+    write_gzip_json(
+        trace_epochs_path,
+        build_trace_epochs_payload(state_action_payload, state_action_payload),
+    )
 
+    total_states, total_state_actions = learning_stats_from_episode_steps(
+        [{"episode": 1, "delay": int(env.cur_time), "steps": step_rows}]
+    )
     return RunExecutionResult(
         finished_delay=int(env.cur_time),
         best_delay_explored=int(env.cur_time),
         lower_bound=lower_bound,
         reward_final=float(total_reward),
+        total_states=total_states,
+        total_state_actions=total_state_actions,
+        decision_graph_edges=len(step_rows),
         artifact_paths={
-            "run_summary": run_summary_path,
-            "state_action_last_epoch": state_action_path,
-            "transmission_last_epoch": transmission_path,
+            "run_bundle": run_bundle_path,
+            "trace_epochs": trace_epochs_path,
         },
     )

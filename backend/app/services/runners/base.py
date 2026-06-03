@@ -25,6 +25,12 @@ class RunExecutionResult:
     lower_bound: int
     reward_final: float
     artifact_paths: dict[str, Path]
+    total_states: int | None = None
+    total_state_actions: int | None = None
+    decision_graph_edges: int | None = None
 
 
 AlgorithmRunner = Callable[[RunnerContext], RunExecutionResult]
+
+# Wall-clock budget for one topology training run (seconds).
+TOPOLOGY_RUN_TIMEOUT_SEC = 30 * 60  # 30 minutes

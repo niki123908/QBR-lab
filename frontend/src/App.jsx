@@ -1,9 +1,59 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DashboardSidebar from "./components/DashboardSidebar";
 import MainTopologyPanel from "./components/MainTopologyPanel";
+import PanelResizer from "./components/PanelResizer";
 import RightControlPanel from "./components/RightControlPanel";
+import CsvExportModal from "./components/CsvExportModal";
+import RunBatchNameModal from "./components/RunBatchNameModal";
+import { buildDefaultBatchRunResultLabel } from "./utils/batchRunLabel.js";
+import {
+  DEFAULT_DECISION_TREE_EDGE_OPACITY,
+  DEFAULT_DECISION_TREE_EDGE_SCALE,
+  DEFAULT_DECISION_TREE_FONT_SCALE,
+  DEFAULT_DECISION_TREE_NODE_SCALE,
+  DEFAULT_DECISION_TREE_ROW_SPREAD,
+  EMPTY_PLAYGROUND_TREE
+} from "./components/PlaygroundStateTree";
+import { createExportSnapshot } from "./export/exportSnapshot.js";
+import { resolveExportContext } from "./export/exportContexts.js";
+import { getInitialDecisionTreeLayout, saveDecisionTreeLayoutAsDefault, refreshInitialDecisionTreeLayoutCache } from "./utils/decisionTreeLayoutStorage.js";
+import { hydrateLegacyRunArtifactState } from "./utils/runArtifactHydration.js";
+import { buildPolicyTraceFromConfig } from "./utils/policyTrace.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
+
+const PANEL_LAYOUT_STORAGE_KEY = "qbr.panel-layout";
+const SIDEBAR_WIDTH_DEFAULT = 280;
+const RIGHT_PANEL_WIDTH_DEFAULT = 420;
+const SIDEBAR_WIDTH_MIN = 220;
+const SIDEBAR_WIDTH_MAX = 360;
+const RIGHT_PANEL_WIDTH_MIN = 280;
+const RIGHT_PANEL_WIDTH_MAX = 560;
+const PANEL_RESIZER_WIDTH = 6;
+
+function clampPanelWidth(value, min, max) {
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function readStoredPanelLayout() {
+  try {
+    const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
+    if (!raw) {
+      return { sidebarWidth: SIDEBAR_WIDTH_DEFAULT, rightPanelWidth: RIGHT_PANEL_WIDTH_DEFAULT };
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      sidebarWidth: clampPanelWidth(parsed.sidebarWidth ?? SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
+      rightPanelWidth: clampPanelWidth(
+        parsed.rightPanelWidth ?? RIGHT_PANEL_WIDTH_DEFAULT,
+        RIGHT_PANEL_WIDTH_MIN,
+        RIGHT_PANEL_WIDTH_MAX
+      )
+    };
+  } catch {
+    return { sidebarWidth: SIDEBAR_WIDTH_DEFAULT, rightPanelWidth: RIGHT_PANEL_WIDTH_DEFAULT };
+  }
+}
 const NODE_OPTIONS = [
   50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750,
   800, 850, 900, 950, 1000
@@ -98,6 +148,21 @@ const INITIAL_TEMPERATURE_TOOL = {
   qMin: -5,
   qMax: 5,
   qValues: [0, 1, 2, 3, 4],
+  fontScale: 1
+};
+const INITIAL_UCB_TOOL = {
+  actionCount: 5,
+  ucbC: 1.414,
+  ucbCMin: 0.1,
+  ucbCMax: 5,
+  globalT: 10,
+  globalTMin: 1,
+  globalTMax: 1000,
+  qMin: -5,
+  qMax: 5,
+  qValues: [0, 1, 2, 3, 4],
+  visitCounts: [1, 2, 1, 0, 0],
+  visitMax: 100,
   fontScale: 1
 };
 
@@ -234,6 +299,12 @@ function simulatePlaygroundSlot(graph, coveredNodeIds, mode, selectedNodeId) {
   };
 }
 
+export function playgroundStateHash(coveredNodeIds) {
+  const sorted = [...(coveredNodeIds ?? [])].sort((a, b) => a - b);
+  if (sorted.length === 1 && sorted[0] === 0) return "0";
+  return sorted.join("/");
+}
+
 function countUniqueNextPlaygroundStates(graph, coveredNodeIds, mode) {
   if (!graph) return 0;
   const { broadcasterCandidates, receiverCandidates } = derivePlaygroundCandidates(graph, coveredNodeIds);
@@ -269,6 +340,13 @@ function resizeQValues(qValues, nextCount, defaultValue = 0) {
   const current = Array.isArray(qValues) ? qValues.slice(0, target) : [];
   while (current.length < target) current.push(defaultValue);
   return current;
+}
+
+function resizeVisitCounts(visitCounts, nextCount, defaultValue = 0) {
+  const target = Math.max(1, Math.min(10, Number(nextCount) || 1));
+  const current = Array.isArray(visitCounts) ? visitCounts.slice(0, target) : [];
+  while (current.length < target) current.push(defaultValue);
+  return current.map((value) => Math.max(0, Math.trunc(Number(value) || 0)));
 }
 
 function clampValue(value, minValue, maxValue) {
@@ -337,6 +415,9 @@ export default function App() {
   const [isRunningSingle, setIsRunningSingle] = useState(false);
   const [pendingSingleRunId, setPendingSingleRunId] = useState(null);
   const [isRunningBatch, setIsRunningBatch] = useState(false);
+  const [runBatchNameModalOpen, setRunBatchNameModalOpen] = useState(false);
+  const [runBatchNameDraft, setRunBatchNameDraft] = useState("");
+  const [runBatchDefaultLabel, setRunBatchDefaultLabel] = useState("");
   const [lastSingleRun, setLastSingleRun] = useState(null);
   const [runHistoryItems, setRunHistoryItems] = useState([]);
   const [runSummaryPayload, setRunSummaryPayload] = useState(null);
@@ -362,7 +443,51 @@ export default function App() {
   const [previewMaxNodesPercent, setPreviewMaxNodesPercent] = useState(80);
   const [previewShowEdges, setPreviewShowEdges] = useState(true);
   const [playgroundState, setPlaygroundState] = useState(INITIAL_PLAYGROUND_STATE);
+  const [playgroundTree, setPlaygroundTree] = useState(null);
+  const [playgroundTreeLoading, setPlaygroundTreeLoading] = useState(false);
+  const [playgroundTreeLoadError, setPlaygroundTreeLoadError] = useState(null);
+  const [playgroundTreeExpanding, setPlaygroundTreeExpanding] = useState(false);
+  const [playgroundTreeExpandStats, setPlaygroundTreeExpandStats] = useState(null);
+  const [playgroundTreeMode, setPlaygroundTreeMode] = useState("manual");
+  const [runDerivedTree, setRunDerivedTree] = useState(null);
+  const [runDerivedTreeLoading, setRunDerivedTreeLoading] = useState(false);
+  const [runDerivedTreeLoadError, setRunDerivedTreeLoadError] = useState(null);
+  const [runDerivedTreeMessage, setRunDerivedTreeMessage] = useState(null);
+  const [runDerivedTreeSourceArtifact, setRunDerivedTreeSourceArtifact] = useState(null);
+  const [playgroundRunSourceId, setPlaygroundRunSourceId] = useState(null);
+  const [decisionTreeRowSpread, setDecisionTreeRowSpread] = useState(() => getInitialDecisionTreeLayout().rowSpread);
+  const [decisionTreeFontScale, setDecisionTreeFontScale] = useState(() => getInitialDecisionTreeLayout().fontScale);
+  const [decisionTreeEdgeScale, setDecisionTreeEdgeScale] = useState(() => getInitialDecisionTreeLayout().edgeScale);
+  const [decisionTreeNodeScale, setDecisionTreeNodeScale] = useState(() => getInitialDecisionTreeLayout().nodeScale);
+  const [decisionTreeEdgeOpacity, setDecisionTreeEdgeOpacity] = useState(() => getInitialDecisionTreeLayout().edgeOpacity);
+
+  const handleSaveDecisionTreeLayoutDefaults = useCallback(() => {
+    const layout = {
+      rowSpread: decisionTreeRowSpread,
+      fontScale: decisionTreeFontScale,
+      edgeScale: decisionTreeEdgeScale,
+      nodeScale: decisionTreeNodeScale,
+      edgeOpacity: decisionTreeEdgeOpacity
+    };
+    saveDecisionTreeLayoutAsDefault(layout);
+    refreshInitialDecisionTreeLayoutCache(layout);
+    setMessage("Decision tree layout saved as default.");
+  }, [
+    decisionTreeRowSpread,
+    decisionTreeFontScale,
+    decisionTreeEdgeScale,
+    decisionTreeNodeScale,
+    decisionTreeEdgeOpacity
+  ]);
+
+  const [sidebarWidth, setSidebarWidth] = useState(() => readStoredPanelLayout().sidebarWidth);
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => readStoredPanelLayout().rightPanelWidth);
+  const [isNarrowLayout, setIsNarrowLayout] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 1280px)").matches : false
+  );
   const [temperatureTool, setTemperatureTool] = useState(INITIAL_TEMPERATURE_TOOL);
+  const [ucbTool, setUcbTool] = useState(INITIAL_UCB_TOOL);
+  const [homeToolTab, setHomeToolTab] = useState("softmax");
   const [batchRunResults, setBatchRunResults] = useState([]);
   const [focusedBatchRunId, setFocusedBatchRunId] = useState(null);
   const [focusedBatchRunResult, setFocusedBatchRunResult] = useState(null);
@@ -372,6 +497,10 @@ export default function App() {
   const [batchRunResultsError, setBatchRunResultsError] = useState(null);
   const [batchRunProgress, setBatchRunProgress] = useState(null);
   const [queueSnapshot, setQueueSnapshot] = useState(null);
+  const [workersExpanded, setWorkersExpanded] = useState(false);
+  const [managedWorkers, setManagedWorkers] = useState([]);
+  const [isSpawningWorker, setIsSpawningWorker] = useState(false);
+  const [killingWorkerId, setKillingWorkerId] = useState("");
   const [singleRunTopologyIds, setSingleRunTopologyIds] = useState([]);
   const batchDetailRefreshKeyRef = useRef("");
   /** If user returns to Run multi while this batch is still running/completing, snap to Results when it finishes. */
@@ -385,8 +514,149 @@ export default function App() {
     setPlaygroundState(INITIAL_PLAYGROUND_STATE);
   }
 
+  async function fetchPlaygroundTree(topologyId) {
+    if (!topologyId) {
+      setPlaygroundTree(null);
+      setPlaygroundTreeLoadError(null);
+      return;
+    }
+    setPlaygroundTreeLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/playground-tree`);
+      const data = await response.json();
+      if (!response.ok) {
+        setPlaygroundTree(EMPTY_PLAYGROUND_TREE);
+        setPlaygroundTreeLoadError(
+          response.status === 404
+            ? "State tree API not found — restart the backend, then reload this page."
+            : data?.message || "Could not load state tree from server."
+        );
+        return;
+      }
+      setPlaygroundTree(data);
+      setPlaygroundTreeLoadError(null);
+    } catch {
+      setPlaygroundTree(EMPTY_PLAYGROUND_TREE);
+      setPlaygroundTreeLoadError("Could not reach the API — check that the backend is running.");
+    } finally {
+      setPlaygroundTreeLoading(false);
+    }
+  }
+
+  async function appendPlaygroundTreeTransition(topologyId, payload) {
+    if (!topologyId) return;
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/playground-tree/event`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setPlaygroundTree(data);
+      }
+    } catch {
+      // Keep existing tree on network failure.
+    }
+  }
+
+  async function resetPlaygroundTreeData(topologyId) {
+    if (!topologyId) return;
+    setPlaygroundTreeLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/playground-tree`, {
+        method: "DELETE"
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setPlaygroundTree(data);
+        setPlaygroundTreeExpandStats(null);
+        setMessage("Success.");
+      } else {
+        setMessage(data?.message || "Failed.");
+      }
+    } catch {
+      setMessage("Failed.");
+    } finally {
+      setPlaygroundTreeLoading(false);
+    }
+  }
+
+  async function expandPlaygroundTreeAll(topologyId) {
+    if (!topologyId) return;
+    setPlaygroundTreeExpanding(true);
+    setPlaygroundTreeLoadError(null);
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/playground-tree/expand`, {
+        method: "POST"
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setPlaygroundTree(data);
+        const stats = data.expand_stats ?? null;
+        setPlaygroundTreeExpandStats(stats);
+        const paths = Number(stats?.unique_paths ?? 0).toLocaleString();
+        const transitions = Number(stats?.transitions_applied ?? 0).toLocaleString();
+        const suffix = stats?.truncated ? " (10k transition cap reached)" : "";
+        setMessage(
+          `Expand done${suffix}: ${paths} unique paths after ${transitions} transitions; +${stats?.nodes_added ?? 0} states, +${stats?.edges_added ?? 0} edges (${stats?.edges_to_existing_states ?? 0} to existing states).`
+        );
+      } else {
+        setMessage(data?.message || "Failed.");
+      }
+    } catch {
+      setMessage("Failed.");
+      setPlaygroundTreeLoadError("Could not reach the API — check that the backend is running.");
+    } finally {
+      setPlaygroundTreeExpanding(false);
+    }
+  }
+
+  async function fetchRunDerivedPlaygroundTree(topologyId, runId) {
+    if (!topologyId || !runId) {
+      setRunDerivedTree(null);
+      setRunDerivedTreeLoadError(null);
+      setRunDerivedTreeMessage(null);
+      setRunDerivedTreeSourceArtifact(null);
+      return;
+    }
+    setRunDerivedTreeLoading(true);
+    setRunDerivedTreeLoadError(null);
+    try {
+      const response = await fetch(
+        `${API_BASE}/topologies/${topologyId}/playground-tree/run-derived?run_id=${encodeURIComponent(runId)}`
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        setRunDerivedTree(EMPTY_PLAYGROUND_TREE);
+        setRunDerivedTreeLoadError(
+          response.status === 404
+            ? "Run-derived tree API not found or run/topology mismatch."
+            : data?.message || "Could not load run-derived tree."
+        );
+        setRunDerivedTreeMessage(null);
+        setRunDerivedTreeSourceArtifact(null);
+        return;
+      }
+      setRunDerivedTree(data);
+      setRunDerivedTreeMessage(data?.message ?? null);
+      setRunDerivedTreeSourceArtifact(data?.source_artifact ?? null);
+    } catch {
+      setRunDerivedTree(EMPTY_PLAYGROUND_TREE);
+      setRunDerivedTreeLoadError("Could not reach the API — check that the backend is running.");
+      setRunDerivedTreeMessage(null);
+      setRunDerivedTreeSourceArtifact(null);
+    } finally {
+      setRunDerivedTreeLoading(false);
+    }
+  }
+
   function resetTemperatureTool() {
     setTemperatureTool(INITIAL_TEMPERATURE_TOOL);
+  }
+
+  function resetUcbTool() {
+    setUcbTool(INITIAL_UCB_TOOL);
   }
   const [topologyNodes, setTopologyNodes] = useState([]);
   const [topologyDetail, setTopologyDetail] = useState(null);
@@ -634,6 +904,59 @@ export default function App() {
     }
   }
 
+  async function fetchManagedWorkers() {
+    try {
+      const response = await fetch(`${API_BASE}/workers`);
+      const data = await response.json();
+      if (!response.ok || !Array.isArray(data)) {
+        setManagedWorkers([]);
+        return;
+      }
+      setManagedWorkers(data);
+    } catch {
+      setManagedWorkers([]);
+    }
+  }
+
+  async function handleSpawnWorker() {
+    setIsSpawningWorker(true);
+    try {
+      const response = await fetch(`${API_BASE}/workers`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Failed to start worker."));
+        return;
+      }
+      setMessage(`Worker started (${data?.worker_id ?? "ok"}).`);
+      await Promise.all([fetchManagedWorkers(), fetchQueueSnapshot()]);
+    } catch {
+      setMessage("Failed to start worker.");
+    } finally {
+      setIsSpawningWorker(false);
+    }
+  }
+
+  async function handleKillWorker(workerId) {
+    if (!workerId) return;
+    const confirmed = window.confirm(`Kill worker ${workerId}? Running jobs will return to the queue.`);
+    if (!confirmed) return;
+    setKillingWorkerId(workerId);
+    try {
+      const response = await fetch(`${API_BASE}/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Failed to kill worker."));
+        return;
+      }
+      setMessage(data?.message || "Worker stopped.");
+      await Promise.all([fetchManagedWorkers(), fetchQueueSnapshot()]);
+    } catch {
+      setMessage("Failed to kill worker.");
+    } finally {
+      setKillingWorkerId("");
+    }
+  }
+
   async function fetchSingleRunTopologyIds() {
     try {
       const response = await fetch(`${API_BASE}/runs/history/single/topology-ids`);
@@ -673,10 +996,13 @@ export default function App() {
       if (!silent) {
         setBatchRunResultDetailError(null);
       }
-    } catch {
+    } catch (err) {
       if (!silent) {
         setFocusedBatchRunResult(null);
-        setBatchRunResultDetailError("Network error while loading batch result.");
+        const detail = err instanceof Error ? err.message : "";
+        setBatchRunResultDetailError(
+          detail ? `Network error while loading batch result (${detail}).` : "Network error while loading batch result."
+        );
       }
     } finally {
       if (!silent) {
@@ -705,11 +1031,12 @@ export default function App() {
   }, [statusFilter, nodeFilter]);
 
   useEffect(() => {
-    if (activeMenu !== "results") return;
-    fetchBatchRunResults();
+    if (activeMenu !== "results" && !workersExpanded) return;
+    if (activeMenu === "results") fetchBatchRunResults();
     fetchQueueSnapshot();
+    if (workersExpanded) fetchManagedWorkers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeMenu]);
+  }, [activeMenu, workersExpanded]);
 
   useEffect(() => {
     if (activeMenu !== "compare") return;
@@ -719,22 +1046,49 @@ export default function App() {
   }, [activeMenu]);
 
   useEffect(() => {
-    if (activeMenu !== "results") return undefined;
+    if (activeMenu !== "results" && !workersExpanded) return undefined;
     let cancelled = false;
     async function poll() {
       try {
-        const [batchResp, queueResp] = await Promise.all([
-          fetch(`${API_BASE}/runs/batch/results`),
-          fetch(`${API_BASE}/runs/queue`)
-        ]);
-        const [batchData, queueData] = await Promise.all([batchResp.json(), queueResp.json()]);
-        if (cancelled) return;
-        if (batchResp.ok && Array.isArray(batchData)) {
-          setBatchRunResults(batchData);
-          setBatchRunResultsError(null);
+        const requests = [fetch(`${API_BASE}/runs/queue`)];
+        if (workersExpanded) {
+          requests.push(fetch(`${API_BASE}/workers`));
         }
-        if (queueResp.ok && queueData && Array.isArray(queueData.lanes)) {
-          setQueueSnapshot(queueData);
+        if (activeMenu === "results") {
+          requests.unshift(fetch(`${API_BASE}/runs/batch/results`));
+        }
+        const responses = await Promise.all(requests);
+        if (cancelled) return;
+        let batchResp = null;
+        let queueResp = null;
+        let workersResp = null;
+        if (activeMenu === "results" && workersExpanded) {
+          [batchResp, queueResp, workersResp] = responses;
+        } else if (activeMenu === "results") {
+          [batchResp, queueResp] = responses;
+        } else if (workersExpanded) {
+          [queueResp, workersResp] = responses;
+        } else {
+          [queueResp] = responses;
+        }
+        if (batchResp) {
+          const batchData = await batchResp.json();
+          if (batchResp.ok && Array.isArray(batchData)) {
+            setBatchRunResults(batchData);
+            setBatchRunResultsError(null);
+          }
+        }
+        if (queueResp) {
+          const queueData = await queueResp.json();
+          if (queueResp.ok && queueData && Array.isArray(queueData.lanes)) {
+            setQueueSnapshot(queueData);
+          }
+        }
+        if (workersResp) {
+          const workersData = await workersResp.json();
+          if (workersResp.ok && Array.isArray(workersData)) {
+            setManagedWorkers(workersData);
+          }
         }
       } catch {
         // ignore transient polling failures
@@ -746,7 +1100,7 @@ export default function App() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [activeMenu]);
+  }, [activeMenu, workersExpanded]);
 
   useEffect(() => {
     batchDetailRefreshKeyRef.current = "";
@@ -870,6 +1224,54 @@ export default function App() {
   }, [selectedTopology?.topology_id]);
 
   useEffect(() => {
+    setPlaygroundTreeMode("manual");
+    setRunDerivedTree(null);
+    setRunDerivedTreeLoadError(null);
+    setRunDerivedTreeMessage(null);
+    setRunDerivedTreeSourceArtifact(null);
+    setPlaygroundRunSourceId(null);
+  }, [selectedTopology?.topology_id, focusedTopologyId]);
+
+  useEffect(() => {
+    const doneRuns = (runHistoryItems ?? []).filter((item) => item.status === "done");
+    setPlaygroundRunSourceId((prev) => {
+      if (prev && doneRuns.some((item) => item.run_id === prev)) {
+        return prev;
+      }
+      return doneRuns[0]?.run_id ?? null;
+    });
+  }, [runHistoryItems]);
+
+  useEffect(() => {
+    const topologyId = selectedTopology?.topology_id ?? focusedTopologyId;
+    if (activeMenu !== "topologies" || activePanel2Tab !== "playground" || !topologyId) {
+      return;
+    }
+    fetchPlaygroundTree(topologyId);
+  }, [selectedTopology?.topology_id, focusedTopologyId, activeMenu, activePanel2Tab]);
+
+  useEffect(() => {
+    const topologyId = selectedTopology?.topology_id ?? focusedTopologyId;
+    if (
+      activeMenu !== "topologies" ||
+      activePanel2Tab !== "playground" ||
+      playgroundTreeMode !== "run" ||
+      !topologyId ||
+      !playgroundRunSourceId
+    ) {
+      return;
+    }
+    fetchRunDerivedPlaygroundTree(topologyId, playgroundRunSourceId);
+  }, [
+    selectedTopology?.topology_id,
+    focusedTopologyId,
+    activeMenu,
+    activePanel2Tab,
+    playgroundTreeMode,
+    playgroundRunSourceId,
+  ]);
+
+  useEffect(() => {
     if (activeMenu !== "topologies" || activePanel2Tab !== "playground") {
       setPlaygroundState((prev) =>
         prev.timeslots.length > 0 ||
@@ -921,7 +1323,7 @@ export default function App() {
       return completedRuns.find((item) => item.run_id === selectedRunId) ?? completedRuns[0];
     }
     const singleRun = completedRuns.find((item) => item.mode === "single");
-    return singleRun ?? null;
+    return singleRun ?? completedRuns[0] ?? null;
   }, [runHistoryItems, selectedRunId]);
 
   const latestRunAlgorithmMeta = useMemo(
@@ -1136,7 +1538,7 @@ export default function App() {
         if (prevRunId && doneRuns.some((item) => item.run_id === prevRunId)) {
           return prevRunId;
         }
-        return doneSingleRuns[0]?.run_id ?? null;
+        return doneSingleRuns[0]?.run_id ?? doneRuns[0]?.run_id ?? null;
       });
     } catch {
       setRunHistoryItems([]);
@@ -1155,48 +1557,77 @@ export default function App() {
 
   async function fetchRunArtifacts(runId) {
     try {
-      const [
-        summary,
-        transmissionLast,
-        transmissionBest,
-        stateActionLast,
-        stateActionBest,
-        qTable,
-        delayPerEpisode,
-        policyTrace,
-        pathSignatures,
-        resolvedRunConfig,
-        stateActionAll,
-        transmissionAll,
-        qTableAllEpochs
-      ] = await Promise.all([
-        fetchRunArtifact(runId, "run_summary"),
-        fetchRunArtifact(runId, "transmission_last_epoch"),
-        fetchRunArtifact(runId, "transmission_best_epoch"),
-        fetchRunArtifact(runId, "state_action_last_epoch"),
-        fetchRunArtifact(runId, "state_action_best_epoch"),
-        fetchRunArtifact(runId, "q_table"),
-        fetchRunArtifact(runId, "delay_per_episode"),
-        fetchRunArtifact(runId, "policy_trace"),
-        fetchRunArtifact(runId, "path_signatures"),
-        fetchRunArtifact(runId, "resolved_run_config"),
-        fetchRunArtifact(runId, "state_action_all_epochs"),
-        fetchRunArtifact(runId, "transmission_all_epochs"),
-        fetchRunArtifact(runId, "q_table_all_epochs")
+      const [runBundle, traceEpochs, resolvedRunConfig] = await Promise.all([
+        fetchRunArtifact(runId, "run_bundle"),
+        fetchRunArtifact(runId, "trace_epochs"),
+        fetchRunArtifact(runId, "resolved_run_config")
       ]);
-      setRunSummaryPayload(summary);
-      setTransmissionLastPayload(transmissionLast);
-      setTransmissionBestPayload(transmissionBest);
-      setStateActionLastPayload(stateActionLast);
-      setStateActionBestPayload(stateActionBest);
-      setQTablePayload(qTable);
-      setDelayPerEpisodePayload(delayPerEpisode);
-      setPolicyTracePayload(policyTrace);
-      setPathSignaturesPayload(pathSignatures);
-      setResolvedRunConfigPayload(resolvedRunConfig);
-      setStateActionAllPayload(stateActionAll);
-      setTransmissionAllPayload(transmissionAll);
-      setQTableAllEpochsPayload(qTableAllEpochs);
+      let hydrated = hydrateLegacyRunArtifactState({
+        runBundle,
+        traceEpochs,
+        qTable: null,
+        resolvedRunConfig
+      });
+      setRunSummaryPayload(hydrated.runSummaryPayload);
+      setTransmissionLastPayload(hydrated.transmissionLastPayload);
+      setTransmissionBestPayload(hydrated.transmissionBestPayload);
+      setStateActionLastPayload(hydrated.stateActionLastPayload);
+      setStateActionBestPayload(hydrated.stateActionBestPayload);
+      setDelayPerEpisodePayload(hydrated.delayPerEpisodePayload);
+      setPolicyTracePayload(hydrated.policyTracePayload);
+      setPathSignaturesPayload(hydrated.pathSignaturesPayload);
+      setResolvedRunConfigPayload(hydrated.resolvedRunConfigPayload);
+      setStateActionAllPayload(hydrated.stateActionAllPayload);
+      setTransmissionAllPayload(hydrated.transmissionAllPayload);
+      setQTableAllEpochsPayload(hydrated.qTableAllEpochsPayload);
+      setQTablePayload(null);
+      fetchRunArtifact(runId, "q_table").then((qTable) => {
+        if (qTable) setQTablePayload(qTable);
+      });
+      if (!runBundle) {
+        const [
+          legacySummary,
+          transmissionLast,
+          transmissionBest,
+          stateActionLast,
+          stateActionBest,
+          delayPerEpisode,
+          pathSignatures
+        ] = await Promise.all([
+          fetchRunArtifact(runId, "run_summary"),
+          fetchRunArtifact(runId, "transmission_last_epoch"),
+          fetchRunArtifact(runId, "transmission_best_epoch"),
+          fetchRunArtifact(runId, "state_action_last_epoch"),
+          fetchRunArtifact(runId, "state_action_best_epoch"),
+          fetchRunArtifact(runId, "delay_per_episode"),
+          fetchRunArtifact(runId, "path_signatures")
+        ]);
+        hydrated = {
+          ...hydrated,
+          runSummaryPayload: legacySummary ?? hydrated.runSummaryPayload,
+          transmissionLastPayload: transmissionLast ?? hydrated.transmissionLastPayload,
+          transmissionBestPayload: transmissionBest ?? hydrated.transmissionBestPayload,
+          stateActionLastPayload: stateActionLast ?? hydrated.stateActionLastPayload,
+          stateActionBestPayload: stateActionBest ?? hydrated.stateActionBestPayload,
+          delayPerEpisodePayload: delayPerEpisode ?? hydrated.delayPerEpisodePayload,
+          pathSignaturesPayload: pathSignatures ?? hydrated.pathSignaturesPayload,
+        };
+        const policyComputed = buildPolicyTraceFromConfig(resolvedRunConfig, legacySummary ?? hydrated.runSummaryPayload);
+        if (policyComputed) {
+          hydrated.policyTracePayload = { text: policyComputed.csvText };
+        }
+        setRunSummaryPayload(hydrated.runSummaryPayload);
+        setTransmissionLastPayload(hydrated.transmissionLastPayload);
+        setTransmissionBestPayload(hydrated.transmissionBestPayload);
+        setStateActionLastPayload(hydrated.stateActionLastPayload);
+        setStateActionBestPayload(hydrated.stateActionBestPayload);
+        setDelayPerEpisodePayload(hydrated.delayPerEpisodePayload);
+        setPolicyTracePayload(hydrated.policyTracePayload);
+        setPathSignaturesPayload(hydrated.pathSignaturesPayload);
+        fetchRunArtifact(runId, "q_table").then((qTable) => {
+          if (qTable) setQTablePayload(qTable);
+        });
+      }
     } catch {
       setRunSummaryPayload(null);
       setTransmissionLastPayload(null);
@@ -1308,7 +1739,16 @@ export default function App() {
       if (prev.isComplete || prev.viewSlot !== latestSlot) return prev;
       const nextSlot = simulatePlaygroundSlot(graph, prev.coveredNodeIds, prev.mode, nodeId);
       if (!nextSlot) return prev;
+      const fromHash = playgroundStateHash(prev.coveredNodeIds);
       const nextCovered = Array.from(new Set([...prev.coveredNodeIds, ...nextSlot.receivers])).sort((a, b) => a - b);
+      const toHash = playgroundStateHash(nextCovered);
+      void appendPlaygroundTreeTransition(topologyId, {
+        from_state_hash: fromHash,
+        to_state_hash: toHash,
+        action: Number(nodeId),
+        mode: prev.mode,
+        to_covered_node_ids: nextCovered
+      });
       const totalNodes = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
       const timeslot = prev.timeslots.length + 1;
       return {
@@ -1381,6 +1821,87 @@ export default function App() {
 
   function updateTemperatureFontScale(value) {
     setTemperatureTool((prev) => ({
+      ...prev,
+      fontScale: clampValue(value, 0.8, 1.8)
+    }));
+  }
+
+  function updateUcbActionCount(nextCount) {
+    setUcbTool((prev) => {
+      const target = Math.max(1, Math.min(10, Number(nextCount) || 1));
+      return {
+        ...prev,
+        actionCount: target,
+        qValues: resizeQValues(prev.qValues, target, 0).map((value) => clampValue(value, prev.qMin, prev.qMax)),
+        visitCounts: resizeVisitCounts(prev.visitCounts, target, 0)
+      };
+    });
+  }
+
+  function updateUcbGlobalTRange(minValue, maxValue, preferredT = null) {
+    setUcbTool((prev) => {
+      const range = normalizeRange(minValue, maxValue, { min: prev.globalTMin, max: prev.globalTMax }, 1);
+      const globalT = clampValue(preferredT ?? prev.globalT, range.min, range.max);
+      return { ...prev, globalTMin: range.min, globalTMax: range.max, globalT: Math.round(globalT) };
+    });
+  }
+
+  function updateUcbGlobalT(value) {
+    setUcbTool((prev) => ({
+      ...prev,
+      globalT: Math.round(clampValue(value, prev.globalTMin, prev.globalTMax))
+    }));
+  }
+
+  function updateUcbCRange(minValue, maxValue, preferredC = null) {
+    setUcbTool((prev) => {
+      const range = normalizeRange(minValue, maxValue, { min: prev.ucbCMin, max: prev.ucbCMax }, 0.001);
+      const ucbC = clampValue(preferredC ?? prev.ucbC, range.min, range.max);
+      return { ...prev, ucbCMin: range.min, ucbCMax: range.max, ucbC };
+    });
+  }
+
+  function updateUcbC(value) {
+    setUcbTool((prev) => ({
+      ...prev,
+      ucbC: clampValue(value, prev.ucbCMin, prev.ucbCMax)
+    }));
+  }
+
+  function updateUcbQRange(minValue, maxValue) {
+    setUcbTool((prev) => {
+      const range = normalizeRange(minValue, maxValue, { min: prev.qMin, max: prev.qMax }, 0.001);
+      return {
+        ...prev,
+        qMin: range.min,
+        qMax: range.max,
+        qValues: prev.qValues.map((value) => clampValue(value, range.min, range.max))
+      };
+    });
+  }
+
+  function updateUcbQValue(index, value) {
+    setUcbTool((prev) => ({
+      ...prev,
+      qValues: prev.qValues.map((item, itemIndex) =>
+        itemIndex === index ? clampValue(value, prev.qMin, prev.qMax) : item
+      )
+    }));
+  }
+
+  function updateUcbVisitCount(index, value) {
+    setUcbTool((prev) => ({
+      ...prev,
+      visitCounts: prev.visitCounts.map((item, itemIndex) =>
+        itemIndex === index
+          ? Math.max(0, Math.min(prev.visitMax, Math.trunc(Number(value) || 0)))
+          : item
+      )
+    }));
+  }
+
+  function updateUcbFontScale(value) {
+    setUcbTool((prev) => ({
       ...prev,
       fontScale: clampValue(value, 0.8, 1.8)
     }));
@@ -1543,7 +2064,7 @@ export default function App() {
   }
 
   function maybeApproveHeavyRender(topo) {
-    if (topo.node_count < LARGE_TOPO_THRESHOLD) return true;
+    if (topo.node_count <= LARGE_TOPO_THRESHOLD) return true;
     if (heavyRenderApprovedIds.includes(topo.topology_id)) return true;
     const ok = window.confirm(LARGE_TOPO_CONFIRM_MESSAGE);
     if (!ok) return false;
@@ -1696,7 +2217,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingSingleRunId, lastSingleRun?.topology_id]);
 
-  async function handleRunMultiTopologies() {
+  function handleRunMultiTopologies() {
     const isRepeatMode = runMultiSubMode === "repeat";
     if (!runMultiForm.batch_id) {
       setMessage("Select a batch first.");
@@ -1716,6 +2237,19 @@ export default function App() {
       setMessage("Select at least one topology.");
       return;
     }
+    const ownerBatch =
+      sidebarBatches.find((item) => item.batch_id === runMultiForm.batch_id) ??
+      batches.find((item) => item.batch_id === runMultiForm.batch_id) ??
+      null;
+    const presetName = runMultiForm.preset_name || runMultiForm.preset_id;
+    setRunBatchDefaultLabel(buildDefaultBatchRunResultLabel(ownerBatch?.batch_name, presetName));
+    setRunBatchNameDraft("");
+    setRunBatchNameModalOpen(true);
+  }
+
+  async function submitRunMultiTopologies() {
+    const isRepeatMode = runMultiSubMode === "repeat";
+    const customLabel = runBatchNameDraft.trim();
     setIsRunningBatch(true);
     setMessage("");
     try {
@@ -1739,6 +2273,7 @@ export default function App() {
           algorithm_id: runMultiForm.algorithm_id,
           preset_id: runMultiForm.preset_id,
           preset_name: runMultiForm.preset_name || runMultiForm.preset_id,
+          result_label: customLabel || null,
           run_config: buildRunConfigPayload(runMultiConfigForm, runMultiForm),
           draft_preset_id: draftPresetId,
           save_full_artifacts_for_selected_runs: selectedArtifactTypes.length > 0,
@@ -1751,6 +2286,7 @@ export default function App() {
         setMessage(parseApiError(data, "Failed."));
         return;
       }
+      setRunBatchNameModalOpen(false);
       setMessage(`Batch run accepted: ${data.batch_run_id}`);
       pendingNavigateFromRunMultiBatchIdRef.current = data.batch_run_id;
       await fetchBatchRunResults();
@@ -1796,10 +2332,41 @@ export default function App() {
     }
   }
 
+  async function handleRenameBatchRunResult(batchRunId, resultLabel) {
+    if (!batchRunId) return false;
+    const payload =
+      resultLabel === null || resultLabel === undefined
+        ? { result_label: null }
+        : { result_label: String(resultLabel).trim() || null };
+    try {
+      const response = await fetch(`${API_BASE}/runs/batch/${batchRunId}/result-label`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Failed."));
+        return false;
+      }
+      setBatchRunResults((prev) =>
+        (prev ?? []).map((item) => (item.batch_run_id === batchRunId ? { ...item, ...data } : item))
+      );
+      if (focusedBatchRunId === batchRunId) {
+        setFocusedBatchRunResult((prev) =>
+          prev ? { ...prev, result_label: data.result_label, custom_result_label: data.custom_result_label } : prev
+        );
+      }
+      setMessage("Success.");
+      return true;
+    } catch {
+      setMessage("Failed.");
+      return false;
+    }
+  }
+
   async function handleDeleteBatchRunResult(batchRunId) {
     if (!batchRunId) return;
-    const confirmed = window.confirm("Delete this multi-run result?");
-    if (!confirmed) return;
     try {
       const response = await fetch(`${API_BASE}/runs/batch/${batchRunId}`, { method: "DELETE" });
       const data = await response.json();
@@ -1918,23 +2485,155 @@ export default function App() {
 
   const hideRightPanel = activeMenu === "generate" || activeMenu === "compare";
 
-  return (
-    <main className={`dashboard-shell ${hideRightPanel ? "generate-only-layout" : ""}`}>
-      <DashboardSidebar
-        activeMenu={activeMenu}
-        setActiveMenu={setActiveMenu}
-        batches={sidebarBatches}
-        selectedTopologyId={selectedTopology?.topology_id ?? null}
-        onGoHome={goHome}
-        onSelectTopology={handleOpenTopology}
-        onSelectBatch={(batchId) => {
-          setActiveMenu("topologies");
-          setFocusedBatchId(batchId);
-          setFocusedTopologyId(null);
-        }}
-      />
+  const [exportSnapshotPatch, setExportSnapshotPatch] = useState({});
+  const [compareExport, setCompareExport] = useState(null);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [exportModalSurface, setExportModalSurface] = useState("main");
 
-      <MainTopologyPanel
+  const resultsSingleFocusedBatch = useMemo(
+    () =>
+      focusedBatchId
+        ? (runBatchesForSingleResults ?? []).find((batch) => batch.batch_id === focusedBatchId) ?? null
+        : null,
+    [focusedBatchId, runBatchesForSingleResults]
+  );
+
+  const focusedBatchTopologies = useMemo(() => {
+    if (!focusedBatchId) return [];
+    const batch = batches.find((item) => item.batch_id === focusedBatchId);
+    return batch?.topologies ?? [];
+  }, [batches, focusedBatchId]);
+
+  const exportSnapshot = useMemo(
+    () =>
+      createExportSnapshot({
+        activeMenu,
+        homeToolTab,
+        activePanel2Tab,
+        focusedBatchId,
+        focusedTopologyId,
+        focusedBatchRunId,
+        focusedBatchRunResult,
+        batchRunProgress,
+        batchRunResults,
+        resultsSingleFocusedBatch,
+        filteredBatches: batches,
+        focusedBatchTopologies,
+        topologyNodes,
+        playgroundTree,
+        runMultiForm,
+        runBatchTopologies: sidebarBatches,
+        delayPerEpisodePayload,
+        policyTracePayload,
+        pathSignaturesPayload,
+        runHistoryItems,
+        selectedTopology,
+        compareExport,
+        ...exportSnapshotPatch
+      }),
+    [
+      activeMenu,
+      homeToolTab,
+      activePanel2Tab,
+      focusedBatchId,
+      focusedTopologyId,
+      focusedBatchRunId,
+      focusedBatchRunResult,
+      batchRunProgress,
+      batchRunResults,
+      resultsSingleFocusedBatch,
+      batches,
+      focusedBatchTopologies,
+      topologyNodes,
+      playgroundTree,
+      runMultiForm,
+      sidebarBatches,
+      delayPerEpisodePayload,
+      policyTracePayload,
+      pathSignaturesPayload,
+      runHistoryItems,
+      selectedTopology,
+      compareExport,
+      exportSnapshotPatch
+    ]
+  );
+
+  const mainExportContext = useMemo(() => resolveExportContext(exportSnapshot, "main"), [exportSnapshot]);
+  const rightExportContext = useMemo(() => resolveExportContext(exportSnapshot, "right"), [exportSnapshot]);
+  const activeExportContext = exportModalSurface === "right" ? rightExportContext : mainExportContext;
+
+  const openExportModal = useCallback((surface = "main") => {
+    setExportModalSurface(surface);
+    setExportModalOpen(true);
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1280px)");
+    const onChange = () => setIsNarrowLayout(media.matches);
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(
+      PANEL_LAYOUT_STORAGE_KEY,
+      JSON.stringify({ sidebarWidth, rightPanelWidth })
+    );
+  }, [sidebarWidth, rightPanelWidth]);
+
+  const dashboardGridColumns = useMemo(() => {
+    if (isNarrowLayout) {
+      return hideRightPanel ? "260px minmax(0, 1fr)" : "260px minmax(0, 1fr)";
+    }
+    if (hideRightPanel) {
+      return `${sidebarWidth}px ${PANEL_RESIZER_WIDTH}px minmax(400px, 1fr)`;
+    }
+    return `${sidebarWidth}px ${PANEL_RESIZER_WIDTH}px minmax(400px, 1fr) ${PANEL_RESIZER_WIDTH}px ${rightPanelWidth}px`;
+  }, [hideRightPanel, isNarrowLayout, rightPanelWidth, sidebarWidth]);
+
+  const resizeSidebar = useCallback((deltaPx) => {
+    setSidebarWidth((prev) => clampPanelWidth(prev + deltaPx, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX));
+  }, []);
+
+  const resizeRightPanel = useCallback((deltaPx) => {
+    setRightPanelWidth((prev) => clampPanelWidth(prev - deltaPx, RIGHT_PANEL_WIDTH_MIN, RIGHT_PANEL_WIDTH_MAX));
+  }, []);
+
+  return (
+    <main
+      className={`dashboard-shell${hideRightPanel ? " generate-only-layout" : ""}${isNarrowLayout ? " dashboard-shell--narrow" : ""}`}
+      style={{ gridTemplateColumns: dashboardGridColumns }}
+    >
+      <div className="dashboard-column dashboard-column--sidebar ui-scroll">
+        <DashboardSidebar
+          activeMenu={activeMenu}
+          setActiveMenu={setActiveMenu}
+          batches={sidebarBatches}
+          selectedTopologyId={selectedTopology?.topology_id ?? null}
+          onGoHome={goHome}
+          queueSnapshot={queueSnapshot}
+          managedWorkers={managedWorkers}
+          onSpawnWorker={handleSpawnWorker}
+          onKillWorker={handleKillWorker}
+          isSpawningWorker={isSpawningWorker}
+          killingWorkerId={killingWorkerId}
+          onWorkersExpandedChange={setWorkersExpanded}
+          onSelectTopology={handleOpenTopology}
+          onSelectBatch={(batchId) => {
+            setActiveMenu("topologies");
+            setFocusedBatchId(batchId);
+            setFocusedTopologyId(null);
+          }}
+        />
+      </div>
+
+      {!isNarrowLayout ? (
+        <PanelResizer onResize={resizeSidebar} disabled={isNarrowLayout} ariaLabel="Resize sidebar" />
+      ) : null}
+
+      <div className="dashboard-column dashboard-column--main">
+        <MainTopologyPanel
         activeMenu={activeMenu}
         activePanel2Tab={activePanel2Tab}
         mainTitle={mainTitle}
@@ -1946,6 +2645,18 @@ export default function App() {
         updateTemperatureTau={updateTemperatureTau}
         updateTemperatureQValue={updateTemperatureQValue}
         updateTemperatureFontScale={updateTemperatureFontScale}
+        homeToolTab={homeToolTab}
+        setHomeToolTab={setHomeToolTab}
+        ucbTool={ucbTool}
+        resetUcbTool={resetUcbTool}
+        updateUcbActionCount={updateUcbActionCount}
+        updateUcbGlobalTRange={updateUcbGlobalTRange}
+        updateUcbGlobalT={updateUcbGlobalT}
+        updateUcbCRange={updateUcbCRange}
+        updateUcbC={updateUcbC}
+        updateUcbQRange={updateUcbQRange}
+        updateUcbQValue={updateUcbQValue}
+        updateUcbVisitCount={updateUcbVisitCount}
         generateMode={generateMode}
         setGenerateMode={setGenerateMode}
         generateForm={generateForm}
@@ -2010,10 +2721,10 @@ export default function App() {
         batchRunResultDetailError={batchRunResultDetailError}
         onRetryBatchRunResultDetail={() => fetchBatchRunResultDetail(focusedBatchRunId, { silent: false })}
         batchRunProgress={batchRunProgress}
-        queueSnapshot={queueSnapshot}
         onBatchStop={handleBatchStop}
         onBatchResume={handleBatchResume}
         onDeleteBatchRunResult={handleDeleteBatchRunResult}
+        onRenameBatchRunResult={handleRenameBatchRunResult}
         graphByTopologyId={graphByTopologyId}
         playgroundState={playgroundState}
         playgroundNextStateCount={
@@ -2030,6 +2741,37 @@ export default function App() {
         setPlaygroundHoverNode={setPlaygroundHoverNode}
         clearPlaygroundHoverPreview={clearPlaygroundHoverPreview}
         commitPlaygroundNode={commitPlaygroundNode}
+        playgroundTree={playgroundTree}
+        playgroundTreeLoading={playgroundTreeLoading}
+        playgroundTreeLoadError={playgroundTreeLoadError}
+        playgroundTreeMode={playgroundTreeMode}
+        setPlaygroundTreeMode={setPlaygroundTreeMode}
+        onResetPlaygroundTree={() =>
+          resetPlaygroundTreeData(selectedTopology?.topology_id ?? focusedTopologyId)
+        }
+        onExpandPlaygroundTree={() =>
+          expandPlaygroundTreeAll(selectedTopology?.topology_id ?? focusedTopologyId)
+        }
+        playgroundTreeExpanding={playgroundTreeExpanding}
+        playgroundTreeExpandStats={playgroundTreeExpandStats}
+        runDerivedTree={runDerivedTree}
+        runDerivedTreeLoading={runDerivedTreeLoading}
+        runDerivedTreeLoadError={runDerivedTreeLoadError}
+        runDerivedTreeMessage={runDerivedTreeMessage}
+        runDerivedTreeSourceArtifact={runDerivedTreeSourceArtifact}
+        playgroundRunSourceId={playgroundRunSourceId}
+        setPlaygroundRunSourceId={setPlaygroundRunSourceId}
+        onRefreshRunDerivedTree={() =>
+          fetchRunDerivedPlaygroundTree(
+            selectedTopology?.topology_id ?? focusedTopologyId,
+            playgroundRunSourceId
+          )
+        }
+        decisionTreeRowSpread={decisionTreeRowSpread}
+        decisionTreeFontScale={decisionTreeFontScale}
+        decisionTreeEdgeScale={decisionTreeEdgeScale}
+        decisionTreeNodeScale={decisionTreeNodeScale}
+        decisionTreeEdgeOpacity={decisionTreeEdgeOpacity}
         focusedTopologyId={focusedTopologyId}
         setFocusedTopologyId={setFocusedTopologyId}
         onDeleteTopology={handleDeleteTopology}
@@ -2073,10 +2815,21 @@ export default function App() {
         apiBase={API_BASE}
         singleRunTopologyIds={singleRunTopologyIds}
         topologyNameById={topologyNameById}
-      />
+        onExportSnapshotPatch={setExportSnapshotPatch}
+        onCompareExportChange={setCompareExport}
+        compareExport={compareExport}
+        mainExportContext={mainExportContext}
+        onOpenExportModal={() => openExportModal("main")}
+        />
+      </div>
 
       {!hideRightPanel ? (
-        <RightControlPanel
+        <>
+          {!isNarrowLayout ? (
+            <PanelResizer onResize={resizeRightPanel} disabled={isNarrowLayout} ariaLabel="Resize right panel" />
+          ) : null}
+          <div className="dashboard-column dashboard-column--right">
+            <RightControlPanel
           activePanel2Tab={activePanel2Tab}
           setActivePanel2Tab={setActivePanel2Tab}
           activeMenu={activeMenu}
@@ -2165,13 +2918,53 @@ export default function App() {
           }
           temperatureTool={temperatureTool}
           updateTemperatureFontScale={updateTemperatureFontScale}
+          homeToolTab={homeToolTab}
+          ucbTool={ucbTool}
+          updateUcbFontScale={updateUcbFontScale}
           setPlaygroundMode={setPlaygroundMode}
           setPlaygroundViewSlot={setPlaygroundViewSlot}
           onResetPlayground={resetPlaygroundState}
+          decisionTreeRowSpread={decisionTreeRowSpread}
+          setDecisionTreeRowSpread={setDecisionTreeRowSpread}
+          decisionTreeFontScale={decisionTreeFontScale}
+          setDecisionTreeFontScale={setDecisionTreeFontScale}
+          decisionTreeEdgeScale={decisionTreeEdgeScale}
+          setDecisionTreeEdgeScale={setDecisionTreeEdgeScale}
+          decisionTreeNodeScale={decisionTreeNodeScale}
+          setDecisionTreeNodeScale={setDecisionTreeNodeScale}
+          decisionTreeEdgeOpacity={decisionTreeEdgeOpacity}
+          setDecisionTreeEdgeOpacity={setDecisionTreeEdgeOpacity}
+          onSaveDecisionTreeLayoutDefaults={handleSaveDecisionTreeLayoutDefaults}
+          rightExportContext={rightExportContext}
+          onOpenExportModal={() => openExportModal("right")}
         />
+          </div>
+        </>
       ) : null}
 
       {message && <div className="toast">{message}</div>}
+      <RunBatchNameModal
+        open={runBatchNameModalOpen}
+        value={runBatchNameDraft}
+        setValue={setRunBatchNameDraft}
+        defaultLabel={runBatchDefaultLabel}
+        isSubmitting={isRunningBatch}
+        onCancel={() => {
+          if (isRunningBatch) return;
+          setRunBatchNameModalOpen(false);
+        }}
+        onConfirm={() => {
+          if (isRunningBatch) return;
+          void submitRunMultiTopologies();
+        }}
+      />
+      <CsvExportModal
+        open={exportModalOpen}
+        snapshot={exportSnapshot}
+        context={activeExportContext}
+        surface={exportModalSurface}
+        onClose={() => setExportModalOpen(false)}
+      />
     </main>
   );
 }

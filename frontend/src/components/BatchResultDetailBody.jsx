@@ -1,4 +1,24 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import {
+  batchHasPathMetricsData,
+  buildBatchDelayScatterCsv,
+  buildBatchPathMetricsCsv,
+  buildBatchPathMetricsCsvForDensity,
+  densityAxisLabel,
+  downloadBatchPathMetricsCsv,
+  downloadCsvText
+} from "../export/batchRunBuilders.js";
+import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
+import {
+  buildBatchPolicyTrace,
+  buildDensityDelayPathMatrix,
+  buildDensityDelayPathMatrixCsv,
+  delayPathMatrixCellStyle,
+  densityDelayRangeLabel,
+  densityLearningMeans,
+  downloadAllDensityDelayPathMatrixCsv,
+  downloadBatchLearningStatsCsv
+} from "../utils/batchResultAnalytics.js";
 
 function quantile(sortedValues, q) {
   if (!sortedValues.length) return null;
@@ -91,6 +111,50 @@ export function scatterYAxisByDensityFromResults(...results) {
   return out;
 }
 
+/** Per-density delay-axis from path/episode artifacts (for delay-path matrix tables). */
+export function delayAxisByDensityFromResults(...results) {
+  const ranges = new Map();
+  results.forEach((result) => {
+    (result?.density_groups ?? []).forEach((group) => {
+      const key = densityAxisLabel(group);
+      let min = Number.POSITIVE_INFINITY;
+      let max = Number.NEGATIVE_INFINITY;
+      (group.topologies ?? []).forEach((topo) => {
+        const map = topo?.paths_count_by_delay;
+        if (map && typeof map === "object") {
+          Object.keys(map).forEach((k) => {
+            const d = Number(k);
+            if (Number.isFinite(d)) {
+              min = Math.min(min, d);
+              max = Math.max(max, d);
+            }
+          });
+        }
+        (topo?.delay_per_episode ?? []).forEach((v) => {
+          const d = Number(v);
+          if (Number.isFinite(d)) {
+            min = Math.min(min, d);
+            max = Math.max(max, d);
+          }
+        });
+      });
+      if (!Number.isFinite(min) || !Number.isFinite(max)) return;
+      const cur = ranges.get(key);
+      if (!cur) {
+        ranges.set(key, { min, max });
+      } else {
+        cur.min = Math.min(cur.min, min);
+        cur.max = Math.max(cur.max, max);
+      }
+    });
+  });
+  const out = {};
+  ranges.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
 /** Shared integer Y domain for compare mode (union of one or more density_groups arrays). */
 export function boxplotYAxisFromDensityGroups(...densityGroupsList) {
   const allValues = [];
@@ -130,6 +194,210 @@ function BatchSummaryStrip({ result }) {
       <span>Total: {result?.total_topologies ?? 0}</span>
       <span>Successful: {result?.successful ?? 0}</span>
       <span>Failed: {result?.failed ?? 0}</span>
+    </div>
+  );
+}
+
+export function BatchPolicyTraceCard({ result }) {
+  const policyRows = useMemo(() => buildBatchPolicyTrace(result), [result]);
+  if (!policyRows?.length) return null;
+  return (
+    <div className="batch-chart-card batch-policy-trace-card">
+      <div className="qtable-header">
+        <h4>Policy trace (batch run config)</h4>
+        <span className="muted chart-hint">Derived from shared run_config / resolved_run_config — same for all topologies.</span>
+      </div>
+      <PolicyTraceLineChart rows={policyRows} />
+    </div>
+  );
+}
+
+function BatchLearningMeansChart({ result }) {
+  const groups = result?.density_groups ?? [];
+  const rows = groups.map((group) => {
+    const means = densityLearningMeans(group);
+    return {
+      label: densityAxisLabel(group),
+      meanStates: means.meanStates,
+      meanActions: means.meanStateActions,
+      stateN: means.stateSampleCount,
+      actionN: means.actionSampleCount
+    };
+  });
+  const hasData = rows.some((r) => Number.isFinite(r.meanStates) || Number.isFinite(r.meanActions));
+  if (!hasData) {
+    return (
+      <div className="batch-chart-card">
+        <h4>Mean Q-table size by density</h4>
+        <p className="muted chart-hint">No learning stats on topology points (run QBR/Greedy with metrics persisted).</p>
+      </div>
+    );
+  }
+  const height = 260;
+  const pad = { left: 56, right: 24, top: 28, bottom: 48 };
+  const plotH = height - pad.top - pad.bottom;
+  const colSlot = 120;
+  const width = Math.max(400, pad.left + pad.right + rows.length * colSlot);
+  const innerW = width - pad.left - pad.right;
+  const colW = innerW / Math.max(1, rows.length);
+  const valueMax = rows.reduce((max, row) => {
+    const candidates = [row.meanStates, row.meanActions].filter((n) => Number.isFinite(n));
+    const localMax = candidates.length ? Math.max(...candidates) : 0;
+    return Math.max(max, localMax);
+  }, 0);
+  const yTicks = linearAxisTicksInteger(0, Math.max(1, Math.ceil(valueMax)), 6);
+  const axisMax = yTicks.length ? yTicks[yTicks.length - 1] : 1;
+  const yBar = (v) => height - pad.bottom - (Math.max(0, v) / axisMax) * plotH;
+  const barW = Math.min(28, colW * 0.22);
+
+  return (
+    <div className="batch-chart-card">
+      <div className="qtable-header">
+        <h4>Mean Q-table size by density</h4>
+        <div className="qtable-actions">
+          <button type="button" className="qtable-sort-btn" title="Download mean states/actions CSV" onClick={() => downloadBatchLearningStatsCsv(result)}>
+            CSV
+          </button>
+        </div>
+      </div>
+      <p className="muted chart-hint">Average total_states and total_state_actions across topologies in each density group.</p>
+      <div className="chart-scroll">
+        <svg viewBox={`0 0 ${width} ${height}`} className="batch-chart-svg" preserveAspectRatio="xMidYMid meet">
+          <rect x="0" y="0" width={width} height={height} fill="#fbfbff" />
+          {yTicks.map((tv) => {
+            const y = yBar(tv);
+            return (
+              <g key={`learn-y-${tv}`}>
+                <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} stroke="#e8eaf5" strokeWidth="1" />
+                <text x={pad.left - 8} y={y + 4} textAnchor="end" className="chart-axis-text">
+                  {tv}
+                </text>
+              </g>
+            );
+          })}
+          {rows.map((row, idx) => {
+            const cx = pad.left + colW * idx + colW / 2;
+            const ms = Number.isFinite(row.meanStates) ? row.meanStates : 0;
+            const ma = Number.isFinite(row.meanActions) ? row.meanActions : 0;
+            return (
+              <g key={`${row.label}-${idx}`}>
+                <text x={cx} y={height - 14} textAnchor="middle" className="chart-axis-text">
+                  {row.label}
+                </text>
+                <title>{`density ${row.label}: mean states ${ms.toFixed(1)} (n=${row.stateN}), mean actions ${ma.toFixed(1)} (n=${row.actionN})`}</title>
+                {Number.isFinite(row.meanStates) ? (
+                  <rect x={cx - barW - 2} y={yBar(ms)} width={barW} height={Math.max(1, height - pad.bottom - yBar(ms))} fill="#4E79A7" opacity="0.65" />
+                ) : null}
+                {Number.isFinite(row.meanActions) ? (
+                  <rect x={cx + 2} y={yBar(ma)} width={barW} height={Math.max(1, height - pad.bottom - yBar(ma))} fill="#59A14F" opacity="0.65" />
+                ) : null}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      <div className="chart-legend-row">
+        <span className="chart-legend-item">
+          <i style={{ background: "#4E79A7" }} /> mean states
+        </span>
+        <span className="chart-legend-item">
+          <i style={{ background: "#59A14F" }} /> mean state-actions
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function DensityDelayPathMatrixTable({ group, runLabel, sharedDelayAxis = null }) {
+  const matrix = useMemo(() => buildDensityDelayPathMatrix(group, sharedDelayAxis), [group, sharedDelayAxis]);
+  if (!matrix.delayColumns.length) return null;
+  const safeLabel = String(runLabel ?? "batch").trim().replace(/[\\/:*?"<>|]/g, "-");
+
+  const downloadMatrixCsv = () => {
+    const csv = buildDensityDelayPathMatrixCsv(group);
+    downloadCsvText(csv, `delay_path_matrix_density_${densityAxisLabel(group)}_${safeLabel}.csv`);
+  };
+
+  return (
+    <div className="batch-chart-card batch-chart-card--nested">
+      <div className="qtable-header">
+        <h5 className="batch-chart-subtitle">Paths count by delay</h5>
+        <div className="qtable-actions">
+          <button type="button" className="qtable-sort-btn" title="Download delay × path count matrix CSV" onClick={downloadMatrixCsv}>
+            CSV
+          </button>
+        </div>
+      </div>
+      <p className="muted chart-hint">
+        Unique path signatures per finished delay (from run bundle). Delay range for density: <strong>{matrix.delayRange}</strong>.
+        Colored cells: red near each topology&apos;s lower bound, blue farther away; darkest red = most paths for that topo. Empty gray = 0 paths.
+      </p>
+      <div className="batch-delay-path-table-wrap">
+        <table className="batch-delay-path-table">
+          <thead>
+            <tr>
+              <th>Delay</th>
+              {matrix.topologies.map((topo) => (
+                <th key={`h-${topo.topology_index}`} title={topo.topology_id || topo.topology_name || undefined}>
+                  {topo.topology_index}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {matrix.rows.map((row) => (
+              <tr key={`delay-${row.delay}`}>
+                <td>{row.delay}</td>
+                {matrix.topologies.map((topo) => {
+                  const count = row.cells[topo.topology_index] ?? 0;
+                  const cellStyle = delayPathMatrixCellStyle({
+                    delay: row.delay,
+                    lowerBound: topo.lower_bound,
+                    maxDist: topo.maxDistFromLowerBound,
+                    maxPathCount: topo.maxPathCount,
+                    count
+                  });
+                  return (
+                    <td
+                      key={`${row.delay}-${topo.topology_index}`}
+                      className={cellStyle.className}
+                      style={
+                        cellStyle.backgroundColor
+                          ? { backgroundColor: cellStyle.backgroundColor, color: cellStyle.color }
+                          : undefined
+                      }
+                      title={
+                        cellStyle.showValue
+                          ? `${count} paths @ delay ${row.delay} (topo ${topo.topology_index}, LB ${topo.lower_bound ?? "—"}${cellStyle.isPeak ? ", peak paths" : ""})`
+                          : undefined
+                      }
+                    >
+                      {cellStyle.showValue ? count : null}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DensityLearningMeansStrip({ group }) {
+  const means = densityLearningMeans(group);
+  if (!means.stateSampleCount && !means.actionSampleCount) return null;
+  return (
+    <div className="batch-density-learning-strip muted">
+      <span>
+        Mean states: {Number.isFinite(means.meanStates) ? means.meanStates.toFixed(1) : "—"} ({means.stateSampleCount} topo)
+      </span>
+      <span>
+        Mean state-actions: {Number.isFinite(means.meanStateActions) ? means.meanStateActions.toFixed(1) : "—"} ({means.actionSampleCount}{" "}
+        topo)
+      </span>
+      <span>Delay range: {densityDelayRangeLabel(group)}</span>
     </div>
   );
 }
@@ -252,10 +520,7 @@ function DensityBoxplotChart({ densityGroups, yAxis, fitWidth = false }) {
   );
 }
 
-function densityAxisLabel(group) {
-  const n = Number(group?.node_count);
-  return Number.isFinite(n) && n > 0 ? n : "?";
-}
+export { densityAxisLabel, batchHasPathMetricsData, downloadBatchPathMetricsCsv, buildBatchPathMetricsCsv };
 
 const DELAY_SCATTER_SERIES = [
   { key: "last_delay", label: "last_delay", color: "#4E79A7" },
@@ -263,9 +528,18 @@ const DELAY_SCATTER_SERIES = [
   { key: "lower_bound", label: "lower_bound", color: "#E15759" }
 ];
 
+function isBestEqLastTopo(p) {
+  const best = Number(p.best_delay);
+  const last = Number(p.last_delay);
+  return Number.isFinite(best) && Number.isFinite(last) && Math.abs(best - last) <= 1e-9;
+}
+
 function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) {
   const [showLowerBound, setShowLowerBound] = useState(true);
+  const [hideBestEqLast, setHideBestEqLast] = useState(false);
+  const svgRef = useRef(null);
   const points = group.topologies ?? [];
+
   if (!points.length) return <div className="empty-topology-state">No topologies in this density.</div>;
 
   const delayValues = [];
@@ -287,7 +561,6 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
   const xBase = (idx) => pad.left + slotUnit * idx + slotUnit / 2;
   const yOf = (v) => scatterH - pad.bottom - ((v - domainMin) / spanD) * plotH;
   const yTicksDelay = yAxis?.yTicks ?? linearAxisTicksInteger(domainMin, domainMax, 5);
-  const svgRef = useRef(null);
   const densityLabel = densityAxisLabel(group);
   const safeRunLabel = String(runLabel ?? "run")
     .trim()
@@ -295,22 +568,8 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
     .replace(/\s+/g, " ");
 
   const downloadDelayScatterCsv = () => {
-    const lines = [
-      "topology_index,topology_id,last_delay,best_delay,lower_bound",
-      ...points.map(
-        (p, idx) =>
-          `${Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx},${String(p.topology_id ?? "")},${String(
-            p.last_delay ?? ""
-          )},${String(p.best_delay ?? "")},${String(p.lower_bound ?? "")}`
-      )
-    ].join("\n");
-    const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `delay_scatter_density_${String(group?.density_key ?? "all")}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
+    const csv = buildBatchDelayScatterCsv(points);
+    downloadCsvText(csv, `delay_scatter_density_${String(group?.density_key ?? densityAxisLabel(group))}.csv`);
   };
 
   const downloadDelayScatterJpg = () => {
@@ -373,6 +632,14 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
         <div className="qtable-actions">
           <button
             type="button"
+            className={`qtable-sort-btn qtable-toggle-btn${hideBestEqLast ? " is-on" : ""}`}
+            title="Hide delay markers (keep index) when best equals last"
+            onClick={() => setHideBestEqLast((on) => !on)}
+          >
+            Best = last
+          </button>
+          <button
+            type="button"
             className={`qtable-sort-btn qtable-toggle-btn${showLowerBound ? " is-on" : ""}`}
             title="Show or hide lower bound markers"
             onClick={() => setShowLowerBound((on) => !on)}
@@ -389,6 +656,7 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
       </div>
       <p className="muted chart-hint">
         Dumbbell per topology: vertical segment between best (green) and last (blue). Red diamond = lower bound when enabled.
+        Toggle <strong>Best = last</strong> to hide markers where best and last delay match (topology index stays).
       </p>
       <div className={`chart-scroll${fitWidth ? " chart-scroll--fit" : ""}`}>
         <svg
@@ -420,27 +688,37 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
           })}
           {points.map((p, idx) => {
             const x = xBase(idx);
+            const hidden = hideBestEqLast && isBestEqLastTopo(p);
             const best = Number(p.best_delay);
             const last = Number(p.last_delay);
             const lower = Number(p.lower_bound);
             const hasBest = Number.isFinite(best);
             const hasLast = Number.isFinite(last);
-            const hasLower = showLowerBound && Number.isFinite(lower);
-            const tip = [
-              `topology ${Number.isFinite(Number(p.topology_index)) ? p.topology_index : idx}`,
-              hasBest ? `best: ${best}` : null,
-              hasLast ? `last: ${last}` : null,
-              hasLower ? `lower: ${lower}` : null
-            ]
-              .filter(Boolean)
-              .join(" · ");
+            const hasLower = !hidden && showLowerBound && Number.isFinite(lower);
+            const tip = hidden
+              ? `topology ${Number.isFinite(Number(p.topology_index)) ? p.topology_index : idx} (best = last, hidden)`
+              : [
+                  `topology ${Number.isFinite(Number(p.topology_index)) ? p.topology_index : idx}`,
+                  hasBest ? `best: ${best}` : null,
+                  hasLast ? `last: ${last}` : null,
+                  hasLower ? `lower: ${lower}` : null
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
 
             return (
               <g key={`${p.topology_id}-${idx}`}>
                 <title>{tip}</title>
-                <text x={x} y={scatterH - 14} textAnchor="middle" className="chart-axis-text">
+                <text
+                  x={x}
+                  y={scatterH - 14}
+                  textAnchor="middle"
+                  className={`chart-axis-text${hidden ? " batch-delay-scatter-index--muted" : ""}`}
+                >
                   {Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx}
                 </text>
+                {hidden ? null : (
+                  <>
                 {hasBest && hasLast && Math.abs(best - last) > 1e-9 ? (
                   <line
                     x1={x}
@@ -462,6 +740,8 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
                     strokeWidth="1"
                   />
                 ) : null}
+                  </>
+                )}
               </g>
             );
           })}
@@ -510,22 +790,8 @@ function DensityPathMetricChart({ group, runLabel, bestDelayOverlayOpacity = 1, 
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ");
   const downloadPathMetricsCsv = () => {
-    const lines = [
-      "topology_index,topology_id,unique_path_count,best_delay_unique_path_count",
-      ...points.map(
-        (p, idx) =>
-          `${Number.isFinite(Number(p.topology_index)) ? Number(p.topology_index) : idx},${String(p.topology_id ?? "")},${String(p.unique_path_count ?? "")},${String(
-            p.best_delay_unique_path_count ?? ""
-          )}`
-      )
-    ].join("\n");
-    const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `path_metrics_density_${String(group?.density_key ?? "all")}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
+    const csv = buildBatchPathMetricsCsvForDensity(group);
+    downloadCsvText(csv, `path_metrics_density_${densityAxisLabel(group)}.csv`);
   };
 
   const downloadPathMetricsJpg = () => {
@@ -756,13 +1022,13 @@ function BatchDensityBlockCard({
   runLabel,
   bestDelayOverlayOpacity,
   scatterYAxis,
+  delayAxis,
   scatterFitWidth,
   pathFitWidth
 }) {
   const showDelayScatter = artifactFilter === "all" || artifactFilter === "delay";
   const showPathMetrics = artifactFilter === "all" || artifactFilter === "path";
-  const showDelayPerEpisode =
-    artifactFilter === "all" || artifactFilter === "path" || artifactFilter === "delay_episode";
+  const showDelayPerEpisode = artifactFilter === "all" || artifactFilter === "delay_episode";
   const dLabel = densityAxisLabel(group);
 
   return (
@@ -770,6 +1036,7 @@ function BatchDensityBlockCard({
       <h4 className="batch-density-block-title">
         Density <span className="batch-density-num">{dLabel}</span> nodes
       </h4>
+      <DensityLearningMeansStrip group={group} />
       {showDelayScatter ? (
         <DensityDelayScatterChart
           group={group}
@@ -787,6 +1054,7 @@ function BatchDensityBlockCard({
         />
       ) : null}
       {showDelayPerEpisode ? <DensityDelayPerEpisodeGrid group={group} /> : null}
+      <DensityDelayPathMatrixTable group={group} runLabel={runLabel} sharedDelayAxis={delayAxis} />
     </div>
   );
 }
@@ -800,7 +1068,8 @@ export default function BatchResultDetailBody({
   compact = false,
   boxplotYAxis = null,
   boxplotFitWidth = false,
-  scatterYAxisByDensity = null
+  scatterYAxisByDensity = null,
+  delayAxisByDensity = null
 }) {
   if (!result) return null;
   const topologies = result.topologies ?? [];
@@ -810,11 +1079,37 @@ export default function BatchResultDetailBody({
   return (
     <>
       <BatchSummaryStrip result={result} />
+      <BatchLearningMeansChart result={result} />
+      <div className="batch-path-metrics-download-row">
+        <button
+          type="button"
+          className="secondary-cta small"
+          title="Download delay × path count tables for all densities"
+          onClick={() => downloadAllDensityDelayPathMatrixCsv(result)}
+        >
+          Download delay × path matrix CSV (all densities)
+        </button>
+      </div>
       <DensityBoxplotChart
         densityGroups={result.density_groups}
         yAxis={boxplotYAxis}
         fitWidth={boxplotFitWidth}
       />
+      <div className="batch-path-metrics-download-row">
+        <button
+          type="button"
+          className="secondary-cta small"
+          disabled={!batchHasPathMetricsData(result)}
+          title={
+            batchHasPathMetricsData(result)
+              ? "Download path metrics for every topology in this batch run"
+              : "No path metrics (enable Path signature + delay_per_episode artifacts)"
+          }
+          onClick={() => downloadBatchPathMetricsCsv(result)}
+        >
+          Download path metrics CSV (all topologies)
+        </button>
+      </div>
       {showArtifactFilter ? (
         <div className="results-graph-controls batch-artifact-filter-row">
           <span className="field-label-span">Charts to show per density:</span>
@@ -846,6 +1141,7 @@ export default function BatchResultDetailBody({
             runLabel={result?.result_label}
             bestDelayOverlayOpacity={bestDelayOverlayOpacity}
             scatterYAxis={scatterYAxisByDensity?.[densityAxisLabel(grp)] ?? null}
+            delayAxis={delayAxisByDensity?.[densityAxisLabel(grp)] ?? null}
             scatterFitWidth={boxplotFitWidth}
             pathFitWidth={boxplotFitWidth}
           />

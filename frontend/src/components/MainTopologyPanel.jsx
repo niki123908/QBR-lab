@@ -6,6 +6,8 @@ import {
 } from "./topology-workspace/TopologyWorkspaceSections";
 import BatchResultDetailBody, { linearAxisTicks } from "./BatchResultDetailBody";
 import CompareWorkspace from "./CompareWorkspace";
+import PlaygroundStateTree from "./PlaygroundStateTree";
+import { formatRunLearningStatsSuffix } from "../utils/runLearningStats.js";
 
 function buildEdges(nodes, txRange) {
   if (!nodes || nodes.length === 0) return [];
@@ -232,7 +234,7 @@ function coveredNodesUpToSlot(timeslots = [], slot = 0) {
   return covered;
 }
 
-function flattenQTableRows(qTablePayload, limit = 300) {
+function flattenQTableRows(qTablePayload) {
   if (!qTablePayload || typeof qTablePayload !== "object") return [];
   const rows = [];
   Object.entries(qTablePayload).forEach(([stateHash, actions]) => {
@@ -245,7 +247,7 @@ function flattenQTableRows(qTablePayload, limit = 300) {
       });
     });
   });
-  return rows.slice(0, limit);
+  return rows;
 }
 
 function computeTemperatureProbabilities(qValues = [], tau = 1) {
@@ -321,7 +323,7 @@ function TemperatureToolWorkspace({
   );
   return (
     <div
-      className="temperature-tool-shell"
+      className="exploration-tool-shell temperature-tool-shell"
       style={{ "--temperature-font-scale": String(Number(tool?.fontScale) || 1) }}
     >
       <section className="temperature-tool-controls">
@@ -449,15 +451,455 @@ function TemperatureToolWorkspace({
   );
 }
 
-function ActionSpaceMeanBarChart({ summary, yMax }) {
+function computeUcbRows(qValues = [], visitCounts = [], globalT = 1, ucbC = 1.414) {
+  const values = (qValues ?? []).map((value) => Number(value) || 0);
+  const visits = (visitCounts ?? []).map((value) => Math.max(0, Math.trunc(Number(value) || 0)));
+  const t = Math.max(Number(globalT) || 0, 1);
+  const c = Number(ucbC) || 1.414;
+  const logT = Math.log(t);
+
+  const rows = values.map((qValue, index) => {
+    const visitCount = visits[index] ?? 0;
+    const unvisited = visitCount === 0;
+    const bonus = unvisited ? null : c * Math.sqrt(logT / visitCount);
+    const score = unvisited ? null : qValue + bonus;
+    return {
+      action: `A${index + 1}`,
+      qValue,
+      visitCount,
+      bonus,
+      score,
+      unvisited,
+      selected: false
+    };
+  });
+
+  const unvisitedRows = rows.filter((row) => row.unvisited);
+  let selectedAction = null;
+  if (unvisitedRows.length > 0) {
+    selectedAction = unvisitedRows.reduce(
+      (minAction, row) => (minAction == null || row.action < minAction ? row.action : minAction),
+      null
+    );
+  } else if (rows.length > 0) {
+    const bestRow = rows.reduce((best, row) =>
+      best == null || (row.score ?? -Infinity) > (best.score ?? -Infinity) ? row : best
+    );
+    selectedAction = bestRow?.action ?? null;
+  }
+
+  return rows.map((row) => ({ ...row, selected: row.action === selectedAction }));
+}
+
+function UcbScoreBarChart({ rows = [] }) {
+  if (!rows.length) {
+    return <p className="muted">No UCB scores.</p>;
+  }
+  const finiteScores = rows.map((row) => (row.unvisited ? null : Number(row.score))).filter((n) => Number.isFinite(n));
+  const maxScore = Math.max(...finiteScores, 1e-6);
+  return (
+    <div className="temperature-chart ucb-score-chart">
+      <div className="temperature-chart-bars">
+        {rows.map((row) => {
+          const isSelected = Boolean(row.selected);
+          const isUnvisited = Boolean(row.unvisited);
+          const score = Number(row.score);
+          const height = isUnvisited ? "100%" : `${Math.max((score / maxScore) * 100, score > 0 ? 2 : 0)}%`;
+          return (
+            <div key={row.action} className="temperature-bar-item">
+              <span className="temperature-bar-value">{isUnvisited ? "∞" : score.toFixed(2)}</span>
+              <div className="temperature-bar-track">
+                <div
+                  className={`temperature-bar-fill ${isSelected ? "top" : ""} ${isUnvisited ? "ucb-bar-unvisited" : ""}`}
+                  style={{ height }}
+                />
+              </div>
+              <span className="temperature-bar-label">{row.action}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function UcbToolWorkspace({
+  tool,
+  rows,
+  onReset,
+  onActionCountChange,
+  onGlobalTRangeChange,
+  onGlobalTChange,
+  onUcbCRangeChange,
+  onUcbCChange,
+  onQRangeChange,
+  onQValueChange,
+  onVisitCountChange
+}) {
+  const selectedRow = rows.find((row) => row.selected) ?? null;
+  const totalQValue = rows.reduce((sum, row) => sum + (Number(row.qValue) || 0), 0);
+  const totalBonus = rows.reduce(
+    (sum, row) => sum + (Number.isFinite(Number(row.bonus)) ? Number(row.bonus) : 0),
+    0
+  );
+  const totalScore = rows.reduce(
+    (sum, row) => sum + (Number.isFinite(Number(row.score)) ? Number(row.score) : 0),
+    0
+  );
+
+  return (
+    <div
+      className="exploration-tool-shell ucb-tool-shell"
+      style={{ "--temperature-font-scale": String(Number(tool?.fontScale) || 1) }}
+    >
+      <section className="temperature-tool-controls">
+        <div className="edit-panel-header">
+          <h3>UCB Tool</h3>
+          <button type="button" className="secondary-cta" onClick={onReset}>
+            Reset
+          </button>
+        </div>
+        <div className="temperature-grid">
+          <label className="field-label">
+            Action count
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={tool.actionCount}
+              onChange={(e) => onActionCountChange(Number(e.target.value))}
+            />
+          </label>
+          <label className="field-label">
+            Global t min
+            <input
+              type="number"
+              step="1"
+              min="1"
+              value={tool.globalTMin}
+              onChange={(e) => onGlobalTRangeChange(Number(e.target.value), tool.globalTMax)}
+            />
+          </label>
+          <label className="field-label">
+            Global t max
+            <input
+              type="number"
+              step="1"
+              min="1"
+              value={tool.globalTMax}
+              onChange={(e) => onGlobalTRangeChange(tool.globalTMin, Number(e.target.value))}
+            />
+          </label>
+          <label className="field-label">
+            UCB c min
+            <input
+              type="number"
+              step="0.001"
+              value={tool.ucbCMin}
+              onChange={(e) => onUcbCRangeChange(Number(e.target.value), tool.ucbCMax)}
+            />
+          </label>
+          <label className="field-label">
+            UCB c max
+            <input
+              type="number"
+              step="0.001"
+              value={tool.ucbCMax}
+              onChange={(e) => onUcbCRangeChange(tool.ucbCMin, Number(e.target.value))}
+            />
+          </label>
+          <label className="field-label">
+            Q min
+            <input
+              type="number"
+              step="0.1"
+              value={tool.qMin}
+              onChange={(e) => onQRangeChange(Number(e.target.value), tool.qMax)}
+            />
+          </label>
+          <label className="field-label">
+            Q max
+            <input
+              type="number"
+              step="0.1"
+              value={tool.qMax}
+              onChange={(e) => onQRangeChange(tool.qMin, Number(e.target.value))}
+            />
+          </label>
+        </div>
+        <label className="field-label temperature-slider-field">
+          Global t
+          <input
+            type="range"
+            min={tool.globalTMin}
+            max={tool.globalTMax}
+            step="1"
+            value={tool.globalT}
+            onChange={(e) => onGlobalTChange(Number(e.target.value))}
+          />
+          <small className="muted">{Math.round(tool.globalT)}</small>
+        </label>
+        <label className="field-label temperature-slider-field">
+          UCB c
+          <input
+            type="range"
+            min={tool.ucbCMin}
+            max={tool.ucbCMax}
+            step="0.001"
+            value={tool.ucbC}
+            onChange={(e) => onUcbCChange(Number(e.target.value))}
+          />
+          <small className="muted">{tool.ucbC.toFixed(3)}</small>
+        </label>
+        <div className="temperature-action-slider-list">
+          {tool.qValues.map((value, index) => (
+            <label key={`ucb-q-${index}`} className="field-label temperature-slider-field">
+              {`A${index + 1} Q value`}
+              <input
+                type="range"
+                min={tool.qMin}
+                max={tool.qMax}
+                step="0.1"
+                value={value}
+                onChange={(e) => onQValueChange(index, Number(e.target.value))}
+              />
+              <small className="muted">{Number(value).toFixed(2)}</small>
+            </label>
+          ))}
+          {tool.visitCounts.map((value, index) => (
+            <label key={`ucb-n-${index}`} className="field-label temperature-slider-field">
+              {`A${index + 1} N(s,a)`}
+              <input
+                type="range"
+                min="0"
+                max={tool.visitMax}
+                step="1"
+                value={value}
+                onChange={(e) => onVisitCountChange(index, Number(e.target.value))}
+              />
+              <small className="muted">{Number(value) === 0 ? "0 (unvisited)" : String(Math.round(Number(value)))}</small>
+            </label>
+          ))}
+        </div>
+      </section>
+      <section className="temperature-tool-results">
+        <div className="temperature-results-header">
+          <h3>UCB Score</h3>
+          <span className="muted">{selectedRow ? `Selected: ${selectedRow.action}` : "No selection"}</span>
+        </div>
+        <UcbScoreBarChart rows={rows} />
+        <div className="table-scroll">
+          <table className="node-edit-table temperature-table ucb-score-table">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>Q value</th>
+                <th>N(s,a)</th>
+                <th>Bonus</th>
+                <th>UCB score</th>
+                <th>Selected</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={`ucb-row-${row.action}`} className={row.selected ? "ucb-row-selected" : ""}>
+                  <td>{row.action}</td>
+                  <td>{row.qValue.toFixed(2)}</td>
+                  <td>{row.unvisited ? "0" : row.visitCount}</td>
+                  <td>{row.unvisited ? "-" : row.bonus.toFixed(4)}</td>
+                  <td>{row.unvisited ? "∞" : row.score.toFixed(4)}</td>
+                  <td>{row.selected ? "Yes" : "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="temperature-table-total-row">
+                <td>Total</td>
+                <td>{totalQValue.toFixed(2)}</td>
+                <td>-</td>
+                <td>{totalBonus.toFixed(4)}</td>
+                <td>{totalScore.toFixed(4)}</td>
+                <td>-</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HomeExplorationToolsWorkspace({
+  homeToolTab,
+  setHomeToolTab,
+  temperatureTool,
+  temperatureRows,
+  resetTemperatureTool,
+  updateTemperatureActionCount,
+  updateTemperatureTauRange,
+  updateTemperatureQRange,
+  updateTemperatureTau,
+  updateTemperatureQValue,
+  ucbTool,
+  ucbRows,
+  resetUcbTool,
+  updateUcbActionCount,
+  updateUcbGlobalTRange,
+  updateUcbGlobalT,
+  updateUcbCRange,
+  updateUcbC,
+  updateUcbQRange,
+  updateUcbQValue,
+  updateUcbVisitCount
+}) {
+  return (
+    <div className="home-exploration-tools">
+      <div className="tab-row home-exploration-tabs">
+        <button
+          type="button"
+          className={`tab-pill ${homeToolTab === "softmax" ? "active" : ""}`}
+          onClick={() => setHomeToolTab("softmax")}
+        >
+          Softmax
+        </button>
+        <button
+          type="button"
+          className={`tab-pill ${homeToolTab === "ucb" ? "active" : ""}`}
+          onClick={() => setHomeToolTab("ucb")}
+        >
+          UCB
+        </button>
+      </div>
+      {homeToolTab === "ucb" ? (
+        <UcbToolWorkspace
+          tool={ucbTool}
+          rows={ucbRows}
+          onReset={resetUcbTool}
+          onActionCountChange={updateUcbActionCount}
+          onGlobalTRangeChange={updateUcbGlobalTRange}
+          onGlobalTChange={updateUcbGlobalT}
+          onUcbCRangeChange={updateUcbCRange}
+          onUcbCChange={updateUcbC}
+          onQRangeChange={updateUcbQRange}
+          onQValueChange={updateUcbQValue}
+          onVisitCountChange={updateUcbVisitCount}
+        />
+      ) : (
+        <TemperatureToolWorkspace
+          tool={temperatureTool}
+          rows={temperatureRows}
+          onReset={resetTemperatureTool}
+          onActionCountChange={updateTemperatureActionCount}
+          onTauRangeChange={updateTemperatureTauRange}
+          onQRangeChange={updateTemperatureQRange}
+          onTauChange={updateTemperatureTau}
+          onQValueChange={updateTemperatureQValue}
+        />
+      )}
+    </div>
+  );
+}
+
+function pickActionSpaceSummary(payload, groupKeys, candidateKeys) {
+  for (const key of groupKeys) {
+    const summary = payload?.[key];
+    if (Array.isArray(summary?.timeslots) && summary.timeslots.length > 0) {
+      return { summary, source: "group" };
+    }
+  }
+  for (const key of candidateKeys) {
+    const summary = payload?.[key];
+    if (Array.isArray(summary?.timeslots) && summary.timeslots.length > 0) {
+      return { summary, source: "candidate_fallback" };
+    }
+  }
+  return { summary: null, source: "none" };
+}
+
+function hasNativeGroupSummaries(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  return ["action_space_by_timeslot_group", "action_space_by_timeslot_group_rcv", "action_space_by_timeslot_group_br"].some(
+    (key) => Array.isArray(payload[key]?.timeslots) && payload[key].timeslots.length > 0
+  );
+}
+
+function buildActionSpaceCompareRows(candidateSummary, groupSummary) {
+  const bySlot = new Map();
+  const ingest = (summary, field) => {
+    (summary?.timeslots ?? []).forEach((row) => {
+      const slot = row?.timeslot;
+      if (slot === undefined || slot === null) return;
+      const key = String(slot);
+      const existing = bySlot.get(key) ?? { timeslot: slot };
+      const mean = Number(row?.mean_candidate_count);
+      if (Number.isFinite(mean)) {
+        existing[field] = mean;
+      }
+      const nPaths = Number(row?.n_unique_paths);
+      if (Number.isFinite(nPaths)) {
+        existing.n_unique_paths = nPaths;
+      }
+      bySlot.set(key, existing);
+    });
+  };
+  ingest(candidateSummary, "mean_candidate_count");
+  ingest(groupSummary, "mean_group_count");
+  return [...bySlot.values()].sort((a, b) => Number(a.timeslot) - Number(b.timeslot));
+}
+
+function ActionSpaceCompareTable({ rows }) {
+  if (!rows.length) {
+    return <p className="muted">No action-space summary.</p>;
+  }
+  return (
+    <div className="table-scroll action-space-mean-table-wrap">
+      <table className="node-edit-table action-space-mean-table">
+        <thead>
+          <tr>
+            <th>timeslot</th>
+            <th>mean_candidate</th>
+            <th>mean_group</th>
+            <th>n_unique_paths</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={`cmp-${row.timeslot}`}>
+              <td>{row.timeslot}</td>
+              <td>
+                {Number.isFinite(Number(row.mean_candidate_count))
+                  ? Number(row.mean_candidate_count).toFixed(4).replace(/\.?0+$/, "")
+                  : "-"}
+              </td>
+              <td>
+                {Number.isFinite(Number(row.mean_group_count))
+                  ? Number(row.mean_group_count).toFixed(4).replace(/\.?0+$/, "")
+                  : "-"}
+              </td>
+              <td>{row.n_unique_paths ?? "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ActionSpaceMeanBarChart({
+  summary,
+  yMax,
+  meanField = "mean_candidate_count",
+  entityLabel = "candidate",
+  barColor = "#63a5c7"
+}) {
   const rows = Array.isArray(summary?.timeslots) ? summary.timeslots : [];
   const rawAxis = String(summary?.action_axis ?? "");
   const axisLabel = rawAxis === "receiver" || rawAxis === "rcv_cands" ? "rcv_cands" : "br_cands";
-  const axisText = axisLabel === "rcv_cands" ? "receive candidate" : "broadcast candidate";
+  const axisText = axisLabel === "rcv_cands" ? "receive" : "broadcast";
   if (rows.length === 0) {
     return <p className="muted">No aggregate candidate data.</p>;
   }
-  const counts = rows.map((row) => Number(row.mean_candidate_count)).filter((n) => Number.isFinite(n));
+  const counts = rows.map((row) => Number(row[meanField])).filter((n) => Number.isFinite(n));
   const computedMaxC = Math.max(...counts, 1e-6);
   const maxC = Number.isFinite(Number(yMax)) ? Math.max(Number(yMax), 1e-6) : computedMaxC;
   const n = rows.length;
@@ -520,10 +962,10 @@ function ActionSpaceMeanBarChart({ summary, yMax }) {
           Timeslot
         </text>
         <text x={padL} y={padT - 2} textAnchor="start" fontSize="11" fill="#4d5478">
-          {`Mean ${axisText}`}
+          {`Mean ${axisText} ${entityLabel}`}
         </text>
         {rows.map((row, i) => {
-          const mean = Number(row.mean_candidate_count);
+          const mean = Number(row[meanField]);
           if (!Number.isFinite(mean)) return null;
           const h = (mean / maxC) * chartH;
           const xCenter = padL + i * slotW + slotW / 2;
@@ -532,7 +974,7 @@ function ActionSpaceMeanBarChart({ summary, yMax }) {
           const ts = row.timeslot;
           return (
             <g key={`${row.timeslot}-${i}`}>
-              <rect x={x} y={y} width={barW} height={Math.max(h, 1)} fill="#63a5c7" rx={2} />
+              <rect x={x} y={y} width={barW} height={Math.max(h, 1)} fill={barColor} rx={2} />
               {i % xLabelStep === 0 ? (
                 <text
                   x={xCenter}
@@ -550,11 +992,29 @@ function ActionSpaceMeanBarChart({ summary, yMax }) {
       </svg>
       <div className="delay-chart-meta">
         <span>
-          {n} timeslots · mean {axisText}
+          {n} timeslots · mean {axisText} {entityLabel}
         </span>
       </div>
     </div>
   );
+}
+
+function sharedMeanCandidateYMax(...summaries) {
+  const vals = summaries.flatMap((summary) =>
+    (summary?.timeslots ?? [])
+      .map((row) => Number(row.mean_candidate_count))
+      .filter((n) => Number.isFinite(n))
+  );
+  return vals.length ? Math.max(...vals) : 0;
+}
+
+function sharedMeanGroupYMax(...summaries) {
+  const vals = summaries.flatMap((summary) =>
+    (summary?.timeslots ?? [])
+      .map((row) => Number(row.mean_candidate_count))
+      .filter((n) => Number.isFinite(n))
+  );
+  return vals.length ? Math.max(...vals) : 0;
 }
 
 function QProfileEpochBarChart({ chart, actionAxis }) {
@@ -931,69 +1391,6 @@ function BatchCard({ batch, onOpen, statusLabel, idSubtitle, actions = null }) {
   );
 }
 
-function QueueLaneDropdown({ lane, index, defaultOpen = true }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const panelRef = useRef(null);
-  const workerLabel = lane.worker_id ? `Worker ${index + 1}` : "Queue";
-  const items = [...(Array.isArray(lane.queued) ? lane.queued : []), ...(lane.running ? [lane.running] : [])];
-  if (!items.length) return null;
-
-  useEffect(() => {
-    if (!open || !panelRef.current) return;
-    panelRef.current.scrollTop = panelRef.current.scrollHeight;
-  }, [open, items.length]);
-
-  return (
-    <div className="queue-lane-dropdown">
-      {open ? (
-        <div ref={panelRef} className="queue-lane-panel">
-          {items.map((item, itemIndex) => {
-            const isRunning = item.status === "running" && itemIndex === items.length - 1;
-            return (
-              <div
-                key={item.run_id}
-                className={`queue-run-line ${isRunning ? "running" : "queued"} ${item.mode === "single" ? "single" : "batch"}`}
-                title={`${item.topology_name} · ${item.mode}${item.batch_label ? ` · ${item.batch_label}` : ""}`}
-              >
-                <span className="queue-run-line-text">{item.topology_name}</span>
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-      <button type="button" className="queue-lane-trigger" onClick={() => setOpen((value) => !value)}>
-        <span>{workerLabel}</span>
-        <span className="queue-lane-count">{items.length}</span>
-      </button>
-    </div>
-  );
-}
-
-function QueueOverlay({ snapshot }) {
-  const lanes = Array.isArray(snapshot?.lanes) ? snapshot.lanes.filter((lane) => (lane?.queued?.length ?? 0) > 0 || lane?.running) : [];
-  if (!lanes.length) return null;
-  return (
-    <div className="queue-overlay">
-      <div className="queue-overlay-header">
-        <span>Queue</span>
-        <span className="muted">
-          running {snapshot?.total_running ?? 0} · queued {snapshot?.total_queued ?? 0}
-        </span>
-      </div>
-      <div className="queue-overlay-lanes">
-        {lanes.map((lane, index) => (
-          <QueueLaneDropdown
-            key={lane.lane_id || lane.worker_id || `lane-${index}`}
-            lane={lane}
-            index={index}
-            defaultOpen={index < 2}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function BatchModal({ open, mode, value, setValue, onCancel, onConfirm }) {
   if (!open) return null;
   return (
@@ -1022,6 +1419,41 @@ function BatchModal({ open, mode, value, setValue, onCancel, onConfirm }) {
   );
 }
 
+function ConfirmModal({
+  open,
+  title,
+  message,
+  confirmLabel = "Delete",
+  cancelLabel = "Cancel",
+  confirming = false,
+  onCancel,
+  onConfirm
+}) {
+  if (!open) return null;
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-modal-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <h3 id="confirm-modal-title">{title}</h3>
+        <p className="modal-message">{message}</p>
+        <div className="modal-actions">
+          <button type="button" className="secondary-cta" onClick={onCancel} disabled={confirming}>
+            {cancelLabel}
+          </button>
+          <button type="button" className="danger-ghost-btn" onClick={onConfirm} disabled={confirming}>
+            {confirming ? "Deleting…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MainTopologyPanel({
   activeMenu,
   activePanel2Tab,
@@ -1033,6 +1465,18 @@ export default function MainTopologyPanel({
   updateTemperatureQRange,
   updateTemperatureTau,
   updateTemperatureQValue,
+  homeToolTab,
+  setHomeToolTab,
+  ucbTool,
+  resetUcbTool,
+  updateUcbActionCount,
+  updateUcbGlobalTRange,
+  updateUcbGlobalT,
+  updateUcbCRange,
+  updateUcbC,
+  updateUcbQRange,
+  updateUcbQValue,
+  updateUcbVisitCount,
   runBatches,
   resultsSingleRunBatches,
   runMultiForm,
@@ -1082,12 +1526,34 @@ export default function MainTopologyPanel({
   batchRunResultDetailError,
   onRetryBatchRunResultDetail,
   batchRunProgress,
-  queueSnapshot,
   onBatchStop,
   onBatchResume,
   onDeleteBatchRunResult,
+  onRenameBatchRunResult,
   graphByTopologyId,
   playgroundState,
+  playgroundTree,
+  playgroundTreeLoading,
+  playgroundTreeLoadError,
+  playgroundTreeMode = "manual",
+  setPlaygroundTreeMode,
+  onResetPlaygroundTree,
+  onExpandPlaygroundTree,
+  playgroundTreeExpanding,
+  playgroundTreeExpandStats,
+  runDerivedTree,
+  runDerivedTreeLoading,
+  runDerivedTreeLoadError,
+  runDerivedTreeMessage,
+  runDerivedTreeSourceArtifact,
+  playgroundRunSourceId,
+  setPlaygroundRunSourceId,
+  onRefreshRunDerivedTree,
+  decisionTreeRowSpread,
+  decisionTreeFontScale,
+  decisionTreeEdgeScale,
+  decisionTreeNodeScale,
+  decisionTreeEdgeOpacity,
   setPlaygroundMode,
   setPlaygroundViewSlot,
   setPlaygroundHoverNode,
@@ -1127,9 +1593,13 @@ export default function MainTopologyPanel({
   onToggleBatchLock,
   apiBase,
   singleRunTopologyIds,
-  topologyNameById
+  topologyNameById,
+  onExportSnapshotPatch,
+  onCompareExportChange,
+  compareExport,
+  mainExportContext,
+  onOpenExportModal
 }) {
-  const BATCH_RESULT_ALIAS_STORAGE_KEY = "qbr_batch_result_alias_map_v1";
   const RUN_TOPO_PRESET_STORAGE_KEY = "qbr_run_topo_presets_v1";
   const homeViewMode = activeMenu === "home";
   const generateViewMode = activeMenu === "generate";
@@ -1143,11 +1613,53 @@ export default function MainTopologyPanel({
   const [generateBatchModalOpen, setGenerateBatchModalOpen] = useState(false);
   const [generateBatchModalName, setGenerateBatchModalName] = useState("");
   const isTopologyPlayground = activeMenu === "topologies" && focusedTopologyId && activePanel2Tab === "playground";
+  const playgroundShellRef = useRef(null);
+  const decisionTreeExportRef = useRef(null);
+  const [decisionTreeExporting, setDecisionTreeExporting] = useState(false);
+  const [topoScalePx, setTopoScalePx] = useState(6);
+
   const temperatureProbabilityRows = useMemo(
     () => computeTemperatureProbabilities(temperatureTool?.qValues ?? [], temperatureTool?.tau ?? 1),
     [temperatureTool?.qValues, temperatureTool?.tau]
   );
+  const ucbScoreRows = useMemo(
+    () =>
+      computeUcbRows(
+        ucbTool?.qValues ?? [],
+        ucbTool?.visitCounts ?? [],
+        ucbTool?.globalT ?? 1,
+        ucbTool?.ucbC ?? 1.414
+      ),
+    [ucbTool?.qValues, ucbTool?.visitCounts, ucbTool?.globalT, ucbTool?.ucbC]
+  );
   const focusedGraph = focusedTopologyId ? graphByTopologyId[focusedTopologyId] : null;
+
+  useEffect(() => {
+    if (!isTopologyPlayground || !playgroundShellRef.current) return;
+    const shell = playgroundShellRef.current;
+    const spaceW = Number(focusedGraph?.space_width) || 100;
+    const spaceH = Number(focusedGraph?.space_height) || 100;
+
+    const measure = () => {
+      const svg = shell.querySelector("svg.topology-svg");
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return;
+      setTopoScalePx(Math.min(rect.width / spaceW, rect.height / spaceH));
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, [
+    isTopologyPlayground,
+    focusedGraph?.topology_id,
+    focusedGraph?.space_width,
+    focusedGraph?.space_height,
+    graphDisplaySettings.node_size,
+    graphDisplaySettings.label_size
+  ]);
   const focusedTopo = focusedTopologyId
     ? topologies.find((item) => item.topology_id === focusedTopologyId) ?? selectedTopology
     : null;
@@ -1165,6 +1677,130 @@ export default function MainTopologyPanel({
   );
   const runMultiTopologies = runMultiSelectedBatch?.topologies ?? [];
   const resultTopologies = focusedBatchRunResult?.topologies ?? [];
+  const isRunMultiRepeatMode = runMultiSubMode === "repeat";
+
+  const { panelHeading, panelSubtitle } = useMemo(() => {
+    if (compareViewMode) {
+      return { panelHeading: mainTitle, panelSubtitle: null };
+    }
+    if (resultsView) {
+      if (focusedBatchRunId) {
+        const label =
+          typeof focusedBatchRunResult?.result_label === "string"
+            ? focusedBatchRunResult.result_label.trim()
+            : "";
+        return {
+          panelHeading: label || "Batch result",
+          panelSubtitle: label ? "Batch result" : null
+        };
+      }
+      if (focusedTopologyId) {
+        const topoName = selectedTopology?.topology_name ?? focusedTopo?.topology_name;
+        return {
+          panelHeading: "Results",
+          panelSubtitle: topoName || null
+        };
+      }
+      if (focusedBatchId && resultsSingleFocusedBatch?.batch_name) {
+        return {
+          panelHeading: "Results",
+          panelSubtitle: resultsSingleFocusedBatch.batch_name
+        };
+      }
+      return { panelHeading: mainTitle, panelSubtitle: null };
+    }
+    if (topologyViewMode) {
+      if (isTopologyPlayground) {
+        return {
+          panelHeading: "Topology playground",
+          panelSubtitle: focusedTopo?.topology_name ?? null
+        };
+      }
+      if (focusedTopologyId) {
+        return {
+          panelHeading: focusedTopo?.topology_name ?? "Topology detail",
+          panelSubtitle: null
+        };
+      }
+      if (focusedBatchId && focusedBatch?.batch_name) {
+        return { panelHeading: focusedBatch.batch_name, panelSubtitle: "Batch topologies" };
+      }
+      return { panelHeading: mainTitle, panelSubtitle: null };
+    }
+    if (runTopoViewMode) {
+      if (focusedTopologyId) {
+        return {
+          panelHeading: focusedTopo?.topology_name ?? "Topology detail",
+          panelSubtitle: "Run topology"
+        };
+      }
+      if (runFocusedBatch?.batch_name) {
+        return { panelHeading: runFocusedBatch.batch_name, panelSubtitle: "Run topology" };
+      }
+      return { panelHeading: mainTitle, panelSubtitle: null };
+    }
+    if (runMultiViewMode) {
+      if (isRunMultiRepeatMode) {
+        return {
+          panelHeading: "Repeat topology",
+          panelSubtitle: selectedTopology?.topology_name ?? null
+        };
+      }
+      if (focusedTopologyId) {
+        return {
+          panelHeading: focusedTopo?.topology_name ?? "Topology detail",
+          panelSubtitle: "Run multi"
+        };
+      }
+      if (runMultiSelectedBatch?.batch_name) {
+        return { panelHeading: runMultiSelectedBatch.batch_name, panelSubtitle: "Run multi" };
+      }
+      return { panelHeading: mainTitle, panelSubtitle: null };
+    }
+    if (generateViewMode) {
+      if (generateMode === "multi") {
+        return {
+          panelHeading: "Generate multi",
+          panelSubtitle: generateSelectedBatch?.batch_name ?? null
+        };
+      }
+      return {
+        panelHeading: mainTitle,
+        panelSubtitle: generateSelectedBatch?.batch_name ?? null
+      };
+    }
+    if (homeViewMode) {
+      return {
+        panelHeading: mainTitle,
+        panelSubtitle: homeToolTab === "ucb" ? "UCB tool" : "Softmax tool"
+      };
+    }
+    return { panelHeading: mainTitle, panelSubtitle: null };
+  }, [
+    compareViewMode,
+    resultsView,
+    focusedBatchRunId,
+    focusedBatchRunResult?.result_label,
+    focusedTopologyId,
+    selectedTopology?.topology_name,
+    focusedTopo?.topology_name,
+    focusedBatchId,
+    resultsSingleFocusedBatch?.batch_name,
+    topologyViewMode,
+    isTopologyPlayground,
+    focusedBatch?.batch_name,
+    runTopoViewMode,
+    runFocusedBatch?.batch_name,
+    runMultiViewMode,
+    isRunMultiRepeatMode,
+    runMultiSelectedBatch?.batch_name,
+    generateViewMode,
+    generateMode,
+    generateSelectedBatch?.batch_name,
+    homeViewMode,
+    homeToolTab,
+    mainTitle
+  ]);
   const selectedEpisodeNum = Number(selectedEpisode) || 0;
   const transmissionEpisodes = Array.isArray(transmissionAllPayload?.episodes) ? transmissionAllPayload.episodes : [];
   const qTableEpisodes = Array.isArray(qTableAllEpochsPayload?.episodes) ? qTableAllEpochsPayload.episodes : [];
@@ -1294,9 +1930,90 @@ export default function MainTopologyPanel({
     return { fillById };
   }, [maxReplaySlot, replaySlotClamped, replayTimeslots]);
   const qTableRows = useMemo(
-    () => flattenQTableRows(selectedEpisodeQTable ?? qTablePayload, 300),
+    () => flattenQTableRows(selectedEpisodeQTable ?? qTablePayload),
     [selectedEpisodeQTable, qTablePayload]
   );
+  const qTableRowCount = qTableRows.length;
+  const actionSpaceRows = useMemo(() => {
+    const rcv = runSummaryPayload?.action_space_by_timeslot_rcv?.timeslots ?? [];
+    if (rcv.length) {
+      return rcv.map((row) => ({
+        timeslot: row.timeslot ?? "",
+        mean_candidate_count: row.mean_candidate_count ?? "",
+        n_unique_paths: row.n_unique_paths ?? ""
+      }));
+    }
+    const br = runSummaryPayload?.action_space_by_timeslot_br?.timeslots ?? [];
+    return br.map((row) => ({
+      timeslot: row.timeslot ?? "",
+      mean_candidate_count: row.mean_candidate_count ?? "",
+      n_unique_paths: row.n_unique_paths ?? ""
+    }));
+  }, [runSummaryPayload]);
+  const actionSpaceProfile = useMemo(() => {
+    const rcv = runSummaryPayload?.action_space_by_timeslot_rcv?.timeslots ?? [];
+    return rcv.length ? "rcv" : "br";
+  }, [runSummaryPayload]);
+  const actionSpaceGroupNative = useMemo(
+    () => hasNativeGroupSummaries(runSummaryPayload),
+    [runSummaryPayload]
+  );
+  const actionSpaceBrCandidate = useMemo(
+    () =>
+      pickActionSpaceSummary(runSummaryPayload, [], [
+        "action_space_by_timeslot_br",
+        "action_space_by_timeslot"
+      ]),
+    [runSummaryPayload]
+  );
+  const actionSpaceRcvCandidate = useMemo(
+    () =>
+      pickActionSpaceSummary(runSummaryPayload, [], [
+        "action_space_by_timeslot_rcv",
+        "action_space_by_timeslot"
+      ]),
+    [runSummaryPayload]
+  );
+  const actionSpaceBrGroup = useMemo(
+    () =>
+      pickActionSpaceSummary(
+        runSummaryPayload,
+        ["action_space_by_timeslot_group_br", "action_space_by_timeslot_group"],
+        ["action_space_by_timeslot_br", "action_space_by_timeslot"]
+      ),
+    [runSummaryPayload]
+  );
+  const actionSpaceRcvGroup = useMemo(
+    () =>
+      pickActionSpaceSummary(
+        runSummaryPayload,
+        ["action_space_by_timeslot_group_rcv", "action_space_by_timeslot_group"],
+        ["action_space_by_timeslot_rcv", "action_space_by_timeslot"]
+      ),
+    [runSummaryPayload]
+  );
+  const actionSpaceBrCompareRows = useMemo(
+    () => buildActionSpaceCompareRows(actionSpaceBrCandidate.summary, actionSpaceBrGroup.summary),
+    [actionSpaceBrCandidate.summary, actionSpaceBrGroup.summary]
+  );
+  const actionSpaceRcvCompareRows = useMemo(
+    () => buildActionSpaceCompareRows(actionSpaceRcvCandidate.summary, actionSpaceRcvGroup.summary),
+    [actionSpaceRcvCandidate.summary, actionSpaceRcvGroup.summary]
+  );
+  const showActionSpacePanel = useMemo(() => {
+    const keys = [
+      actionSpaceRcvCandidate.summary,
+      actionSpaceBrCandidate.summary,
+      actionSpaceRcvGroup.summary,
+      actionSpaceBrGroup.summary
+    ];
+    return keys.some((s) => Array.isArray(s?.timeslots) && s.timeslots.length > 0);
+  }, [
+    actionSpaceBrCandidate.summary,
+    actionSpaceBrGroup.summary,
+    actionSpaceRcvCandidate.summary,
+    actionSpaceRcvGroup.summary
+  ]);
   const hasTransmissionTrace = latestRunCapabilities?.has_transmission_trace ?? true;
   const hasQTable = latestRunCapabilities?.has_q_table ?? true;
   const hasEpochCompare = latestRunCapabilities?.has_epoch_compare ?? true;
@@ -1304,41 +2021,80 @@ export default function MainTopologyPanel({
     () => (runHistoryItems ?? []).filter((item) => item.status === "done"),
     [runHistoryItems]
   );
+  const historySelectableRuns = useMemo(
+    () => (runHistoryItems ?? []).filter((item) => item.status === "done" || item.status === "failed"),
+    [runHistoryItems]
+  );
+  const latestHistoryRun = (runHistoryItems ?? [])[0] ?? null;
   const selectedRun = useMemo(
     () =>
       (selectedRunId
-        ? completedRuns.find((item) => item.run_id === selectedRunId) ?? null
+        ? historySelectableRuns.find((item) => item.run_id === selectedRunId) ?? null
         : null) ?? completedRuns[0] ?? null,
-    [completedRuns, selectedRunId]
+    [completedRuns, historySelectableRuns, selectedRunId]
   );
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState("create");
   const [modalBatchName, setModalBatchName] = useState("");
+  const [deleteBatchRunTarget, setDeleteBatchRunTarget] = useState(null);
+  const [deletingBatchRun, setDeletingBatchRun] = useState(false);
   const [qValueSortMode, setQValueSortMode] = useState("none");
-  const [batchResultAliasMap, setBatchResultAliasMap] = useState({});
   const [presetLabelMap, setPresetLabelMap] = useState({});
+  const batchResultAliasMap = useMemo(() => {
+    const map = {};
+    (batchRunResults ?? []).forEach((item) => {
+      const custom =
+        typeof item.custom_result_label === "string" ? item.custom_result_label.trim() : "";
+      if (custom) {
+        map[item.batch_run_id] = custom;
+      }
+    });
+    return map;
+  }, [batchRunResults]);
   /** Multi batch detail: which chart groups to show — not a per-density filter. */
   const [batchArtifactFilter, setBatchArtifactFilter] = useState(() => "all");
+  const isRunDerivedTreeMode = playgroundTreeMode === "run";
+  const [highlightMergedTransitions, setHighlightMergedTransitions] = useState(false);
+
+  const handleExportDecisionTreeJpg = useCallback(async () => {
+    if (!decisionTreeExportRef.current) return;
+    setDecisionTreeExporting(true);
+    try {
+      const topoLabel = (focusedTopo?.topology_name ?? "topology").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, "_");
+      const runSuffix =
+        isRunDerivedTreeMode && playgroundRunSourceId ? `_run-${playgroundRunSourceId.slice(0, 8)}` : "";
+      await decisionTreeExportRef.current.exportJpg(`decision_tree_${topoLabel}${runSuffix}.jpg`);
+    } finally {
+      setDecisionTreeExporting(false);
+    }
+  }, [focusedTopo?.topology_name, isRunDerivedTreeMode, playgroundRunSourceId]);
 
   useEffect(() => {
-    try {
-      const rawAlias = window.localStorage.getItem(BATCH_RESULT_ALIAS_STORAGE_KEY);
-      if (rawAlias) {
-        const parsed = JSON.parse(rawAlias);
-        if (parsed && typeof parsed === "object") setBatchResultAliasMap(parsed);
-      }
-    } catch {
-      // ignore invalid local storage content
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(BATCH_RESULT_ALIAS_STORAGE_KEY, JSON.stringify(batchResultAliasMap));
-    } catch {
-      // ignore write errors
-    }
-  }, [batchResultAliasMap]);
+    onExportSnapshotPatch?.({
+      temperatureRows: temperatureProbabilityRows,
+      ucbRows: ucbScoreRows,
+      qTableRows,
+      qTableRowCount,
+      actionSpaceRows,
+      actionSpaceProfile,
+      batchResultAliasMap,
+      resultsSingleFocusedBatch,
+      focusedBatchTopologies: topologiesInBatch,
+      runBatchTopologies: runBatchTopologies ?? []
+    });
+  }, [
+    onExportSnapshotPatch,
+    temperatureProbabilityRows,
+    ucbScoreRows,
+    qTableRows,
+    qTableRowCount,
+    actionSpaceRows,
+    actionSpaceProfile,
+    batchResultAliasMap,
+    resultsSingleFocusedBatch,
+    topologiesInBatch,
+    runBatchTopologies
+  ]);
 
   useEffect(() => {
     try {
@@ -1419,7 +2175,12 @@ export default function MainTopologyPanel({
     const presetNameRaw = typeof run.preset_name === "string" ? run.preset_name.trim() : "";
     const storedPresetLabel = presetLabelMap[presetId] ?? null;
     const presetLabel = presetNameRaw || storedPresetLabel || presetId;
-    return `${presetLabel} || ${delay}`;
+    const statusTag = run.status === "failed" ? " · FAILED" : "";
+    const runtimeTag =
+      run.status === "failed" && Number.isFinite(Number(run.runtime_sec))
+        ? ` (${Math.round(Number(run.runtime_sec))}s)`
+        : "";
+    return `${presetLabel} || ${delay}${formatRunLearningStatsSuffix(run)}${runtimeTag}${statusTag}`;
   }
 
   async function handleModalConfirm() {
@@ -1435,6 +2196,17 @@ export default function MainTopologyPanel({
     const ok = await onRenameBatch(focusedBatch.batch_id, modalBatchName);
     if (ok) {
       setModalOpen(false);
+    }
+  }
+
+  async function handleConfirmDeleteBatchRunResult() {
+    if (!deleteBatchRunTarget?.id) return;
+    setDeletingBatchRun(true);
+    try {
+      await onDeleteBatchRunResult(deleteBatchRunTarget.id);
+    } finally {
+      setDeletingBatchRun(false);
+      setDeleteBatchRunTarget(null);
     }
   }
 
@@ -1457,8 +2229,6 @@ export default function MainTopologyPanel({
       selected_topology_ids: prev.batch_selected ? [] : runMultiTopologies.map((topo) => topo.topology_id)
     }));
   }
-
-  const isRunMultiRepeatMode = runMultiSubMode === "repeat";
 
   function switchRunMultiSubMode(nextMode) {
     if (!setRunMultiSubMode) return;
@@ -1531,10 +2301,15 @@ export default function MainTopologyPanel({
     <section className={`main-panel-shell${compareViewMode ? " main-panel-shell--compare" : ""}`}>
       <header className="main-panel-header">
         <div>
-          <h1>Main Panel 1</h1>
-          <p>{mainTitle}</p>
+          <h1>{panelHeading}</h1>
+          {panelSubtitle ? <p className="muted">{panelSubtitle}</p> : null}
         </div>
         <div className="main-header-actions">
+          {mainExportContext ? (
+            <button type="button" className="secondary-cta small" onClick={onOpenExportModal}>
+              Export CSV
+            </button>
+          ) : null}
           {topologyViewMode && focusedTopologyId ? (
             <button type="button" className="back-to-grid-btn" onClick={() => setFocusedTopologyId(null)}>
               Back to topologies
@@ -1575,16 +2350,30 @@ export default function MainTopologyPanel({
         </div>
       </header>
 
+      <div className={`main-panel-scroll ui-scroll${compareViewMode ? " main-panel-scroll--compare" : ""}`}>
       {homeViewMode ? (
-        <TemperatureToolWorkspace
-          tool={temperatureTool}
-          rows={temperatureProbabilityRows}
-          onReset={resetTemperatureTool}
-          onActionCountChange={updateTemperatureActionCount}
-          onTauRangeChange={updateTemperatureTauRange}
-          onQRangeChange={updateTemperatureQRange}
-          onTauChange={updateTemperatureTau}
-          onQValueChange={updateTemperatureQValue}
+        <HomeExplorationToolsWorkspace
+          homeToolTab={homeToolTab}
+          setHomeToolTab={setHomeToolTab}
+          temperatureTool={temperatureTool}
+          temperatureRows={temperatureProbabilityRows}
+          resetTemperatureTool={resetTemperatureTool}
+          updateTemperatureActionCount={updateTemperatureActionCount}
+          updateTemperatureTauRange={updateTemperatureTauRange}
+          updateTemperatureQRange={updateTemperatureQRange}
+          updateTemperatureTau={updateTemperatureTau}
+          updateTemperatureQValue={updateTemperatureQValue}
+          ucbTool={ucbTool}
+          ucbRows={ucbScoreRows}
+          resetUcbTool={resetUcbTool}
+          updateUcbActionCount={updateUcbActionCount}
+          updateUcbGlobalTRange={updateUcbGlobalTRange}
+          updateUcbGlobalT={updateUcbGlobalT}
+          updateUcbCRange={updateUcbCRange}
+          updateUcbC={updateUcbC}
+          updateUcbQRange={updateUcbQRange}
+          updateUcbQValue={updateUcbQValue}
+          updateUcbVisitCount={updateUcbVisitCount}
         />
       ) : generateViewMode ? (
         <div className="generate-workspace">
@@ -2135,6 +2924,7 @@ export default function MainTopologyPanel({
                   artifactFilter={batchArtifactFilter}
                   onArtifactFilterChange={setBatchArtifactFilter}
                   bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+                  boxplotFitWidth
                 />
               </div>
             </section>
@@ -2190,22 +2980,36 @@ export default function MainTopologyPanel({
                     type="button"
                     className="run-dropdown-trigger"
                     onClick={() => setRunPickerOpen((open) => !open)}
-                    disabled={completedRuns.length === 0}
+                    disabled={historySelectableRuns.length === 0}
                   >
-                    <span>{selectedRun ? formatRunOptionLabel(selectedRun) : "No completed run"}</span>
+                    <span>
+                      {selectedRun
+                        ? formatRunOptionLabel(selectedRun)
+                        : historySelectableRuns.length === 0
+                          ? "No completed run"
+                          : "No successful run"}
+                    </span>
                     <span>{runPickerOpen ? "▴" : "▾"}</span>
                   </button>
                   {runPickerOpen ? (
                     <div className="run-dropdown-menu">
-                      {completedRuns.length === 0 ? (
+                      {historySelectableRuns.length === 0 ? (
                         <p className="muted">No completed run.</p>
                       ) : (
-                        completedRuns.map((run) => (
+                        historySelectableRuns.map((run) => (
                           <div key={run.run_id} className={`run-dropdown-item ${selectedRun?.run_id === run.run_id ? "active" : ""}`}>
                             <button
                               type="button"
                               className="run-dropdown-select-btn"
                               onClick={() => {
+                                if (run.status === "failed") {
+                                  window.alert(
+                                    run.error_message
+                                      ? `Run failed: ${run.error_message}`
+                                      : "Run failed — no training artifacts to display."
+                                  );
+                                  return;
+                                }
                                 if (run.mode === "batch") {
                                   const ok = window.confirm(
                                     "Kết quả run từ chạy multi-run, có thể thiếu thông tin. Xác nhận xem ?"
@@ -2236,6 +3040,26 @@ export default function MainTopologyPanel({
                   ) : null}
                 </div>
               </div>
+              {latestHistoryRun?.status === "failed" ? (
+                <p className="action-space-stale-hint run-failed-hint">
+                  Run gần nhất <strong>thất bại</strong>
+                  {Number.isFinite(Number(latestHistoryRun.runtime_sec))
+                    ? ` sau ~${Math.round(Number(latestHistoryRun.runtime_sec) / 60)} phút`
+                    : ""}
+                  .
+                  {latestHistoryRun.error_message ? (
+                    <>
+                      {" "}
+                      Lý do: <code>{latestHistoryRun.error_message}</code>
+                    </>
+                  ) : null}{" "}
+                  Topo 500 node thường cần &gt;15 phút — hãy <strong>restart worker</strong> (timeout hiện tại 30 phút) rồi chạy lại.
+                  Không có Q-table / delay chart vì run chưa hoàn thành.
+                </p>
+              ) : null}
+              {completedRuns.length === 0 && historySelectableRuns.length > 0 ? (
+                <p className="muted">Chưa có run thành công (done). Chỉ có run failed trong lịch sử.</p>
+              ) : null}
               <div className="hero-canvas-wrap full">
                 <TopologyGraph
                   graph={focusedGraph}
@@ -2341,72 +3165,6 @@ export default function MainTopologyPanel({
                       </div>
                     )}
                   </div>
-                  {(runSummaryPayload?.action_space_by_timeslot_rcv?.timeslots?.length ||
-                    runSummaryPayload?.action_space_by_timeslot_br?.timeslots?.length) ? (
-                    <div className="qtable-panel action-space-below-qtable">
-                      <div className="qtable-header">
-                        <h4>Mean candidate count by timeslot</h4>
-                        <div className="qtable-actions">
-                          <button
-                            type="button"
-                            className="qtable-sort-btn"
-                            title="Download CSV"
-                            onClick={() => {
-                              const ts = runSummaryPayload.action_space_by_timeslot_rcv?.timeslots ?? [];
-                              const lines = [
-                                "timeslot,mean_candidate_count,n_unique_paths",
-                                ...ts.map(
-                                  (r) =>
-                                    `${String(r.timeslot)},${String(r.mean_candidate_count)},${String(r.n_unique_paths ?? "")}`
-                                )
-                              ].join("\n");
-                              const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
-                              const url = URL.createObjectURL(blob);
-                              const link = document.createElement("a");
-                              link.href = url;
-                              link.download = "action_space_by_timeslot_rcv.csv";
-                              link.click();
-                              URL.revokeObjectURL(url);
-                            }}
-                          >
-                            CSV
-                          </button>
-                        </div>
-                      </div>
-                      <div className="mean-cands-grid">
-                        <div>
-                          <h4 className="chart-subheading">Mean broadcast candidate</h4>
-                          <ActionSpaceMeanBarChart
-                            summary={runSummaryPayload.action_space_by_timeslot_br ?? runSummaryPayload.action_space_by_timeslot}
-                            yMax={(() => {
-                              const rcvTs = runSummaryPayload.action_space_by_timeslot_rcv?.timeslots ?? [];
-                              const brTs = runSummaryPayload.action_space_by_timeslot_br?.timeslots ?? [];
-                              const vals = [
-                                ...rcvTs.map((r) => Number(r.mean_candidate_count)).filter((n) => Number.isFinite(n)),
-                                ...brTs.map((r) => Number(r.mean_candidate_count)).filter((n) => Number.isFinite(n))
-                              ];
-                              return vals.length ? Math.max(...vals) : 0;
-                            })()}
-                          />
-                        </div>
-                        <div>
-                          <h4 className="chart-subheading">Mean receive candidate</h4>
-                          <ActionSpaceMeanBarChart
-                            summary={runSummaryPayload.action_space_by_timeslot_rcv ?? runSummaryPayload.action_space_by_timeslot}
-                            yMax={(() => {
-                              const rcvTs = runSummaryPayload.action_space_by_timeslot_rcv?.timeslots ?? [];
-                              const brTs = runSummaryPayload.action_space_by_timeslot_br?.timeslots ?? [];
-                              const vals = [
-                                ...rcvTs.map((r) => Number(r.mean_candidate_count)).filter((n) => Number.isFinite(n)),
-                                ...brTs.map((r) => Number(r.mean_candidate_count)).filter((n) => Number.isFinite(n))
-                              ];
-                              return vals.length ? Math.max(...vals) : 0;
-                            })()}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ) : null}
                   {runSummaryPayload?.q_profile_by_epoch?.charts?.length ? (
                     <div className="qtable-panel action-space-below-qtable">
                       <div className="qtable-header">
@@ -2434,12 +3192,96 @@ export default function MainTopologyPanel({
                   ) : null}
                 </>
               ) : null}
+              {showActionSpacePanel ? (
+                <div className="qtable-panel action-space-below-qtable" id="action-space-mean-panel">
+                  <div className="qtable-header">
+                    <h4>Mean candidate &amp; group count by timeslot</h4>
+                    <div className="qtable-actions">
+                      <button
+                        type="button"
+                        className="qtable-sort-btn"
+                        title="Download compare CSV (receive)"
+                        onClick={() => {
+                          const lines = [
+                            "timeslot,mean_candidate_count,mean_group_count,n_unique_paths",
+                            ...actionSpaceRcvCompareRows.map(
+                              (r) =>
+                                `${String(r.timeslot)},${String(r.mean_candidate_count ?? "")},${String(r.mean_group_count ?? "")},${String(r.n_unique_paths ?? "")}`
+                            )
+                          ].join("\n");
+                          const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
+                          const url = URL.createObjectURL(blob);
+                          const link = document.createElement("a");
+                          link.href = url;
+                          link.download = "action_space_rcv_candidate_vs_group.csv";
+                          link.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                      >
+                        CSV
+                      </button>
+                    </div>
+                  </div>
+                  {!actionSpaceGroupNative ? (
+                    <p className="action-space-stale-hint muted">
+                      Run này chưa có field <code>action_space_by_timeslot_group_*</code> trong{" "}
+                      <code>run_summary.json</code> (thường do chạy trước khi cập nhật backend). Đang hiển thị tạm
+                      theo mean candidate; hãy <strong>chạy lại topology</strong> để có số mean group chính xác (đặc biệt
+                      khi bật action aggregation).
+                    </p>
+                  ) : null}
+                  <div className="mean-cands-grid">
+                    <div className="mean-cands-column">
+                      <h4 className="chart-subheading">Mean broadcast candidate</h4>
+                      <ActionSpaceMeanBarChart
+                        summary={actionSpaceBrCandidate.summary}
+                        yMax={sharedMeanCandidateYMax(
+                          actionSpaceRcvCandidate.summary,
+                          actionSpaceBrCandidate.summary
+                        )}
+                      />
+                      <h4 className="chart-subheading chart-subheading--nested">Mean broadcast group</h4>
+                      <ActionSpaceMeanBarChart
+                        summary={actionSpaceBrGroup.summary}
+                        entityLabel="group"
+                        barColor="#7b6cb5"
+                        yMax={sharedMeanGroupYMax(actionSpaceRcvGroup.summary, actionSpaceBrGroup.summary)}
+                      />
+                      <h4 className="chart-subheading chart-subheading--nested">Broadcast: candidate vs group (table)</h4>
+                      <ActionSpaceCompareTable rows={actionSpaceBrCompareRows} />
+                    </div>
+                    <div className="mean-cands-column">
+                      <h4 className="chart-subheading">Mean receive candidate</h4>
+                      <ActionSpaceMeanBarChart
+                        summary={actionSpaceRcvCandidate.summary}
+                        yMax={sharedMeanCandidateYMax(
+                          actionSpaceRcvCandidate.summary,
+                          actionSpaceBrCandidate.summary
+                        )}
+                      />
+                      <h4 className="chart-subheading chart-subheading--nested">Mean receive group</h4>
+                      <ActionSpaceMeanBarChart
+                        summary={actionSpaceRcvGroup.summary}
+                        entityLabel="group"
+                        barColor="#7b6cb5"
+                        yMax={sharedMeanGroupYMax(actionSpaceRcvGroup.summary, actionSpaceBrGroup.summary)}
+                      />
+                      <h4 className="chart-subheading chart-subheading--nested">Receive: candidate vs group (table)</h4>
+                      <ActionSpaceCompareTable rows={actionSpaceRcvCompareRows} />
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               </section>
             ) : focusedBatchId ? (
               <TopologyGridSection
                 title={resultsSingleFocusedBatch?.batch_name ?? "Batch"}
                 topologies={resultsSingleTopologies}
-                emptyMessage="No topology available in this batch."
+                emptyMessage={
+                  resultsSingleFocusedBatch
+                    ? `Batch "${resultsSingleFocusedBatch.batch_name}" không có topology nào đã chạy Run single (mode single). Nếu bạn chỉ chạy multi/batch, mở Block 2 — Multi topology batches bên dưới.`
+                    : "Batch này không có topology đã run single. Thử batch khác hoặc Block 2."
+                }
                 renderTopologyCard={(topo) => (
                   <TopologyCard
                     key={topo.topology_id}
@@ -2460,6 +3302,23 @@ export default function MainTopologyPanel({
                   <BatchCard
                     key={batch.batch_id ?? index}
                     batch={batch}
+                    actions={
+                      <button
+                        type="button"
+                        className="batch-icon-btn"
+                        title="Rename batch"
+                        onClick={async () => {
+                          const current = batch.batch_name ?? "";
+                          const next = window.prompt("Batch display name:", current);
+                          if (next === null) return;
+                          const trimmed = next.trim();
+                          if (!trimmed) return;
+                          await onRenameBatch(batch.batch_id, trimmed);
+                        }}
+                      >
+                        ✎
+                      </button>
+                    }
                     onOpen={(batchId) => {
                       setFocusedBatchId(batchId);
                       setFocusedTopologyId(null);
@@ -2494,10 +3353,8 @@ export default function MainTopologyPanel({
               <BatchGridSection
                 batches={(batchRunResults ?? []).map((item) => ({
                   batch_id: item.batch_run_id,
-                  batch_name:
-                    typeof batchResultAliasMap[item.batch_run_id] === "string" && batchResultAliasMap[item.batch_run_id].trim()
-                      ? batchResultAliasMap[item.batch_run_id].trim()
-                      : item.result_label,
+                  batch_name: item.result_label,
+                  custom_result_label: item.custom_result_label ?? null,
                   topologies: Array.from({ length: Number(item.total_topologies) || 0 }),
                   batch_status: item.batch_status ?? "completed"
                 }))}
@@ -2513,20 +3370,13 @@ export default function MainTopologyPanel({
                           type="button"
                           className="batch-icon-btn"
                           title="Edit result name"
-                          onClick={() => {
-                            const current = typeof batchResultAliasMap[batch.batch_id] === "string" ? batchResultAliasMap[batch.batch_id] : "";
+                          onClick={async () => {
+                            const current =
+                              typeof batch.custom_result_label === "string" ? batch.custom_result_label : "";
                             const next = window.prompt("Result display name (leave empty to reset):", current);
                             if (next === null) return;
                             const trimmed = next.trim();
-                            setBatchResultAliasMap((prev) => {
-                              const updated = { ...prev };
-                              if (!trimmed) {
-                                delete updated[batch.batch_id];
-                              } else {
-                                updated[batch.batch_id] = trimmed;
-                              }
-                              return updated;
-                            });
+                            await onRenameBatchRunResult(batch.batch_id, trimmed || null);
                           }}
                         >
                           ✎
@@ -2536,7 +3386,11 @@ export default function MainTopologyPanel({
                           className="batch-icon-btn danger"
                           title="Delete this batch result"
                           onClick={() => {
-                            onDeleteBatchRunResult(batch.batch_id);
+                            setDeleteBatchRunTarget({
+                              id: batch.batch_id,
+                              name: batch.batch_name,
+                              topologyCount: batch.topologies?.length ?? 0
+                            });
                           }}
                         >
                           🗑
@@ -2565,6 +3419,7 @@ export default function MainTopologyPanel({
           singleRunTopologyIds={singleRunTopologyIds}
           topologyNameById={topologyNameById}
           bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+          onCompareExportChange={onCompareExportChange}
         />
       ) : !topologyViewMode ? (
         <div className="hero-placeholder">
@@ -2617,7 +3472,7 @@ export default function MainTopologyPanel({
               }
             >
               {isTopologyPlayground ? (
-                <div className="playground-shell">
+                <div className="playground-shell" ref={playgroundShellRef}>
                   <TopologyGraph
                     graph={focusedGraph}
                     className="full-graph"
@@ -2633,9 +3488,9 @@ export default function MainTopologyPanel({
                     nodeStrokeWidthById={playgroundVisual.strokeWidthById}
                     clickableNodeIds={playgroundCandidateIds}
                     hoveredNodeId={playgroundPreview?.nodeId ?? null}
-                    onNodeHover={setPlaygroundHoverNode}
-                    onNodeLeave={clearPlaygroundHoverPreview}
-                    onNodeClick={commitPlaygroundNode}
+                    onNodeHover={isRunDerivedTreeMode ? undefined : setPlaygroundHoverNode}
+                    onNodeLeave={isRunDerivedTreeMode ? undefined : clearPlaygroundHoverPreview}
+                    onNodeClick={isRunDerivedTreeMode ? undefined : commitPlaygroundNode}
                   />
                   <div className="replay-bar-wrap playground-bar-wrap">
                     <input
@@ -2655,6 +3510,127 @@ export default function MainTopologyPanel({
                           : `Mode: ${playgroundState?.mode === "receiver" ? "Receiver" : "Broadcaster"}`}
                       </span>
                     </div>
+                  </div>
+                  <div className="playground-decision-tree-block">
+                    <div className="playground-state-tree-header">
+                      <h5>Decision tree</h5>
+                      <div className="view-mode-toggle">
+                        <button
+                          type="button"
+                          className={playgroundTreeMode === "manual" ? "active" : ""}
+                          onClick={() => setPlaygroundTreeMode?.("manual")}
+                        >
+                          Manual tree
+                        </button>
+                        <button
+                          type="button"
+                          className={playgroundTreeMode === "run" ? "active" : ""}
+                          onClick={() => setPlaygroundTreeMode?.("run")}
+                        >
+                          Tree from run result
+                        </button>
+                      </div>
+                      <div className="playground-state-tree-actions">
+                        <button
+                          type="button"
+                          className="secondary-cta small"
+                          disabled={
+                            decisionTreeExporting ||
+                            (isRunDerivedTreeMode ? runDerivedTreeLoading : playgroundTreeLoading)
+                          }
+                          onClick={handleExportDecisionTreeJpg}
+                          title="Download decision tree as JPG (current layout and styling)."
+                        >
+                          {decisionTreeExporting ? "Exporting…" : "Export JPG"}
+                        </button>
+                        {isRunDerivedTreeMode ? (
+                          <>
+                            <button
+                              type="button"
+                              className="secondary-cta small"
+                              disabled={runDerivedTreeLoading || !playgroundRunSourceId}
+                              onClick={onRefreshRunDerivedTree}
+                              title="Rebuild tree from selected run trace."
+                            >
+                              {runDerivedTreeLoading ? "Building…" : "Rebuild from run"}
+                            </button>
+                            <button
+                              type="button"
+                              className={`secondary-cta small${highlightMergedTransitions ? " active" : ""}`}
+                              onClick={() => setHighlightMergedTransitions((prev) => !prev)}
+                              title="Highlight edges where multiple actions from the same state lead to the same next state."
+                            >
+                              {highlightMergedTransitions ? "Shared transitions: on" : "Shared transitions: off"}
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="secondary-cta small"
+                              disabled={playgroundTreeExpanding || playgroundTreeLoading}
+                              onClick={onExpandPlaygroundTree}
+                              title="Enumerate all broadcaster/receiver actions from each state; skip duplicate states."
+                            >
+                              {playgroundTreeExpanding ? "Expanding…" : "Expand all paths"}
+                            </button>
+                            <button type="button" className="secondary-cta small" onClick={onResetPlaygroundTree}>
+                              Reset tree
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    {isRunDerivedTreeMode ? (
+                      <>
+                        <div className="field-label">
+                          Result for rebuild
+                          <select
+                            value={playgroundRunSourceId ?? ""}
+                            onChange={(e) => setPlaygroundRunSourceId?.(e.target.value || null)}
+                          >
+                            <option value="">Select run</option>
+                            {completedRuns.map((run) => (
+                              <option key={run.run_id} value={run.run_id}>
+                                {formatRunOptionLabel(run)}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <p className="playground-tree-expand-stats muted">
+                          {playgroundRunSourceId
+                            ? `Source run: ${playgroundRunSourceId}`
+                            : "Select a completed run to rebuild decision tree."}
+                          {runDerivedTreeSourceArtifact ? ` · trace: ${runDerivedTreeSourceArtifact}` : ""}
+                        </p>
+                        {runDerivedTreeMessage ? (
+                          <p className="playground-tree-expand-stats muted">{runDerivedTreeMessage}</p>
+                        ) : null}
+                      </>
+                    ) : playgroundTreeExpandStats ? (
+                      <p className="playground-tree-expand-stats muted">
+                        {Number(playgroundTreeExpandStats.unique_paths ?? 0).toLocaleString()} unique paths
+                        {" · "}
+                        {Number(playgroundTreeExpandStats.transitions_applied ?? 0).toLocaleString()} transitions
+                        {playgroundTreeExpandStats.truncated ? " (capped at 10k)" : ""}
+                        {" · "}
+                        {Number(playgroundTreeExpandStats.edges_to_existing_states ?? 0).toLocaleString()} edges to
+                        existing states
+                      </p>
+                    ) : null}
+                    <PlaygroundStateTree
+                      ref={decisionTreeExportRef}
+                      tree={isRunDerivedTreeMode ? runDerivedTree : playgroundTree}
+                      isLoading={isRunDerivedTreeMode ? runDerivedTreeLoading : playgroundTreeLoading}
+                      loadError={isRunDerivedTreeMode ? runDerivedTreeLoadError : playgroundTreeLoadError}
+                      rowSpread={decisionTreeRowSpread}
+                      fontScale={decisionTreeFontScale}
+                      edgeScale={decisionTreeEdgeScale}
+                      nodeScale={decisionTreeNodeScale}
+                      edgeOpacity={decisionTreeEdgeOpacity}
+                      highlightMergedTransitions={isRunDerivedTreeMode && highlightMergedTransitions}
+                      timeslotExportBasename={`timeslot_summary_${(focusedTopo?.topology_name ?? "tree").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, "_")}`}
+                    />
                   </div>
                 </div>
               ) : (
@@ -2730,6 +3706,7 @@ export default function MainTopologyPanel({
           )}
         </>
       )}
+      </div>
       <BatchModal
         open={modalOpen}
         mode={modalMode}
@@ -2746,7 +3723,20 @@ export default function MainTopologyPanel({
         onCancel={() => setGenerateBatchModalOpen(false)}
         onConfirm={handleGenerateBatchModalConfirm}
       />
-      {resultsView ? <QueueOverlay snapshot={queueSnapshot} /> : null}
+      <ConfirmModal
+        open={Boolean(deleteBatchRunTarget)}
+        title="Delete batch result?"
+        message={
+          deleteBatchRunTarget
+            ? `«${deleteBatchRunTarget.name}» and all ${deleteBatchRunTarget.topologyCount} run(s) will be permanently removed. This cannot be undone.`
+            : ""
+        }
+        confirming={deletingBatchRun}
+        onCancel={() => {
+          if (!deletingBatchRun) setDeleteBatchRunTarget(null);
+        }}
+        onConfirm={handleConfirmDeleteBatchRunResult}
+      />
     </section>
   );
 }

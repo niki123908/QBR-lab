@@ -1,4 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import QueueWorkersPanel from "./QueueWorkersPanel";
+import { sortBatchesWithTopologies } from "../utils/topologyNameSort.js";
 
 export default function DashboardSidebar({
   activeMenu,
@@ -7,13 +9,30 @@ export default function DashboardSidebar({
   selectedTopologyId,
   onSelectTopology,
   onSelectBatch,
-  onGoHome
+  onGoHome,
+  queueSnapshot,
+  managedWorkers,
+  onSpawnWorker,
+  onKillWorker,
+  isSpawningWorker,
+  killingWorkerId,
+  onWorkersExpandedChange
 }) {
   const [expandedBatchIds, setExpandedBatchIds] = useState({});
+  const [workersExpanded, setWorkersExpanded] = useState(false);
+  const sortedBatches = useMemo(() => sortBatchesWithTopologies(batches), [batches]);
   const totalTopologies = useMemo(
-    () => batches.reduce((acc, batch) => acc + batch.topologies.length, 0),
-    [batches]
+    () => sortedBatches.reduce((acc, batch) => acc + batch.topologies.length, 0),
+    [sortedBatches]
   );
+  const workerCount = Math.max(
+    Array.isArray(managedWorkers) ? managedWorkers.filter((worker) => worker?.alive).length : 0,
+    Number(queueSnapshot?.lane_count) || 0
+  );
+
+  useEffect(() => {
+    onWorkersExpandedChange?.(workersExpanded);
+  }, [workersExpanded, onWorkersExpandedChange]);
 
   function toggleBatch(batchId) {
     setExpandedBatchIds((prev) => ({
@@ -62,17 +81,17 @@ export default function DashboardSidebar({
         </button>
         <button
           type="button"
-          className={`nav-item ${activeMenu === "results" ? "active" : ""}`}
-          onClick={() => setActiveMenu("results")}
-        >
-          Results
-        </button>
-        <button
-          type="button"
           className={`nav-item ${activeMenu === "run_multi" ? "active" : ""}`}
           onClick={() => setActiveMenu("run_multi")}
         >
           Run multi-topos
+        </button>
+        <button
+          type="button"
+          className={`nav-item ${activeMenu === "results" ? "active" : ""}`}
+          onClick={() => setActiveMenu("results")}
+        >
+          Results
         </button>
         <button
           type="button"
@@ -89,7 +108,7 @@ export default function DashboardSidebar({
           <span className="chip">{totalTopologies}</span>
         </div>
         <ul>
-          {batches.map((batch) => {
+          {sortedBatches.map((batch) => {
             const isExpanded = Boolean(expandedBatchIds[batch.batch_id]);
             return (
               <li key={batch.batch_id} className="batch-item">
@@ -123,8 +142,36 @@ export default function DashboardSidebar({
               </li>
             );
           })}
-          {batches.length === 0 && <li className="empty-text">No data</li>}
+          {sortedBatches.length === 0 && <li className="empty-text">No data</li>}
         </ul>
+      </section>
+
+      <section className="sidebar-card utility-card sidebar-workers-card">
+        <button
+          type="button"
+          className={`batch-toggle workers-dropdown-toggle${workersExpanded ? " active" : ""}`}
+          onClick={() => setWorkersExpanded((value) => !value)}
+          aria-expanded={workersExpanded}
+        >
+          <span>{workersExpanded ? "▾" : "▸"}</span>
+          <span>Workers</span>
+          <span className="workers-dropdown-meta">
+            {(Number(queueSnapshot?.total_running) || 0) > 0 ? (
+              <span className="chip workers-running-chip">{queueSnapshot.total_running} running</span>
+            ) : null}
+            <span className="batch-count">{workerCount}</span>
+          </span>
+        </button>
+        {workersExpanded ? (
+          <QueueWorkersPanel
+            snapshot={queueSnapshot}
+            managedWorkers={managedWorkers}
+            onSpawnWorker={onSpawnWorker}
+            onKillWorker={onKillWorker}
+            isSpawningWorker={isSpawningWorker}
+            killingWorkerId={killingWorkerId}
+          />
+        ) : null}
       </section>
     </aside>
   );

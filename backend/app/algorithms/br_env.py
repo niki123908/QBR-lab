@@ -147,7 +147,13 @@ class Br_Env:
         print("Broadcaster candidate empty!!")
         return None
 
-    def proceed_action(self, first_pick, completion_bonus_multiplier=1.0, action_axis="broadcaster"):
+    def proceed_action(
+        self,
+        first_pick,
+        completion_bonus_multiplier=1.0,
+        coverage_reward_enabled=True,
+        action_axis="broadcaster",
+    ):
         if str(action_axis) == "receiver":
             br_set, rcv_set = self._greedy_spread_receiver(first_pick)
         else:
@@ -160,7 +166,8 @@ class Br_Env:
                 float(completion_bonus_multiplier) * total_nodes_in_topo * math.exp(self.lowerbound - self.cur_time)
             )
 
-        reward = len(rcv_set) + completion_bonus
+        covered_reward = len(rcv_set) if bool(coverage_reward_enabled) else 0.0
+        reward = float(covered_reward) + completion_bonus
         self.V_ns = list(set(self.V_ns) - set(rcv_set))
         done = len(self.V_ns) == 0
         next_state = self.V_s + rcv_set

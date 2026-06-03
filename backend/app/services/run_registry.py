@@ -31,10 +31,13 @@ _QBR_DEFAULT_CONFIG: dict[str, Any] = {
     "temperature_end": 0.1,
     "temperature_decay": 0.001,
     "temperature_decay_mode": "linear",
+    "ucb_c": 1.414,
     "action_axis": "broadcaster",
     "completion_bonus_multiplier": 1.0,
+    "coverage_reward_enabled": True,
     "lambda_param": 0.0,
     "trace_threshold": 0.01,
+    "action_aggregation_mode": "off",
 }
 
 _QBR_CONFIG_SCHEMA: dict[str, Any] = {
@@ -43,7 +46,7 @@ _QBR_CONFIG_SCHEMA: dict[str, Any] = {
         "episodes": {"type": "integer", "minimum": 1, "default": 1000},
         "alpha": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.2},
         "gamma": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.8},
-        "policy_type": {"type": "string", "enum": ["epsilon_greedy", "softmax"], "default": "epsilon_greedy"},
+        "policy_type": {"type": "string", "enum": ["epsilon_greedy", "softmax", "ucb"], "default": "epsilon_greedy"},
         "action_axis": {"type": "string", "enum": ["broadcaster", "receiver"], "default": "broadcaster"},
         "epsilon_start": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0},
         "epsilon_end": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.01},
@@ -58,9 +61,16 @@ _QBR_CONFIG_SCHEMA: dict[str, Any] = {
         "temperature_end": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.1},
         "temperature_decay": {"type": "number", "minimum": 0.0, "default": 0.001},
         "temperature_decay_mode": {"type": "string", "enum": ["linear", "multiplicative"], "default": "linear"},
+        "ucb_c": {"type": "number", "exclusiveMinimum": 0.0, "default": 1.414},
         "completion_bonus_multiplier": {"type": "number", "minimum": 0.0, "default": 1.0},
+        "coverage_reward_enabled": {"type": "boolean", "default": True},
         "lambda_param": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
         "trace_threshold": {"type": "number", "minimum": 0.0, "default": 0.01},
+        "action_aggregation_mode": {
+            "type": "string",
+            "enum": ["off", "exact_next_state", "incremental_merge"],
+            "default": "off",
+        },
     },
     "required": [],
 }
@@ -143,8 +153,11 @@ def _resolve_qbr_config(
         temperature_decay_mode = str(merged["temperature_decay_mode"])
         action_axis = str(merged["action_axis"])
         completion_bonus_multiplier = float(merged["completion_bonus_multiplier"])
+        raw_coverage_reward_enabled = merged["coverage_reward_enabled"]
         lambda_param = float(merged["lambda_param"])
         trace_threshold = float(merged["trace_threshold"])
+        ucb_c = float(merged["ucb_c"])
+        action_aggregation_mode = str(merged["action_aggregation_mode"])
     except (TypeError, ValueError):
         raise ValueError("Failed.") from None
 
@@ -156,7 +169,7 @@ def _resolve_qbr_config(
         raise ValueError("Failed.")
     if not (0.0 <= gamma <= 1.0):
         raise ValueError("Failed.")
-    if policy_type not in {"epsilon_greedy", "softmax"}:
+    if policy_type not in {"epsilon_greedy", "softmax", "ucb"}:
         raise ValueError("Failed.")
     if temperature_start_mode not in {"manual", "node_count_multiplier"}:
         raise ValueError("Failed.")
@@ -164,8 +177,22 @@ def _resolve_qbr_config(
         raise ValueError("Failed.")
     if action_axis not in {"broadcaster", "receiver"}:
         raise ValueError("Failed.")
+    if action_aggregation_mode not in {"off", "exact_next_state", "incremental_merge"}:
+        raise ValueError("Failed.")
     if completion_bonus_multiplier < 0.0:
         raise ValueError("Failed.")
+    if isinstance(raw_coverage_reward_enabled, bool):
+        coverage_reward_enabled = raw_coverage_reward_enabled
+    elif isinstance(raw_coverage_reward_enabled, str):
+        lowered = raw_coverage_reward_enabled.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            coverage_reward_enabled = True
+        elif lowered in {"0", "false", "no", "off"}:
+            coverage_reward_enabled = False
+        else:
+            raise ValueError("Failed.")
+    else:
+        coverage_reward_enabled = bool(raw_coverage_reward_enabled)
     if not (0.0 <= lambda_param <= 1.0):
         raise ValueError("Failed.")
     if trace_threshold < 0.0:
@@ -180,7 +207,7 @@ def _resolve_qbr_config(
             raise ValueError("Failed.")
         if epsilon_decay < 0.0:
             raise ValueError("Failed.")
-    else:
+    elif policy_type == "softmax":
         if temperature_start_mode == "node_count_multiplier":
             if temperature_start_multiplier <= 0.0:
                 raise ValueError("Failed.")
@@ -206,6 +233,9 @@ def _resolve_qbr_config(
                 raise ValueError("Failed.")
             if temperature_decay > 1.0:
                 raise ValueError("Failed.")
+    else:
+        if ucb_c <= 0.0:
+            raise ValueError("Failed.")
 
     run_seed = _resolve_run_seed_value(merged)
 
@@ -223,10 +253,13 @@ def _resolve_qbr_config(
         "temperature_end": temperature_end,
         "temperature_decay": temperature_decay,
         "temperature_decay_mode": temperature_decay_mode,
+        "ucb_c": ucb_c,
         "action_axis": action_axis,
         "completion_bonus_multiplier": completion_bonus_multiplier,
+        "coverage_reward_enabled": coverage_reward_enabled,
         "lambda_param": lambda_param,
         "trace_threshold": trace_threshold,
+        "action_aggregation_mode": action_aggregation_mode,
         "run_seed": run_seed,
     }
 

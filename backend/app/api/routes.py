@@ -7,11 +7,13 @@ from app.schemas import (
     BatchRunRequest,
     BatchRunResponse,
     BatchRunListItem,
+    BatchRunResultLabelUpdate,
     BatchRunProgressResponse,
     BatchRunProgressRow,
     QueueRunItem,
     QueueSnapshotResponse,
     WorkerQueueLane,
+    ManagedWorkerOut,
     BatchRunResultResponse,
     BatchRunDensityGroup,
     BatchRunTopologyPoint,
@@ -37,6 +39,13 @@ from app.schemas import (
     RunPresetOut,
     RunPresetUpdate,
     TopologySummary,
+    PlaygroundTreeExpandResponse,
+    PlaygroundTreeExpandStats,
+    PlaygroundRunTreeResponse,
+    PlaygroundTreeResponse,
+    PlaygroundTreeEventRequest,
+    PlaygroundTreeNode,
+    PlaygroundTreeEdge,
 )
 from app.core.errors import AppError
 from app.core.responses import MessageResponse
@@ -47,6 +56,7 @@ from app.repositories.run_repo import get_batch_run_result as get_batch_run_resu
 from app.repositories.run_repo import get_run_detail as get_run_detail_repo
 from app.repositories.run_repo import get_batch_run_progress as get_batch_run_progress_repo
 from app.repositories.run_repo import list_batch_runs as list_batch_runs_repo
+from app.repositories.run_repo import update_batch_run_result_label as update_batch_run_result_label_repo
 from app.repositories.run_repo import get_queue_snapshot as get_queue_snapshot_repo
 from app.repositories.run_repo import request_batch_stop as request_batch_stop_repo
 from app.repositories.run_repo import list_run_history
@@ -60,6 +70,13 @@ from app.repositories.topology_memory_repo import set_batch_locked as set_batch_
 from app.repositories.topology_memory_repo import get_topology as get_topology_repo
 from app.repositories.topology_memory_repo import get_topology_nodes as get_topology_nodes_repo
 from app.repositories.topology_memory_repo import list_topologies as list_topologies_repo
+from app.services.playground_tree_service import (
+    append_playground_tree_event,
+    derive_playground_tree_from_run,
+    expand_playground_tree,
+    get_playground_tree,
+    reset_playground_tree,
+)
 from app.services.topology_service import (
     commit_topology_updates,
     generate_connected_topology,
@@ -69,6 +86,7 @@ from app.services.topology_service import (
 from app.services.run_engine_service import resume_batch_job as resume_batch_job_service
 from app.services.run_engine_service import run_batch_topologies as run_batch_topologies_service
 from app.services.run_engine_service import run_single_topology as run_single_topology_service
+from app.services.worker_manager_service import kill_managed_worker, list_managed_workers, spawn_managed_worker
 from app.services.run_registry import list_algorithms, resolve_and_validate_run_config
 from app.repositories.preset_repo import PresetRecord
 from app.repositories.preset_repo import create_preset as create_preset_repo
@@ -280,6 +298,76 @@ def get_topology_detail(topology_id: str) -> TopologyDetailResponse:
     )
 
 
+def _playground_tree_response(topology_id: str, payload: dict) -> PlaygroundTreeResponse:
+    return PlaygroundTreeResponse(
+        topology_id=topology_id,
+        root_state_hash=str(payload.get("root_state_hash") or "0"),
+        next_state_index=int(payload.get("next_state_index") or 1),
+        nodes=[PlaygroundTreeNode(**node) for node in payload.get("nodes") or []],
+        edges=[PlaygroundTreeEdge(**edge) for edge in payload.get("edges") or []],
+    )
+
+
+@router.get("/topologies/{topology_id}/playground-tree", response_model=PlaygroundTreeResponse)
+def read_playground_tree(topology_id: str) -> PlaygroundTreeResponse:
+    payload = get_playground_tree(topology_id)
+    if payload is None:
+        raise AppError(message="Failed.", status_code=404)
+    return _playground_tree_response(topology_id, payload)
+
+
+@router.post("/topologies/{topology_id}/playground-tree/event", response_model=PlaygroundTreeResponse)
+def post_playground_tree_event(topology_id: str, body: PlaygroundTreeEventRequest) -> PlaygroundTreeResponse:
+    try:
+        payload = append_playground_tree_event(
+            topology_id,
+            from_state_hash=body.from_state_hash,
+            to_state_hash=body.to_state_hash,
+            action=body.action,
+            mode=body.mode,
+            to_covered_node_ids=body.to_covered_node_ids,
+        )
+    except ValueError:
+        raise AppError(message="Failed.", status_code=400) from None
+    if payload is None:
+        raise AppError(message="Failed.", status_code=404)
+    return _playground_tree_response(topology_id, payload)
+
+
+@router.delete("/topologies/{topology_id}/playground-tree", response_model=PlaygroundTreeResponse)
+def delete_playground_tree(topology_id: str) -> PlaygroundTreeResponse:
+    payload = reset_playground_tree(topology_id)
+    if payload is None:
+        raise AppError(message="Failed.", status_code=404)
+    return _playground_tree_response(topology_id, payload)
+
+
+@router.post("/topologies/{topology_id}/playground-tree/expand", response_model=PlaygroundTreeExpandResponse)
+def post_playground_tree_expand(topology_id: str) -> PlaygroundTreeExpandResponse:
+    payload, stats = expand_playground_tree(topology_id)
+    if payload is None or stats is None:
+        raise AppError(message="Failed.", status_code=404)
+    base = _playground_tree_response(topology_id, payload)
+    return PlaygroundTreeExpandResponse(
+        **base.model_dump(),
+        expand_stats=PlaygroundTreeExpandStats(**stats),
+    )
+
+
+@router.get("/topologies/{topology_id}/playground-tree/run-derived", response_model=PlaygroundRunTreeResponse)
+def read_playground_tree_from_run(topology_id: str, run_id: str) -> PlaygroundRunTreeResponse:
+    payload, source_artifact, message = derive_playground_tree_from_run(topology_id=topology_id, run_id=run_id)
+    if payload is None:
+        raise AppError(message="Failed.", status_code=404)
+    base = _playground_tree_response(topology_id, payload)
+    return PlaygroundRunTreeResponse(
+        **base.model_dump(),
+        run_id=run_id,
+        source_artifact=source_artifact,
+        message=message,
+    )
+
+
 @router.post("/topologies/{topology_id}/save", response_model=MessageResponse)
 def save_topology(topology_id: str) -> MessageResponse:
     ok, error = commit_topology_updates(topology_id=topology_id)
@@ -359,6 +447,11 @@ def get_run_history(topology_id: str) -> list[RunHistoryItem]:
             best_delay_explored=row.best_delay_explored,
             batch_run_id=row.batch_run_id,
             batch_result_label=row.batch_result_label,
+            runtime_sec=row.runtime_sec,
+            error_message=row.error_message,
+            total_states=row.total_states,
+            total_state_actions=row.total_state_actions,
+            decision_graph_edges=row.decision_graph_edges,
         )
         for row in rows
     ]
@@ -417,6 +510,30 @@ def get_run_queue() -> QueueSnapshotResponse:
     )
 
 
+@router.get("/workers", response_model=list[ManagedWorkerOut])
+def list_workers() -> list[ManagedWorkerOut]:
+    return [ManagedWorkerOut(**row) for row in list_managed_workers()]
+
+
+@router.post("/workers", response_model=ManagedWorkerOut)
+def create_worker() -> ManagedWorkerOut:
+    try:
+        row = spawn_managed_worker()
+    except ValueError:
+        raise AppError(message="Failed.", status_code=400) from None
+    return ManagedWorkerOut(**row)
+
+
+@router.delete("/workers/{worker_id}", response_model=MessageResponse)
+def delete_worker(worker_id: str) -> MessageResponse:
+    if not worker_id.strip():
+        raise AppError(message="Failed.", status_code=400)
+    ok = kill_managed_worker(worker_id.strip())
+    if not ok:
+        raise AppError(message="Failed.", status_code=404)
+    return MessageResponse(message="Success.")
+
+
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 def get_run_detail(run_id: str) -> RunDetailResponse:
     row = get_run_detail_repo(run_id=run_id)
@@ -440,6 +557,9 @@ def get_run_detail(run_id: str) -> RunDetailResponse:
         lower_bound=row.lower_bound,
         best_delay_explored=row.best_delay_explored,
         reward_final=row.reward_final,
+        total_states=row.total_states,
+        total_state_actions=row.total_state_actions,
+        decision_graph_edges=row.decision_graph_edges,
         artifacts=[
             ArtifactRef(
                 artifact_type=item.artifact_type,
@@ -483,6 +603,7 @@ def run_batch(payload: BatchRunRequest) -> BatchRunResponse:
             selected_artifact_topology_ids=payload.selected_artifact_topology_ids,
             selected_artifact_types=payload.selected_artifact_types,
             draft_preset_id=payload.draft_preset_id,
+            result_label=payload.result_label,
         )
     except ValueError:
         raise AppError(message="Failed.", status_code=400) from None
@@ -502,6 +623,7 @@ def list_batch_results() -> list[BatchRunListItem]:
             preset_id=item.preset_id,
             preset_name=item.preset_name,
             result_label=item.result_label,
+            custom_result_label=item.custom_result_label,
             total_topologies=item.total_topologies,
             successful=item.successful,
             failed=item.failed,
@@ -510,6 +632,30 @@ def list_batch_results() -> list[BatchRunListItem]:
         )
         for item in rows
     ]
+
+
+@router.patch("/runs/batch/{batch_run_id}/result-label", response_model=BatchRunListItem)
+def patch_batch_run_result_label(batch_run_id: str, body: BatchRunResultLabelUpdate) -> BatchRunListItem:
+    if not update_batch_run_result_label_repo(batch_run_id, body.result_label):
+        raise AppError(message="Failed.", status_code=404)
+    rows = list_batch_runs_repo()
+    row = next((item for item in rows if item.batch_run_id == batch_run_id), None)
+    if row is None:
+        raise AppError(message="Failed.", status_code=404)
+    return BatchRunListItem(
+        batch_run_id=row.batch_run_id,
+        batch_name=row.batch_name,
+        algorithm_id=row.algorithm_id,
+        preset_id=row.preset_id,
+        preset_name=row.preset_name,
+        result_label=row.result_label,
+        custom_result_label=row.custom_result_label,
+        total_topologies=row.total_topologies,
+        successful=row.successful,
+        failed=row.failed,
+        created_at=row.created_at.isoformat(),
+        batch_status=row.batch_status,
+    )
 
 
 @router.get("/runs/batch/{batch_run_id}/progress", response_model=BatchRunProgressResponse)
@@ -565,6 +711,7 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
         algorithm_id=row.algorithm_id,
         preset_id=row.preset_id,
         preset_name=row.preset_name,
+        run_config=run_config,
         resolved_run_config={
             "batch_run_id": row.batch_run_id,
             "algorithm_id": row.algorithm_id,
@@ -576,6 +723,7 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
         if resolved_run_config is not None
         else None,
         result_label=row.result_label,
+        custom_result_label=row.custom_result_label,
         total_topologies=row.total_topologies,
         successful=row.successful,
         failed=row.failed,
@@ -595,6 +743,9 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
                         unique_path_count=topo.unique_path_count,
                         best_delay_unique_path_count=topo.best_delay_unique_path_count,
                         delay_per_episode=topo.delay_per_episode,
+                        paths_count_by_delay=topo.paths_count_by_delay,
+                        total_states=topo.total_states,
+                        total_state_actions=topo.total_state_actions,
                     )
                     for topo in item.topologies
                 ],
@@ -614,6 +765,9 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
                 unique_path_count=topo.unique_path_count,
                 best_delay_unique_path_count=topo.best_delay_unique_path_count,
                 delay_per_episode=topo.delay_per_episode,
+                paths_count_by_delay=topo.paths_count_by_delay,
+                total_states=topo.total_states,
+                total_state_actions=topo.total_state_actions,
             )
             for topo in row.topologies
         ],
