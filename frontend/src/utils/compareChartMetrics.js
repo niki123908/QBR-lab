@@ -10,7 +10,8 @@ const TOPOLOGY_EXCLUDED_KEYS = new Set([
 const DENSITY_EXCLUDED_KEYS = new Set(["topologies", "node_count", "density_key"]);
 
 const METRIC_DISPLAY_LABELS = {
-  total_state_actions: "total actions"
+  total_state_actions: "total actions",
+  lower_bound: "lower bound"
 };
 
 function titleize(raw) {
@@ -44,6 +45,7 @@ function pushMetric(catalogMap, metric) {
   catalogMap.set(metric.key, metric);
 }
 
+import { findQbrSideForLowerBound } from "./compareChartLowerBound.js";
 import { normalizeCompareChartInput } from "./compareChartSides.js";
 
 export function buildCompareMetricCatalog(compareChartInput) {
@@ -84,6 +86,25 @@ export function buildCompareMetricCatalog(compareChartInput) {
     pushMetric(topologyMetrics, {
       key: "convergence_count",
       label: "convergence count",
+      scope: "topology",
+      group: "Delay",
+      defaultAxis: "left"
+    });
+  }
+
+  const qbrSideId = findQbrSideForLowerBound(normalized);
+  if (!qbrSideId) {
+    topologyMetrics.delete("lower_bound");
+  } else if (topologyMetrics.has("lower_bound")) {
+    const existing = topologyMetrics.get("lower_bound");
+    topologyMetrics.set("lower_bound", {
+      ...existing,
+      label: METRIC_DISPLAY_LABELS.lower_bound
+    });
+  } else {
+    pushMetric(topologyMetrics, {
+      key: "lower_bound",
+      label: METRIC_DISPLAY_LABELS.lower_bound,
       scope: "topology",
       group: "Delay",
       defaultAxis: "left"

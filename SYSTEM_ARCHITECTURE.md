@@ -32,7 +32,7 @@
 - `frontend/` (core runtime):
   - React + Vite app, UI shell, state orchestration, charts/results.
 - `storage/` (core runtime data):
-  - `storage/db/` DB file local (SQLite default).
+  - `storage/artifacts/` run output files (DB is PostgreSQL).
   - `storage/artifacts/` artifact cua moi run.
 - `worker/` (core runtime):
   - Worker process poll queue tren bang `runs`, claim job, heartbeat, execute runner, persist artifact/metric.
@@ -59,7 +59,7 @@
 - Backend route xu ly nghiep vu, enqueue `Run`, va doc DB/artifact de tra progress/result.
 - Worker service claim `Run(status="queued")`, set `running`, heartbeat, execute runner, persist metric/artifact, reconcile batch status.
 - DB:
-  - Local/default: SQLite (`storage/db/qbr.db`) neu khong set `DATABASE_URL`.
+  - Database: PostgreSQL (`DATABASE_URL` in `QBR/.env`; local dev via Docker Postgres).
   - Worker mode / Docker target chinh: Postgres.
 - Artifact:
   - Moi run tao folder `storage/artifacts/<run_id>/...`.
@@ -166,6 +166,7 @@
 - IDs dang dang ky:
   - `qbr` (hien thi **QBR**; softmax la `policy_type` trong config, khong phai algorithm rieng)
   - `greedy` (hien thi **GREEDY**; mac dinh UI/run form)
+  - `cf_cas` (hien thi **CF-CAS**; collision-free critical-path aware scheduling, always-on T=1; runner `cf_cas_runner.py`, core `algorithms/cf_cas.py`)
 
 ### Config mechanism
 - Backend:
@@ -173,7 +174,7 @@
   - Registry tra metadata `default_config`, `config_schema`, `capabilities`.
 - Frontend:
   - Dynamic config form render theo `config_schema`.
-  - Shared state moi theo backbone (`qbr`, `greedy`) thay vi 1 object global duy nhat.
+  - Shared state moi theo backbone (`qbr`, `greedy`, `cf_cas`) thay vi 1 object global duy nhat.
 
 ### QBR reward/training knobs hien tai
 - `action_axis`: chon action tren candidate broadcaster hoac receiver.
@@ -201,8 +202,8 @@
 ## 6) Data and persistence
 
 ### DB dang dung gi (local/dev/docker)
-- Local/dev default: SQLite (`storage/db/qbr.db`) neu khong set env.
-- Docker / worker mode: backend va worker dung chung `DATABASE_URL`; Postgres la target chinh.
+- Database: PostgreSQL only (`DATABASE_URL` required).
+- Backend va worker dung chung `DATABASE_URL` va `storage/artifacts` (volume `QBR_ROOT` trong Docker).
 
 ### Luu artifact o dau
 - Tren disk: `QBR/storage/artifacts/<run_id>/...`.
@@ -295,7 +296,7 @@
 - `QBR/README.md` mo ta scaffold/stub nhung implementation hien tai da co nhieu flow runtime that.
 - `worker/README.md` va doc lien quan can doc-sync tiep theo implementation worker queue hien tai.
 - Compare duoc expose route/menu nhung backend va UI compare logic chua xong.
-- DB mode split (SQLite default vs Postgres worker mode) can duoc nhan manh ro hon trong docs huong dan.
+- Multi-worker: `npm run dev` (3 workers) hoac Docker `worker-1`..`worker-3`.
 - Docker compose runtime chua duoc verify tren may test hien tai vi Docker daemon offline.
 
 ---
@@ -336,7 +337,7 @@ flowchart LR
   SRV --> REG[Algorithm Registry]
   REG --> RUNNERS[QBR/Greedy Runners]
   SRV --> REPO[Repositories]
-  REPO --> DB[(SQLite/Postgres)]
+  REPO --> DB[(PostgreSQL)]
   SRV --> ART[Artifact Files in storage/artifacts]
   REPO --> ART
   WK[Worker Service] --> REPO
@@ -381,7 +382,7 @@ sequenceDiagram
 4. `backend/app/repositories/run_repo.py`
 5. `worker/jobs/worker_main.py`
 6. `backend/app/services/run_registry.py`
-7. `backend/app/services/runners/qbr_runner.py` va `backend/app/services/runners/greedy_runner.py`
+7. `backend/app/services/runners/qbr_runner.py`, `greedy_runner.py`, va `cf_cas_runner.py`
 8. `backend/app/models.py`
 9. `frontend/src/App.jsx`
 10. `frontend/src/components/MainTopologyPanel.jsx`

@@ -3,30 +3,32 @@ from __future__ import annotations
 import os
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from app.core.env import default_database_url, ensure_qbr_env
 
-def _default_sqlite_url() -> str:
-    # backend/app/core -> backend/app -> backend -> QBR
-    qbr_root = Path(__file__).resolve().parents[3]
-    db_path = qbr_root / "storage" / "db" / "qbr.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite:///{db_path.as_posix()}"
+ensure_qbr_env()
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip() or default_database_url()
 
-DATABASE_URL = os.getenv("DATABASE_URL", _default_sqlite_url())
+if DATABASE_URL.startswith("sqlite"):
+    raise RuntimeError(
+        "SQLite is no longer supported. Set DATABASE_URL to PostgreSQL "
+        "(see .env.example and README.md)."
+    )
 
-_IS_SQLITE = DATABASE_URL.startswith("sqlite")
-connect_args = {"check_same_thread": False, "timeout": 30} if _IS_SQLITE else {}
+if not DATABASE_URL.startswith("postgresql"):
+    raise RuntimeError("DATABASE_URL must be a PostgreSQL connection URL.")
+
 engine = create_engine(
     DATABASE_URL,
     future=True,
     echo=False,
-    connect_args=connect_args,
     pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 Base = declarative_base()
@@ -35,28 +37,16 @@ _db_initialized = False
 _db_init_lock = threading.Lock()
 
 
-if _IS_SQLITE:
-
-    @event.listens_for(engine, "connect")
-    def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.close()
-
-
 def _ensure_run_queue_columns() -> None:
     inspector = inspect(engine)
     if "runs" not in inspector.get_table_names():
         return
 
     existing_columns = {column["name"] for column in inspector.get_columns("runs")}
-    datetime_sql = "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME"
     ddl_by_column = {
         "worker_id": "ALTER TABLE runs ADD COLUMN worker_id VARCHAR(64)",
-        "heartbeat_at": f"ALTER TABLE runs ADD COLUMN heartbeat_at {datetime_sql}",
-        "claimed_at": f"ALTER TABLE runs ADD COLUMN claimed_at {datetime_sql}",
+        "heartbeat_at": "ALTER TABLE runs ADD COLUMN heartbeat_at TIMESTAMP WITH TIME ZONE",
+        "claimed_at": "ALTER TABLE runs ADD COLUMN claimed_at TIMESTAMP WITH TIME ZONE",
         "attempt_count": "ALTER TABLE runs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
         "queue_priority": "ALTER TABLE runs ADD COLUMN queue_priority INTEGER NOT NULL DEFAULT 100",
         "payload_json": "ALTER TABLE runs ADD COLUMN payload_json TEXT",
@@ -67,7 +57,6 @@ def _ensure_run_queue_columns() -> None:
             if column_name not in existing_columns:
                 connection.execute(text(ddl))
 
-        # Backward-compatible normalization for older rows created before queue semantics were aligned.
         connection.execute(text("UPDATE runs SET status = 'queued' WHERE status = 'pending'"))
         connection.execute(text("UPDATE runs SET queue_priority = 100 WHERE queue_priority IS NULL"))
         connection.execute(text("UPDATE runs SET attempt_count = 0 WHERE attempt_count IS NULL"))

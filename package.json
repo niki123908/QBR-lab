@@ -4,16 +4,22 @@
   "private": true,
   "scripts": {
     "postinstall": "npm --prefix frontend install",
-    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\" \"npm run dev:worker\"",
+    "predev": "docker compose up postgres -d --wait",
+    "dev": "concurrently -n frontend,backend,workers \"npm run dev:frontend\" \"npm run dev:backend\" \"npm run dev:workers\"",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": "python backend/dev_server.py",
     "dev:worker": "python worker/jobs/worker_main.py",
+    "dev:workers": "concurrently -n w1,w2,w3 \"python worker/jobs/worker_main.py\" \"python worker/jobs/worker_main.py\" \"python worker/jobs/worker_main.py\"",
+    "dev:postgres": "docker compose up postgres -d --wait",
+    "tunnel": "node scripts/wait_and_tunnel.cjs --nowait",
+    "share": "concurrently -n dev,tunnel -c blue,magenta \"npm run dev\" \"node scripts/wait_and_tunnel.cjs\"",
     "build": "npm run build:frontend && npm run check:backend",
     "build:frontend": "npm --prefix frontend run build",
     "check:backend": "python -m compileall backend/app",
     "test": "npm run check:backend"
   },
   "devDependencies": {
+    "cloudflared": "^0.7.1",
     "concurrently": "^9.1.2"
   }
 }

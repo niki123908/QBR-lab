@@ -2,10 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-COPY app /app/app
+COPY . /app/backend
+
+ENV PYTHONPATH=/app/backend
+ENV QBR_ROOT=/app
+
+WORKDIR /app/backend
 
 EXPOSE 8000
 

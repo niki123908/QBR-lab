@@ -1,5 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, XAxis, YAxis } from "recharts";
+import {
+  applySeriesStyles,
+  appearanceDraftToUi,
+  buildAppearanceDraft,
+  defaultChartAxisLabels,
+  defaultYAxisLabelFromMetrics,
+  resolveChartDisplayUi,
+  normalizeSeriesStylesMap,
+  resolvePanelTitle,
+  resolveYAxisDomain
+} from "../utils/compareChartAppearance.js";
+import { downloadPanelChartsAsPdf } from "../utils/compareChartExport.js";
+import {
+  buildChartFiguresForPanel,
+  downloadPanelChartsAsLatex
+} from "../utils/compareChartLatexExport.js";
 import { buildCompareMetricCatalog } from "../utils/compareChartMetrics.js";
 import {
   QUAD_COMPARE_SIDES,
@@ -7,6 +23,25 @@ import {
   normalizeCompareChartInput,
   activeSideIds
 } from "../utils/compareChartSides.js";
+import { SERIES_MARKER_OPTIONS, rechartsLegendType } from "../utils/compareChartMarkers.js";
+import {
+  applyChartPresetToDraft,
+  deleteChartPreset,
+  presetSummaryLabel,
+  readChartPresets,
+  saveChartPreset
+} from "../utils/compareChartPresetStorage.js";
+import {
+  readCompareChartWorkspaceSession,
+  writeCompareChartWorkspaceSession
+} from "../utils/compareChartWorkspaceStorage.js";
+import {
+  LOWER_BOUND_DATA_KEY,
+  LOWER_BOUND_SERIES_LABEL,
+  filterMetricKeysWithLowerBound,
+  findQbrSideForLowerBound,
+  materializeLowerBoundRows
+} from "../utils/compareChartLowerBound.js";
 import { buildDensityMeanRows, buildDensityPairs, buildPerDensityChartRows } from "../utils/compareChartTransforms.js";
 
 async function fetchBatchResultDetail(apiBase, batchRunId) {
@@ -23,6 +58,8 @@ function emptyBatchIds(sideIds) {
 }
 const FIXED_GROUP_PATH = ["unique_path_count", "best_delay_unique_path_count"];
 const FIXED_GROUP_DELAY = ["best_delay", "last_delay", "lower_bound"];
+const PATH_COUNT_METRICS = new Set(FIXED_GROUP_PATH);
+const PATH_COUNT_Y_MAX = 1000;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -40,7 +77,7 @@ function valueTick(value) {
 function metricColor(metricKey, side) {
   const key = String(metricKey || "");
   const family = SIDE_COLORS[side] ?? SIDE_COLORS.A;
-  if (key === "lower_bound" && side === "AB") return "#9333EA";
+  if (key === "lower_bound") return "#9333EA";
   if (key === "unique_path_count") return family.light;
   if (key === "best_delay_unique_path_count") return family.dark;
   if (key.includes("best")) return family.dark;
@@ -48,20 +85,43 @@ function metricColor(metricKey, side) {
   return family.light;
 }
 
-function buildMarkerByMetric(metricKeys) {
-  const shapes = ["circle", "cross", "triangle", "diamond", "square"];
-  const out = {};
-  metricKeys.forEach((key, idx) => {
-    out[key] = shapes[idx % shapes.length];
-  });
-  return out;
+function LegendMarkerGlyph({ shape, color, size = 14 }) {
+  const c = color || "#5a6375";
+  const half = size / 2;
+  if (shape === "none") {
+    return (
+      <svg width={size} height={size} className="compare-chart-legend-marker compare-chart-legend-marker--line-only" aria-hidden>
+        <line x1={2} y1={half} x2={size - 2} y2={half} stroke={c} strokeWidth={2.2} strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg width={size} height={size} className="compare-chart-legend-marker" aria-hidden>
+      <MetricDot cx={half} cy={half} stroke={c} fill={c} shape={shape} opacity={1} />
+    </svg>
+  );
 }
 
-function MetricDot({ cx, cy, stroke, fill, shape = "circle" }) {
+function LineSeriesLegend({ defs }) {
+  if (!defs?.length) return null;
+  return (
+    <div className="compare-chart-legend compare-chart-legend--line" role="list">
+      {defs.map((def) => (
+        <span key={def.dataKey} className="compare-chart-legend-item" role="listitem">
+          <LegendMarkerGlyph shape={def.marker || "circle"} color={def.color} />
+          <span className="compare-chart-legend-label">{def.name}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function MetricDot({ cx, cy, stroke, fill, shape = "circle", opacity = 1 }) {
   const x = Number(cx);
   const y = Number(cy);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   const color = stroke || fill || "#333";
+  const o = Math.min(1, Math.max(0.05, Number(opacity) || 1));
   if (shape === "cross") {
     return (
       <g>
@@ -71,44 +131,44 @@ function MetricDot({ cx, cy, stroke, fill, shape = "circle" }) {
     );
   }
   if (shape === "triangle") {
-    return <path d={`M ${x} ${y - 5} L ${x + 5} ${y + 4} L ${x - 5} ${y + 4} Z`} fill={color} fillOpacity={0.7} stroke={color} strokeOpacity={0.7} strokeWidth={1} />;
+    return <path d={`M ${x} ${y - 5} L ${x + 5} ${y + 4} L ${x - 5} ${y + 4} Z`} fill={color} fillOpacity={o} stroke={color} strokeOpacity={o} strokeWidth={1} />;
   }
   if (shape === "diamond") {
-    return <path d={`M ${x} ${y - 5} L ${x + 5} ${y} L ${x} ${y + 5} L ${x - 5} ${y} Z`} fill={color} fillOpacity={0.7} stroke={color} strokeOpacity={0.7} strokeWidth={1} />;
+    return <path d={`M ${x} ${y - 5} L ${x + 5} ${y} L ${x} ${y + 5} L ${x - 5} ${y} Z`} fill={color} fillOpacity={o} stroke={color} strokeOpacity={o} strokeWidth={1} />;
   }
   if (shape === "square") {
-    return <rect x={x - 4} y={y - 4} width={8} height={8} fill={color} fillOpacity={0.7} stroke={color} strokeOpacity={0.7} strokeWidth={1} />;
+    return <rect x={x - 4} y={y - 4} width={8} height={8} fill={color} fillOpacity={o} stroke={color} strokeOpacity={o} strokeWidth={1} />;
   }
-  return <circle cx={x} cy={y} r={4} fill={color} fillOpacity={0.7} stroke={color} strokeOpacity={0.7} strokeWidth={1} />;
+  return <circle cx={x} cy={y} r={4} fill={color} fillOpacity={o} stroke={color} strokeOpacity={o} strokeWidth={1} />;
 }
 
-function seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById) {
+function seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById, compareChartInput) {
   const defs = [];
-  const useSharedLowerBound = sideIds.length === 2 && metricKeys.includes("lower_bound");
+  const qbrSideId = findQbrSideForLowerBound(compareChartInput);
 
   metricKeys.forEach((key) => {
     const metric = catalogMap.get(key);
     if (!metric) return;
 
-    if (key === "lower_bound" && useSharedLowerBound) {
+    if (key === "lower_bound") {
+      if (!qbrSideId) return;
       defs.push({
-        dataKey: "AB__lower_bound",
+        dataKey: LOWER_BOUND_DATA_KEY,
         metricKey: key,
-        side: "AB",
-        name: `${metric.label} (shared)`,
-        color: metricColor(key, "AB")
+        side: "LB",
+        name: LOWER_BOUND_SERIES_LABEL,
+        color: metricColor(key, "LB")
       });
       return;
     }
 
     sideIds.forEach((sideId) => {
       const sideLabel = sideLabelsById?.[sideId] || sideId;
-      const suffix = key === "convergence_count" ? "convergence count (%)" : metric.label;
       defs.push({
         dataKey: `${sideId}__${key}`,
         metricKey: key,
         side: sideId,
-        name: `${sideLabel} · ${suffix}`,
+        name: sideLabel,
         color: metricColor(key, sideId)
       });
     });
@@ -160,15 +220,8 @@ function axisDomainForLine(rows, defs, yPaddingPct = 8) {
   return [lo, hi > lo ? hi : lo + 1];
 }
 
-function materializeRowsForDefs(rows, defs) {
-  if (!rows?.length) return rows ?? [];
-  if (!defs.some((def) => def.dataKey === "AB__lower_bound")) return rows;
-  return rows.map((row) => {
-    const a = Number(row?.A__lower_bound);
-    const b = Number(row?.B__lower_bound);
-    const shared = Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : Number.isFinite(a) ? a : Number.isFinite(b) ? b : null;
-    return { ...row, AB__lower_bound: shared };
-  });
+function materializeRowsForDefs(rows, defs, compareChartInput) {
+  return materializeLowerBoundRows(rows, defs, findQbrSideForLowerBound(compareChartInput));
 }
 
 function shouldUseLeadingZeroPad(rows, xKey, chartType, enabled) {
@@ -188,12 +241,65 @@ function defaultChartUi() {
     yPaddingPct: 8,
     showGrid: true,
     showLegend: true,
-    leadingZeroPad: true
+    leadingZeroPad: true,
+    seriesStyles: {},
+    yAxisManual: false,
+    showXAxisTicks: true,
+    showYAxisTicks: true,
+    showXAxisLabel: false,
+    showYAxisLabel: true,
+    xAxisTickFontSize: 11,
+    yAxisTickFontSize: 11
   };
 }
 
-function formatMode(mode) {
-  return mode === "densityMean" ? "Density mean" : "Density";
+function mergeChartUi(rawUi) {
+  const base = defaultChartUi();
+  if (!rawUi || typeof rawUi !== "object" || Array.isArray(rawUi)) return base;
+  return {
+    ...base,
+    ...rawUi,
+    seriesStyles: normalizeSeriesStylesMap(rawUi.seriesStyles)
+  };
+}
+
+function chartUiForDisplay(chart, catalogMap) {
+  return mergeChartUi(resolveChartDisplayUi(chart.ui, chart, catalogMap));
+}
+
+function filterPlotDefs(defs, chartMode) {
+  const hasConvergenceMetric = defs.some((def) => def.metricKey === "convergence_count");
+  const shouldPlotConvergenceSeries = chartMode === "densityMean" && hasConvergenceMetric;
+  return shouldPlotConvergenceSeries ? defs : defs.filter((def) => def.metricKey !== "convergence_count");
+}
+
+function computeChartAutoYDomain({
+  rows,
+  plotDefs,
+  chartType,
+  chartMode,
+  ui,
+  sideIds,
+  compareChartInput,
+  xKey = "x"
+}) {
+  if (!rows?.length || !plotDefs?.length) return [0, 1];
+  const normalizedRows = materializeRowsForDefs(rows, plotDefs, compareChartInput);
+  const useZeroPad =
+    chartType === "bar" && shouldUseLeadingZeroPad(normalizedRows, xKey, chartType, ui?.leadingZeroPad !== false);
+  const drawRows = useZeroPad ? withLeadingZeroRow(normalizedRows, xKey, plotDefs) : normalizedRows;
+  const isBar = chartType === "bar";
+  const isPathOverlay = isBar && hasPathOverlayPair(plotDefs, sideIds);
+  const convergenceSeriesOnly = plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
+  if (convergenceSeriesOnly) return [0, 100];
+  if (isPathOverlay || isPathCountOnlyChart(plotDefs)) return [0, PATH_COUNT_Y_MAX];
+  return isBar
+    ? axisDomainForBar(drawRows, plotDefs, ui?.yPaddingPct ?? 8)
+    : axisDomainForLine(drawRows, plotDefs, ui?.yPaddingPct ?? 8);
+}
+
+function isPathCountOnlyChart(plotDefs) {
+  return plotDefs.length > 0 && plotDefs.every((def) => PATH_COUNT_METRICS.has(def.metricKey));
 }
 
 function hasPathOverlayPair(defs, sideIds) {
@@ -207,50 +313,42 @@ function hasPathOverlayPair(defs, sideIds) {
   );
 }
 
-function pathOverlayLegendPayload(sideLabelsById) {
-  return [
-    {
-      value: `${sideLabelsById?.A ?? "A"} · unique path count`,
+const PATH_OVERLAY_KEYS = [
+  ["A__unique_path_count", "A", "unique path count", SIDE_COLORS.A.light],
+  ["A__best_delay_unique_path_count", "A", "best delay unique path count", SIDE_COLORS.A.dark],
+  ["B__unique_path_count", "B", "unique path count", SIDE_COLORS.B.light],
+  ["B__best_delay_unique_path_count", "B", "best delay unique path count", SIDE_COLORS.B.dark]
+];
+
+function pathOverlayLegendPayload(defs, sideLabelsById) {
+  const byKey = new Map((defs ?? []).map((def) => [def.dataKey, def]));
+  return PATH_OVERLAY_KEYS.map(([dataKey, side, suffix, fallbackColor]) => {
+    const def = byKey.get(dataKey);
+    const sideLabel = sideLabelsById?.[side] ?? side;
+    return {
+      value: def?.name ?? sideLabel,
       type: "square",
-      color: SIDE_COLORS.A.light,
-      id: "legend-a-unique"
-    },
-    {
-      value: `${sideLabelsById?.A ?? "A"} · best delay unique path count`,
-      type: "square",
-      color: SIDE_COLORS.A.dark,
-      id: "legend-a-best"
-    },
-    {
-      value: `${sideLabelsById?.B ?? "B"} · unique path count`,
-      type: "square",
-      color: SIDE_COLORS.B.light,
-      id: "legend-b-unique"
-    },
-    {
-      value: `${sideLabelsById?.B ?? "B"} · best delay unique path count`,
-      type: "square",
-      color: SIDE_COLORS.B.dark,
-      id: "legend-b-best"
-    }
-  ];
+      color: def?.color ?? fallbackColor,
+      id: `legend-${dataKey}`
+    };
+  });
 }
 
-function PathOverlayLegend() {
-  const items = pathOverlayLegendPayload();
+function PathOverlayLegend({ items }) {
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: "10px 14px", marginTop: 6 }}>
+    <div className="compare-chart-legend compare-chart-legend--bar" role="list">
       {items.map((item) => (
-        <span key={item.id} style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "#5a6375" }}>
-          <i style={{ width: 10, height: 10, borderRadius: 2, background: item.color, display: "inline-block" }} />
-          {item.value}
+        <span key={item.id} className="compare-chart-legend-item" role="listitem">
+          <i className="compare-chart-legend-swatch" style={{ background: item.color }} />
+          <span className="compare-chart-legend-label">{item.value}</span>
         </span>
       ))}
     </div>
   );
 }
 
-function overlayBarShapeFactory(baseColor, topColor, topKey) {
+function overlayBarShapeFactory(baseColor, topColor, topKey, baseOpacity = 0.65) {
+  const baseOp = Math.min(1, Math.max(0.05, Number(baseOpacity) || 0.65));
   return function OverlayBarShape(props) {
     const { x, y, width, height, payload } = props;
     const base = Number(props.value);
@@ -265,11 +363,15 @@ function overlayBarShapeFactory(baseColor, topColor, topKey) {
     const topY = safeY + (safeH - topHeight);
     return (
       <g>
-        <rect x={safeX} y={safeY} width={safeW} height={safeH} fill={baseColor} fillOpacity={0.65} />
-        {topHeight > 0 ? <rect x={safeX} y={topY} width={safeW} height={topHeight} fill={topColor} /> : null}
+        <rect x={safeX} y={safeY} width={safeW} height={safeH} fill={baseColor} fillOpacity={baseOp} />
+        {topHeight > 0 ? <rect x={safeX} y={topY} width={safeW} height={topHeight} fill={topColor} fillOpacity={baseOp} /> : null}
       </g>
     );
   };
+}
+
+function defByKey(defs, dataKey) {
+  return defs.find((def) => def.dataKey === dataKey);
 }
 
 function convergenceOverlayShapeFactory(colorA, colorB, overlapColor) {
@@ -305,54 +407,108 @@ function ChartCard({
   chartType,
   defs,
   ui,
-  markerByMetric,
   chartMode,
   sideIds,
-  sideLabelsById
+  sideLabelsById,
+  compareChartInput
 }) {
   if (!rows.length || !defs.length) return <div className="empty-topology-state">No data for this chart.</div>;
-  const normalizedRows = materializeRowsForDefs(rows, defs);
-  const useZeroPad = chartType === "bar" && shouldUseLeadingZeroPad(normalizedRows, xKey, chartType, ui.leadingZeroPad);
+  const uiSafe = mergeChartUi(ui);
+  const normalizedRows = materializeRowsForDefs(rows, defs, compareChartInput);
+  const useZeroPad = chartType === "bar" && shouldUseLeadingZeroPad(normalizedRows, xKey, chartType, uiSafe.leadingZeroPad);
   const drawRows = useZeroPad ? withLeadingZeroRow(normalizedRows, xKey, defs) : normalizedRows;
   const isBar = chartType === "bar";
   const isPathOverlay = isBar && hasPathOverlayPair(defs, sideIds);
   const hasConvergenceMetric = defs.some((def) => def.metricKey === "convergence_count");
   const shouldPlotConvergenceSeries = chartMode === "densityMean" && hasConvergenceMetric;
   const hasConvergenceOverlay = hasConvergenceMetric && !shouldPlotConvergenceSeries && sideIds.length === 2;
-  const plotDefs = shouldPlotConvergenceSeries ? defs : defs.filter((def) => def.metricKey !== "convergence_count");
+  const plotDefs = filterPlotDefs(defs, chartMode);
+  if (!plotDefs.length) {
+    return <div className="empty-topology-state">No plottable series for this chart (check metrics / visibility).</div>;
+  }
+  const useFixedPathCountScale = isPathOverlay || isPathCountOnlyChart(plotDefs);
+  const pathLegendItems = isPathOverlay ? pathOverlayLegendPayload(plotDefs, sideLabelsById) : [];
   const convergenceSeriesOnly = plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
   const yTickFormatter = convergenceSeriesOnly ? (value) => `${Math.round(Number(value) || 0)}%` : valueTick;
-  const yDomain = convergenceSeriesOnly
-    ? [0, 100]
-    : isBar
-      ? axisDomainForBar(drawRows, plotDefs, ui.yPaddingPct)
-      : axisDomainForLine(drawRows, plotDefs, ui.yPaddingPct);
+  const autoYDomain = computeChartAutoYDomain({
+    rows,
+    plotDefs,
+    chartType,
+    chartMode,
+    ui: uiSafe,
+    sideIds,
+    compareChartInput,
+    xKey
+  });
+  const yDomain = resolveYAxisDomain(autoYDomain, uiSafe);
+  const xTickSize = Math.min(18, Math.max(8, Number(uiSafe.xAxisTickFontSize) || 11));
+  const yTickSize = Math.min(18, Math.max(8, Number(uiSafe.yAxisTickFontSize) || 11));
+  const xTickProps = { fontSize: xTickSize };
+  const yTickProps = { fontSize: yTickSize };
+  const xAxisLabelProps =
+    uiSafe.showXAxisLabel && String(uiSafe.xAxisLabel ?? "").trim()
+      ? {
+          value: String(uiSafe.xAxisLabel).trim(),
+          position: "insideBottom",
+          offset: -2,
+          style: { fontSize: Math.max(10, xTickSize), fill: "#5a6375" }
+        }
+      : undefined;
+  const yAxisLabelProps =
+    uiSafe.showYAxisLabel && String(uiSafe.yAxisLabel ?? "").trim()
+      ? {
+          value: String(uiSafe.yAxisLabel).trim(),
+          angle: -90,
+          position: "insideLeft",
+          style: { fontSize: Math.max(10, yTickSize), fill: "#5a6375", textAnchor: "middle" }
+        }
+      : undefined;
+  const legendBottomPad = !isBar && uiSafe.showLegend ? (uiSafe.showXAxisLabel ? 36 : 28) : 0;
+  const chartMargin = {
+    top: 12,
+    right: 22,
+    left: uiSafe.showYAxisLabel ? 28 : 20,
+    bottom: (uiSafe.showXAxisLabel ? 22 : 8) + legendBottomPad
+  };
 
   return (
     <div className="compare-chart-card">
       <h4>{title}</h4>
-      <div className="compare-chart-canvas">
+      <div
+        className={`compare-chart-canvas${useFixedPathCountScale ? " compare-chart-canvas--path-count" : ""}`}
+      >
         <ResponsiveContainer width="100%" height="100%">
           {isBar ? (
             <BarChart
               data={drawRows}
-              margin={{ top: 12, right: 22, left: 20, bottom: 8 }}
+              margin={chartMargin}
               barCategoryGap={isPathOverlay ? "22%" : "34%"}
               barGap={isPathOverlay ? 0 : -5}
             >
-              {ui.showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
+              {uiSafe.showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
               <XAxis
                 dataKey={xKey}
-                tick={{ fontSize: 11 }}
+                tick={xTickProps}
+                hide={uiSafe.showXAxisTicks === false}
                 tickFormatter={xTickFormatter}
                 padding={{ left: 44, right: 14 }}
+                label={xAxisLabelProps}
               />
-              <YAxis tick={{ fontSize: 11 }} tickFormatter={yTickFormatter} domain={yDomain} />
+              <YAxis
+                tick={yTickProps}
+                hide={uiSafe.showYAxisTicks === false}
+                tickFormatter={yTickFormatter}
+                domain={yDomain}
+                label={yAxisLabelProps}
+              />
               {hasConvergenceOverlay ? <YAxis yAxisId="bg" hide domain={[0, 1]} /> : null}
-              {ui.showLegend ? (
+              {uiSafe.showLegend ? (
                 <Legend
-                  payload={isPathOverlay ? pathOverlayLegendPayload(sideLabelsById) : undefined}
-                  content={isPathOverlay ? <PathOverlayLegend /> : undefined}
+                  verticalAlign="bottom"
+                  align="center"
+                  wrapperStyle={{ width: "100%", paddingTop: 8 }}
+                  payload={isPathOverlay ? pathLegendItems : undefined}
+                  content={isPathOverlay ? <PathOverlayLegend items={pathLegendItems} /> : undefined}
                 />
               ) : null}
               {hasConvergenceOverlay ? (
@@ -371,19 +527,29 @@ function ChartCard({
                 <>
                   <Bar
                     dataKey="A__unique_path_count"
-                    name="A column"
+                    name={defByKey(plotDefs, "A__unique_path_count")?.name ?? "A column"}
                     barSize={12}
                     minPointSize={2}
                     isAnimationActive={false}
-                    shape={overlayBarShapeFactory(SIDE_COLORS.A.light, SIDE_COLORS.A.dark, "A__best_delay_unique_path_count")}
+                    shape={overlayBarShapeFactory(
+                      defByKey(plotDefs, "A__unique_path_count")?.color ?? SIDE_COLORS.A.light,
+                      defByKey(plotDefs, "A__best_delay_unique_path_count")?.color ?? SIDE_COLORS.A.dark,
+                      "A__best_delay_unique_path_count",
+                      defByKey(plotDefs, "A__unique_path_count")?.opacity ?? 0.65
+                    )}
                   />
                   <Bar
                     dataKey="B__unique_path_count"
-                    name="B column"
+                    name={defByKey(plotDefs, "B__unique_path_count")?.name ?? "B column"}
                     barSize={12}
                     minPointSize={2}
                     isAnimationActive={false}
-                    shape={overlayBarShapeFactory(SIDE_COLORS.B.light, SIDE_COLORS.B.dark, "B__best_delay_unique_path_count")}
+                    shape={overlayBarShapeFactory(
+                      defByKey(plotDefs, "B__unique_path_count")?.color ?? SIDE_COLORS.B.light,
+                      defByKey(plotDefs, "B__best_delay_unique_path_count")?.color ?? SIDE_COLORS.B.dark,
+                      "B__best_delay_unique_path_count",
+                      defByKey(plotDefs, "B__unique_path_count")?.opacity ?? 0.65
+                    )}
                   />
                 </>
               ) : (
@@ -393,6 +559,7 @@ function ChartCard({
                     dataKey={def.dataKey}
                     name={def.name}
                     fill={def.color}
+                    fillOpacity={def.opacity ?? 0.65}
                     maxBarSize={14}
                     minPointSize={2}
                     isAnimationActive={false}
@@ -401,18 +568,33 @@ function ChartCard({
               )}
             </BarChart>
           ) : (
-            <ComposedChart data={drawRows} margin={{ top: 12, right: 22, left: 20, bottom: 8 }}>
-              {ui.showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
+            <ComposedChart data={drawRows} margin={chartMargin}>
+              {uiSafe.showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
               <XAxis
                 dataKey={xKey}
                 type="category"
-                tick={{ fontSize: 11 }}
+                tick={xTickProps}
+                hide={uiSafe.showXAxisTicks === false}
                 tickFormatter={xTickFormatter}
                 padding={{ left: 44, right: 14 }}
+                label={xAxisLabelProps}
               />
-              <YAxis tick={{ fontSize: 11 }} tickFormatter={yTickFormatter} domain={yDomain} />
+              <YAxis
+                tick={yTickProps}
+                hide={uiSafe.showYAxisTicks === false}
+                tickFormatter={yTickFormatter}
+                domain={yDomain}
+                label={yAxisLabelProps}
+              />
               {hasConvergenceOverlay ? <YAxis yAxisId="bg" hide domain={[0, 1]} /> : null}
-              {ui.showLegend ? <Legend /> : null}
+              {uiSafe.showLegend ? (
+                <Legend
+                  verticalAlign="bottom"
+                  align="center"
+                  wrapperStyle={{ width: "100%", paddingTop: 10 }}
+                  content={<LineSeriesLegend defs={plotDefs} />}
+                />
+              ) : null}
               {hasConvergenceOverlay ? (
                 <Bar
                   dataKey="__convergence_bg_a"
@@ -425,27 +607,19 @@ function ChartCard({
                   shape={convergenceOverlayShapeFactory(SIDE_COLORS.A.light, "#FBCFE8", "#C4B5FD")}
                 />
               ) : null}
-              {plotDefs.map((def) => (
+              {plotDefs.map((def) => {
+                const markerShape = def.marker || "circle";
+                return (
                 <Line
                   key={def.dataKey}
                   type="linear"
                   dataKey={def.dataKey}
                   name={def.name}
                   stroke={def.color}
-                  legendType={
-                    (markerByMetric?.[def.metricKey] || "circle") === "cross"
-                      ? "cross"
-                      : (markerByMetric?.[def.metricKey] || "circle") === "triangle"
-                        ? "triangle"
-                        : (markerByMetric?.[def.metricKey] || "circle") === "diamond"
-                          ? "diamond"
-                          : (markerByMetric?.[def.metricKey] || "circle") === "square"
-                            ? "square"
-                            : "circle"
-                  }
+                  legendType={rechartsLegendType(markerShape)}
                   connectNulls
                   isAnimationActive={false}
-                  strokeOpacity={0.5}
+                  strokeOpacity={def.opacity ?? 0.5}
                   label={
                     convergenceSeriesOnly
                       ? ({ x, y, value }) => {
@@ -453,13 +627,14 @@ function ChartCard({
                           if (!Number.isFinite(n)) return null;
                           const px = Number(x);
                           const py = Number(y);
-                          const sideIdx = sideIds.indexOf(def.side);
-                          const dy = sideIdx <= 0 ? -9 : 9 + sideIdx * 4;
+                          const plotIdx = Math.max(0, plotDefs.findIndex((d) => d.dataKey === def.dataKey));
+                          const labelY = py - 10 - plotIdx * 11;
                           return (
                             <text
                               x={px}
-                              y={py + dy}
+                              y={labelY}
                               textAnchor="middle"
+                              dominantBaseline="text-after-edge"
                               fontSize="10"
                               fill={def.color}
                               fillOpacity="0.95"
@@ -470,18 +645,24 @@ function ChartCard({
                         }
                       : undefined
                   }
-                  dot={(props) => (
-                    <MetricDot
-                      {...props}
-                      shape={markerByMetric?.[def.metricKey] || "circle"}
-                      stroke={def.color}
-                      fill={def.color}
-                    />
-                  )}
+                  dot={
+                    markerShape === "none"
+                      ? false
+                      : (props) => (
+                          <MetricDot
+                            {...props}
+                            shape={markerShape}
+                            stroke={def.color}
+                            fill={def.color}
+                            opacity={def.opacity ?? 1}
+                          />
+                        )
+                  }
                   activeDot={false}
-                  strokeWidth={clamp(Number(ui.lineWidth) || 3, 1, 8)}
+                  strokeWidth={clamp(Number(uiSafe.lineWidth) || 3, 1, 8)}
                 />
-              ))}
+              );
+              })}
             </ComposedChart>
           )}
         </ResponsiveContainer>
@@ -524,12 +705,50 @@ function defaultDraft(densityLabels) {
     mode: "density",
     chartType: "line",
     selectedMetricKeys: [],
-    selectedDensityLabels: [...densityLabels]
+    selectedDensityLabels: [...densityLabels],
+    presetUi: null,
+    presetId: ""
   };
 }
 
 function metricSummary(metricKeys, catalogMap) {
   return metricKeys.map((key) => catalogMap.get(key)?.label ?? key).join(", ");
+}
+
+function ChartPresetNameModal({ open, value, setValue, defaultLabel, onCancel, onConfirm }) {
+  if (!open) return null;
+  return (
+    <div className="compare-chart-modal-backdrop" onClick={onCancel}>
+      <div className="modal-card compare-chart-preset-name-card" onClick={(e) => e.stopPropagation()}>
+        <h3>Save chart preset</h3>
+        <p className="muted">
+          Saves metrics, densities, chart type, mode, and appearance (titles, colors, axes). Leave empty to use:{" "}
+          <strong>{defaultLabel}</strong>
+        </p>
+        <input
+          autoFocus
+          className="modal-input"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onConfirm();
+            }
+          }}
+          placeholder={defaultLabel}
+        />
+        <div className="modal-actions">
+          <button type="button" className="secondary-cta small" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="primary-cta small" onClick={onConfirm}>
+            Save preset
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ChartConfigModal({
@@ -538,6 +757,9 @@ function ChartConfigModal({
   draft,
   densityLabels,
   catalog,
+  presets,
+  onPresetSelect,
+  onPresetDelete,
   onClose,
   onDraftChange,
   onSave
@@ -547,10 +769,12 @@ function ChartConfigModal({
   const selectedSet = new Set(draft.selectedMetricKeys);
   const densitySet = new Set(draft.selectedDensityLabels);
   const canSave = draft.selectedMetricKeys.length > 0 && draft.selectedDensityLabels.length > 0;
+  const selectedPresetId = draft.presetId ?? "";
 
   const toggleMetric = (metricKey) => {
     onDraftChange({
       ...draft,
+      presetId: "",
       selectedMetricKeys: selectedSet.has(metricKey)
         ? draft.selectedMetricKeys.filter((key) => key !== metricKey)
         : [...draft.selectedMetricKeys, metricKey]
@@ -560,6 +784,7 @@ function ChartConfigModal({
   const toggleDensity = (label) => {
     onDraftChange({
       ...draft,
+      presetId: "",
       selectedDensityLabels: densitySet.has(label)
         ? draft.selectedDensityLabels.filter((key) => key !== label)
         : [...draft.selectedDensityLabels, label]
@@ -571,6 +796,7 @@ function ChartConfigModal({
     onDraftChange({
       ...draft,
       mode: nextMode,
+      presetId: "",
       selectedMetricKeys: draft.selectedMetricKeys.filter((key) => allowed.has(key))
     });
   };
@@ -584,6 +810,37 @@ function ChartConfigModal({
             ×
           </button>
         </div>
+
+        <section className="compare-chart-modal-section">
+          <h5>Load preset (optional)</h5>
+          <div className="compare-chart-preset-load-row">
+            <select
+              className="modal-input"
+              value={selectedPresetId}
+              onChange={(e) => onPresetSelect(e.target.value)}
+            >
+              <option value="">— Configure from scratch —</option>
+              {presets.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {presetSummaryLabel(preset)}
+                </option>
+              ))}
+            </select>
+            {selectedPresetId ? (
+              <button
+                type="button"
+                className="danger-ghost-btn small"
+                title="Delete saved preset"
+                onClick={() => onPresetDelete(selectedPresetId)}
+              >
+                Delete preset
+              </button>
+            ) : null}
+          </div>
+          {!presets.length ? (
+            <p className="muted compare-chart-preset-hint">No saved presets yet. Use “Save preset” on an existing chart.</p>
+          ) : null}
+        </section>
 
         <section className="compare-chart-modal-section">
           <h5>1) Mode</h5>
@@ -626,14 +883,14 @@ function ChartConfigModal({
             <button
               type="button"
               className={`segment-btn ${draft.chartType === "line" ? "active" : ""}`}
-              onClick={() => onDraftChange({ ...draft, chartType: "line" })}
+              onClick={() => onDraftChange({ ...draft, chartType: "line", presetId: "" })}
             >
               Line chart
             </button>
             <button
               type="button"
               className={`segment-btn ${draft.chartType === "bar" ? "active" : ""}`}
-              onClick={() => onDraftChange({ ...draft, chartType: "bar" })}
+              onClick={() => onDraftChange({ ...draft, chartType: "bar", presetId: "" })}
             >
               Bar chart
             </button>
@@ -676,18 +933,389 @@ function ChartConfigModal({
   );
 }
 
+function normalizeHexColor(raw) {
+  const s = String(raw ?? "")
+    .trim()
+    .replace(/^#/, "");
+  if (/^[0-9a-fA-F]{6}$/.test(s)) return `#${s.toLowerCase()}`;
+  if (/^[0-9a-fA-F]{3}$/.test(s)) {
+    const [r, g, b] = s.split("");
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+  }
+  return null;
+}
+
+function SeriesColorPicker({ color, onChange }) {
+  const resolved = normalizeHexColor(color) ?? "#888888";
+  const [hexText, setHexText] = useState(() => resolved.slice(1));
+
+  useEffect(() => {
+    setHexText(resolved.slice(1));
+  }, [resolved]);
+
+  const commitHex = (text) => {
+    const next = normalizeHexColor(text);
+    if (next) {
+      onChange(next);
+      setHexText(next.slice(1));
+      return;
+    }
+    setHexText(resolved.slice(1));
+  };
+
+  return (
+    <div className="compare-chart-color-field">
+      <input
+        type="color"
+        value={resolved}
+        onChange={(e) => {
+          const next = normalizeHexColor(e.target.value);
+          if (next) onChange(next);
+        }}
+        title="Pick color"
+      />
+      <input
+        type="text"
+        className="modal-input compare-chart-color-hex"
+        value={`#${hexText}`}
+        onChange={(e) => {
+          const v = e.target.value;
+          setHexText(v.replace(/^#/, ""));
+          const next = normalizeHexColor(v);
+          if (next) onChange(next);
+        }}
+        onBlur={() => commitHex(hexText)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitHex(hexText);
+          }
+        }}
+        spellCheck={false}
+        aria-label="Hex color"
+        placeholder="#RRGGBB"
+      />
+    </div>
+  );
+}
+
+function ChartAppearanceModal({ open, draft, chartType, onClose, onDraftChange, onSave }) {
+  if (!open || !draft) return null;
+
+  const isLineChart = chartType === "line";
+
+  const updateSeries = (dataKey, patch) => {
+    onDraftChange({
+      ...draft,
+      series: draft.series.map((row) => (row.dataKey === dataKey ? { ...row, ...patch } : row))
+    });
+  };
+
+  const visibleCount = draft.series.filter((row) => !row.hidden).length;
+
+  return (
+    <div className="compare-chart-modal-backdrop" onClick={onClose}>
+      <div className="compare-chart-modal compare-chart-modal--appearance" onClick={(e) => e.stopPropagation()}>
+        <div className="compare-chart-modal-header">
+          <h4>Edit chart appearance</h4>
+          <button type="button" className="batch-icon-btn" onClick={onClose} title="Close">
+            ×
+          </button>
+        </div>
+
+        <section className="compare-chart-modal-section">
+          <h5>Chart title</h5>
+          <input
+            type="text"
+            className="modal-input"
+            value={draft.chartTitle}
+            placeholder="Panel title (leave empty for default)"
+            onChange={(e) => onDraftChange({ ...draft, chartTitle: e.target.value })}
+          />
+        </section>
+
+        <section className="compare-chart-modal-section">
+          <h5>Card title</h5>
+          <input
+            type="text"
+            className="modal-input"
+            value={draft.cardTitle}
+            placeholder="Title inside chart area (optional)"
+            onChange={(e) => onDraftChange({ ...draft, cardTitle: e.target.value })}
+          />
+        </section>
+
+        <section className="compare-chart-modal-section">
+          <h5>LaTeX export</h5>
+          <label className="compare-chart-field-label">Figure caption</label>
+          <input
+            type="text"
+            className="modal-input"
+            value={draft.latexCaption}
+            placeholder="\\caption{...} in exported .tex (optional)"
+            onChange={(e) => onDraftChange({ ...draft, latexCaption: e.target.value })}
+          />
+          <label className="compare-chart-field-label">Figure label</label>
+          <input
+            type="text"
+            className="modal-input"
+            value={draft.latexLabel}
+            placeholder="e.g. delay_performance → fig:delay_performance"
+            onChange={(e) => onDraftChange({ ...draft, latexLabel: e.target.value })}
+          />
+        </section>
+
+        <section className="compare-chart-modal-section">
+          <h5>Data series</h5>
+          <p className="muted">
+            Rename, pick colors, adjust opacity, or hide lines/bars.
+            {isLineChart ? " Line charts: choose a point marker per series." : ""} ({visibleCount} visible)
+          </p>
+          <div className="compare-chart-appearance-series">
+            <div
+              className={`compare-chart-appearance-row compare-chart-appearance-row-head${isLineChart ? " compare-chart-appearance-row--line" : ""}`}
+            >
+              <span>Show</span>
+              <span>Name</span>
+              <span>Color</span>
+              {isLineChart ? <span>Marker</span> : null}
+              <span>Opacity</span>
+              <span />
+            </div>
+            {draft.series.map((row) => (
+              <div
+                key={row.dataKey}
+                className={`compare-chart-appearance-row${isLineChart ? " compare-chart-appearance-row--line" : ""}`}
+              >
+                <label className="compare-chart-check" title="Show series">
+                  <input
+                    type="checkbox"
+                    checked={!row.hidden}
+                    onChange={(e) => updateSeries(row.dataKey, { hidden: !e.target.checked })}
+                  />
+                </label>
+                <input
+                  type="text"
+                  className="modal-input"
+                  value={row.name}
+                  placeholder={row.defaultName}
+                  onChange={(e) => updateSeries(row.dataKey, { name: e.target.value })}
+                />
+                <SeriesColorPicker color={row.color} onChange={(color) => updateSeries(row.dataKey, { color })} />
+                {isLineChart ? (
+                  <select
+                    className="modal-input compare-chart-marker-select"
+                    value={row.marker || "circle"}
+                    onChange={(e) => updateSeries(row.dataKey, { marker: e.target.value })}
+                    title="Point marker on line"
+                  >
+                    {SERIES_MARKER_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                <input
+                  type="range"
+                  min="0.05"
+                  max="1"
+                  step="0.05"
+                  value={row.opacity}
+                  onChange={(e) => updateSeries(row.dataKey, { opacity: Number(e.target.value) })}
+                />
+                <span className="muted">{Math.round((Number(row.opacity) || 1) * 100)}%</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="compare-chart-modal-section">
+          <h5>Axes</h5>
+          <div className="compare-chart-appearance-axis-block">
+            <label className="compare-chart-check">
+              <input
+                type="checkbox"
+                checked={draft.yAxisManual}
+                onChange={(e) => onDraftChange({ ...draft, yAxisManual: e.target.checked })}
+              />
+              <span>Manual Y range</span>
+            </label>
+            <p className="muted compare-chart-axis-hint">
+              Auto: {draft.yAxisAutoMin} – {draft.yAxisAutoMax}
+            </p>
+            <div className={`compare-chart-axis-range${draft.yAxisManual ? "" : " compare-chart-axis-range--disabled"}`}>
+              <label className="field-label">
+                Y min
+                <input
+                  type="number"
+                  className="modal-input"
+                  disabled={!draft.yAxisManual}
+                  value={draft.yAxisMin}
+                  onChange={(e) => onDraftChange({ ...draft, yAxisMin: Number(e.target.value) })}
+                />
+              </label>
+              <label className="field-label">
+                Y max
+                <input
+                  type="number"
+                  className="modal-input"
+                  disabled={!draft.yAxisManual}
+                  value={draft.yAxisMax}
+                  onChange={(e) => onDraftChange({ ...draft, yAxisMax: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+            <div className="compare-chart-appearance-global">
+              <label className="compare-chart-check">
+                <input
+                  type="checkbox"
+                  checked={draft.showXAxisTicks}
+                  onChange={(e) => onDraftChange({ ...draft, showXAxisTicks: e.target.checked })}
+                />
+                <span>X tick numbers</span>
+              </label>
+              <label className="compare-chart-check">
+                <input
+                  type="checkbox"
+                  checked={draft.showYAxisTicks}
+                  onChange={(e) => onDraftChange({ ...draft, showYAxisTicks: e.target.checked })}
+                />
+                <span>Y tick numbers</span>
+              </label>
+              <label className="compare-chart-check">
+                <input
+                  type="checkbox"
+                  checked={draft.showXAxisLabel}
+                  onChange={(e) => onDraftChange({ ...draft, showXAxisLabel: e.target.checked })}
+                />
+                <span>X axis label</span>
+              </label>
+              <label className="compare-chart-check">
+                <input
+                  type="checkbox"
+                  checked={draft.showYAxisLabel}
+                  onChange={(e) => onDraftChange({ ...draft, showYAxisLabel: e.target.checked })}
+                />
+                <span>Y axis label</span>
+              </label>
+            </div>
+            <div className="compare-chart-axis-range">
+              <label className="field-label">
+                X label text
+                <input
+                  type="text"
+                  className="modal-input"
+                  disabled={!draft.showXAxisLabel}
+                  value={draft.xAxisLabel}
+                  onChange={(e) => onDraftChange({ ...draft, xAxisLabel: e.target.value })}
+                />
+              </label>
+              <label className="field-label">
+                Y label text
+                <input
+                  type="text"
+                  className="modal-input"
+                  disabled={!draft.showYAxisLabel}
+                  value={draft.yAxisLabel}
+                  onChange={(e) => onDraftChange({ ...draft, yAxisLabel: e.target.value })}
+                />
+              </label>
+              <label className="field-label">
+                X tick size
+                <input
+                  type="number"
+                  className="modal-input"
+                  min={8}
+                  max={18}
+                  value={draft.xAxisTickFontSize}
+                  onChange={(e) => onDraftChange({ ...draft, xAxisTickFontSize: Number(e.target.value) })}
+                />
+              </label>
+              <label className="field-label">
+                Y tick size
+                <input
+                  type="number"
+                  className="modal-input"
+                  min={8}
+                  max={18}
+                  value={draft.yAxisTickFontSize}
+                  onChange={(e) => onDraftChange({ ...draft, yAxisTickFontSize: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section className="compare-chart-modal-section">
+          <h5>Display</h5>
+          <div className="compare-chart-appearance-global">
+            <label className="compare-chart-check">
+              <input
+                type="checkbox"
+                checked={draft.showGrid}
+                onChange={(e) => onDraftChange({ ...draft, showGrid: e.target.checked })}
+              />
+              <span>Show grid</span>
+            </label>
+            <label className="compare-chart-check">
+              <input
+                type="checkbox"
+                checked={draft.showLegend}
+                onChange={(e) => onDraftChange({ ...draft, showLegend: e.target.checked })}
+              />
+              <span>Show legend</span>
+            </label>
+            {chartType === "line" ? (
+              <label className="field-label compare-chart-line-width">
+                <span>Line width</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={draft.lineWidth}
+                  onChange={(e) => onDraftChange({ ...draft, lineWidth: Number(e.target.value) })}
+                />
+              </label>
+            ) : null}
+          </div>
+        </section>
+
+        <div className="compare-chart-modal-footer">
+          <button type="button" className="secondary-cta small" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="primary-cta small" disabled={visibleCount < 1} onClick={onSave}>
+            Save appearance
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function batchOptionLabel(item) {
   return `${item.result_label || item.batch_name} (${item.successful}/${item.total_topologies})`;
 }
 
 const MAX_CHART_SLOTS = 4;
 
+function hydrateBatchIds(stored) {
+  const base = emptyBatchIds(QUAD_COMPARE_SIDES);
+  if (!stored) return base;
+  QUAD_COMPARE_SIDES.forEach((sideId) => {
+    if (typeof stored[sideId] === "string") base[sideId] = stored[sideId];
+  });
+  return base;
+}
+
 export default function CompareChartWorkspace({
   apiBase,
   batchRunResults
 }) {
-  const [slotCount, setSlotCount] = useState(2);
-  const [batchIds, setBatchIds] = useState(() => emptyBatchIds(QUAD_COMPARE_SIDES));
+  const restoredSession = useMemo(() => readCompareChartWorkspaceSession(), []);
+  const [slotCount, setSlotCount] = useState(() => restoredSession?.slotCount ?? 2);
+  const [batchIds, setBatchIds] = useState(() => hydrateBatchIds(restoredSession?.batchIds));
   const [resultsBySide, setResultsBySide] = useState({});
   const [loadingBySide, setLoadingBySide] = useState({});
   const [errorsBySide, setErrorsBySide] = useState({});
@@ -759,10 +1387,24 @@ export default function CompareChartWorkspace({
   const densityLabels = useMemo(() => densityPairs.map((pair) => pair.densityLabel), [densityPairs]);
   const sideIds = useMemo(() => activeSideIds(normalizeCompareChartInput(compareChartInput)), [compareChartInput]);
 
-  const [chartConfigs, setChartConfigs] = useState([]);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [draft, setDraft] = useState(() => defaultDraft([]));
+  const [chartConfigs, setChartConfigs] = useState(() => restoredSession?.chartConfigs ?? []);
+  const [chartPresets, setChartPresets] = useState(() => readChartPresets());
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+  const [configDraft, setConfigDraft] = useState(() => defaultDraft([]));
+  const [presetSaveModalOpen, setPresetSaveModalOpen] = useState(false);
+  const [presetSaveChartId, setPresetSaveChartId] = useState(null);
+  const [presetNameDraft, setPresetNameDraft] = useState("");
+  const [appearanceModalOpen, setAppearanceModalOpen] = useState(false);
+  const [appearanceChartId, setAppearanceChartId] = useState(null);
+  const [appearanceDraft, setAppearanceDraft] = useState(null);
+  const panelRefs = useRef({});
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      writeCompareChartWorkspaceSession({ slotCount, batchIds, chartConfigs });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [slotCount, batchIds, chartConfigs]);
 
   const setChartSlotCount = (nextCount) => {
     const clamped = Math.max(1, Math.min(MAX_CHART_SLOTS, Number(nextCount) || 1));
@@ -797,55 +1439,213 @@ export default function CompareChartWorkspace({
   const selectedBatchCount = activeSides.filter((sideId) => batchIds[sideId]).length;
 
   const openNewChart = () => {
-    setDraft(defaultDraft(densityLabels));
-    setEditingId(null);
-    setModalOpen(true);
+    setConfigDraft(defaultDraft(densityLabels));
+    setConfigModalOpen(true);
   };
 
-  const openEditChart = (chartId) => {
+  const handleConfigPresetSelect = (presetId) => {
+    if (!presetId) {
+      setConfigDraft(defaultDraft(densityLabels));
+      return;
+    }
+    const preset = chartPresets.find((item) => item.id === presetId);
+    const nextDraft = applyChartPresetToDraft(preset?.config, densityLabels, catalog);
+    if (!nextDraft) {
+      window.alert("This preset cannot be applied with the current batch data.");
+      return;
+    }
+    setConfigDraft({ ...nextDraft, presetId });
+  };
+
+  const handleDeleteChartPreset = (presetId) => {
+    if (!presetId) return;
+    if (!window.confirm("Delete this chart preset?")) return;
+    const next = deleteChartPreset(presetId);
+    setChartPresets(next);
+    if (configDraft.presetId === presetId) {
+      setConfigDraft(defaultDraft(densityLabels));
+    }
+  };
+
+  const openSaveChartPreset = (chartId, chartIdx) => {
+    const chart = chartConfigs.find((item) => item.id === chartId);
+    if (!chart) return;
+    const chartUi = chartUiForDisplay(chart, catalogMap);
+    const defaultLabel =
+      chartUi.chartTitle?.trim() || resolvePanelTitle(chart, chartIdx) || `Chart preset ${chartPresets.length + 1}`;
+    setPresetSaveChartId(chartId);
+    setPresetNameDraft(defaultLabel);
+    setPresetSaveModalOpen(true);
+  };
+
+  const confirmSaveChartPreset = () => {
+    const chart = chartConfigs.find((item) => item.id === presetSaveChartId);
+    if (!chart) {
+      setPresetSaveModalOpen(false);
+      return;
+    }
+    const saved = saveChartPreset(presetNameDraft, chart);
+    if (!saved) {
+      window.alert("Could not save preset (chart has no valid metrics).");
+      return;
+    }
+    setChartPresets(readChartPresets());
+    setPresetSaveModalOpen(false);
+    setPresetSaveChartId(null);
+    setPresetNameDraft("");
+  };
+
+  const buildChartRowsForAxis = useCallback(
+    (chart) => {
+      const topoKeys = chart.selectedMetricKeys.filter((key) => catalogMap.get(key)?.scope === "topology");
+      const densityKeys = chart.selectedMetricKeys.filter((key) => catalogMap.get(key)?.scope === "density");
+      if (chart.mode === "densityMean") {
+        return buildDensityMeanRows(compareChartInput, topoKeys, densityKeys).filter((row) =>
+          chart.selectedDensityLabels.includes(row.densityLabel)
+        );
+      }
+      const selectedPairMap = new Map(
+        densityPairs
+          .filter((pair) => chart.selectedDensityLabels.includes(pair.densityLabel))
+          .map((pair) => [pair.densityLabel, pair])
+      );
+      const rows = [];
+      chart.selectedDensityLabels.forEach((densityLabel) => {
+        const pair = selectedPairMap.get(densityLabel);
+        if (pair) {
+          rows.push(...buildPerDensityChartRows(pair, chart.selectedMetricKeys, sideIds));
+        }
+      });
+      return rows;
+    },
+    [catalogMap, compareChartInput, densityPairs, sideIds]
+  );
+
+  const openEditChart = (chartId, chartIdx) => {
     const found = chartConfigs.find((item) => item.id === chartId);
     if (!found) return;
-    setEditingId(chartId);
-    setDraft({
-      mode: found.mode,
+    const metricKeys = filterMetricKeysWithLowerBound(found.selectedMetricKeys, compareChartInput);
+    const baseDefs = seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById, compareChartInput);
+    const plotDefs = filterPlotDefs(
+      applySeriesStyles(baseDefs, found.ui?.seriesStyles ?? {}, metricKeys),
+      found.mode
+    );
+    const axisRows = buildChartRowsForAxis(found);
+    const autoYDomain = computeChartAutoYDomain({
+      rows: axisRows,
+      plotDefs,
       chartType: found.chartType,
-      selectedMetricKeys: [...found.selectedMetricKeys],
-      selectedDensityLabels: [...found.selectedDensityLabels]
+      chartMode: found.mode,
+      ui: mergeChartUi(found.ui),
+      sideIds,
+      compareChartInput
     });
-    setModalOpen(true);
+    setAppearanceChartId(chartId);
+    setAppearanceDraft(
+      buildAppearanceDraft(found, baseDefs, chartIdx, {
+        autoYDomain,
+        catalogMap,
+        defaultAxisLabels: defaultChartAxisLabels(found.mode, found.selectedMetricKeys, catalogMap)
+      })
+    );
+    setAppearanceModalOpen(true);
   };
 
-  const saveChart = () => {
+  const saveNewChart = () => {
     const sanitized = {
-      mode: draft.mode,
-      chartType: draft.chartType,
-      selectedMetricKeys: [...new Set(draft.selectedMetricKeys)],
-      selectedDensityLabels: [...new Set(draft.selectedDensityLabels)]
+      mode: configDraft.mode,
+      chartType: configDraft.chartType,
+      selectedMetricKeys: [...new Set(configDraft.selectedMetricKeys)],
+      selectedDensityLabels: [...new Set(configDraft.selectedDensityLabels)]
     };
     if (!sanitized.selectedMetricKeys.length || !sanitized.selectedDensityLabels.length) return;
-    if (editingId) {
-      setChartConfigs((prev) =>
-        prev.map((chart) =>
-          chart.id === editingId
-            ? {
-                ...chart,
-                ...sanitized
-              }
-            : chart
-        )
-      );
-    } else {
-      setChartConfigs((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          ...sanitized,
-          ui: defaultChartUi()
-        }
-      ]);
+    setChartConfigs((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        ...sanitized,
+        ui: (() => {
+          const base = configDraft.presetUi ? mergeChartUi(configDraft.presetUi) : defaultChartUi();
+          const yDefault = defaultYAxisLabelFromMetrics(sanitized.selectedMetricKeys, catalogMap);
+          return {
+            ...base,
+            yAxisLabel: String(base.yAxisLabel ?? "").trim() || yDefault,
+            showYAxisLabel: base.showYAxisLabel !== false
+          };
+        })()
+      }
+    ]);
+    setConfigModalOpen(false);
+  };
+
+  const saveAppearance = () => {
+    if (!appearanceChartId || !appearanceDraft) return;
+    if (!appearanceDraft.series.some((row) => !row.hidden)) return;
+    if (
+      appearanceDraft.yAxisManual &&
+      Number(appearanceDraft.yAxisMax) <= Number(appearanceDraft.yAxisMin)
+    ) {
+      window.alert("Y max must be greater than Y min.");
+      return;
     }
-    setModalOpen(false);
-    setEditingId(null);
+    setChartConfigs((prev) =>
+      prev.map((chart) =>
+        chart.id === appearanceChartId
+          ? {
+              ...chart,
+              ui: appearanceDraftToUi(appearanceDraft, mergeChartUi(chart.ui))
+            }
+          : chart
+      )
+    );
+    setAppearanceModalOpen(false);
+    setAppearanceChartId(null);
+    setAppearanceDraft(null);
+  };
+
+  const downloadChartPdf = async (chartId, title) => {
+    const panel = panelRefs.current[chartId];
+    try {
+      const ok = await downloadPanelChartsAsPdf(panel, title);
+      if (!ok) {
+        window.alert("Chart PDF is not ready yet. Wait for the chart to finish rendering.");
+      }
+    } catch (err) {
+      console.error(err);
+      window.alert("Could not export IEEE figure PDF. Try again after the chart finishes rendering.");
+    }
+  };
+
+  const downloadChartLatex = (chartId, chart, chartIdx) => {
+    const chartUi = chartUiForDisplay(chart, catalogMap);
+    const metricKeys = filterMetricKeysWithLowerBound(chart.selectedMetricKeys, compareChartInput);
+    const defs = applySeriesStyles(
+      seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById, compareChartInput),
+      chartUi.seriesStyles,
+      metricKeys
+    );
+    const defaultCardTitle = chart.mode === "densityMean" ? "Density mean comparison" : "";
+    const figures = buildChartFiguresForPanel({
+      chart,
+      chartUi,
+      defs,
+      densityPairs,
+      sideIds,
+      compareChartInput,
+      catalogMap,
+      defaultCardTitle
+    });
+    const panelTitle = resolvePanelTitle(chart, chartIdx);
+    if (
+      !downloadPanelChartsAsLatex(figures, {
+        chart,
+        chartIdx,
+        chartUi,
+        panelTitle
+      })
+    ) {
+      window.alert("No chart data to export as LaTeX.");
+    }
   };
 
   const removeChart = (id) => {
@@ -920,9 +1720,13 @@ export default function CompareChartWorkspace({
       <div className="compare-chart-cards">
         {chartReady
           ? chartConfigs.map((chart, idx) => {
-          const defs = seriesDefs(chart.selectedMetricKeys, catalogMap, sideIds, sideLabelsById);
-          const markerByMetric = buildMarkerByMetric(chart.selectedMetricKeys);
-          const titleMetrics = metricSummary(chart.selectedMetricKeys, catalogMap);
+          const chartUi = chartUiForDisplay(chart, catalogMap);
+          const metricKeys = filterMetricKeysWithLowerBound(chart.selectedMetricKeys, compareChartInput);
+          const baseDefs = seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById, compareChartInput);
+          const defs = applySeriesStyles(baseDefs, chartUi.seriesStyles, metricKeys);
+          const titleMetrics = metricSummary(metricKeys, catalogMap);
+          const panelTitle = resolvePanelTitle(chart, idx);
+          const defaultCardTitle = chart.mode === "densityMean" ? "Density mean comparison" : "";
           const selectedPairMap = new Map(
             densityPairs
               .filter((pair) => chart.selectedDensityLabels.includes(pair.densityLabel))
@@ -936,14 +1740,38 @@ export default function CompareChartWorkspace({
           );
 
           return (
-            <div key={chart.id} className="compare-chart-panel">
+            <div
+              key={chart.id}
+              className="compare-chart-panel"
+              ref={(el) => {
+                if (el) panelRefs.current[chart.id] = el;
+                else delete panelRefs.current[chart.id];
+              }}
+            >
               <div className="compare-chart-panel-header">
-                <strong>
-                  Chart {idx + 1}: {formatMode(chart.mode)} · {chart.chartType === "bar" ? "bar" : "line"}
-                </strong>
+                <strong>{panelTitle}</strong>
                 <div className="compare-chart-panel-actions">
-                  <button type="button" className="secondary-cta small" onClick={() => openEditChart(chart.id)}>
+                  <button
+                    type="button"
+                    className="secondary-cta small"
+                    title="IEEE single-column PDF (3.5×2.4 in, 7–8 pt fonts)"
+                    onClick={() => downloadChartPdf(chart.id, panelTitle)}
+                  >
+                    Download PDF
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-cta small"
+                    title="pgfplots/TikZ snippet (3.5×2.4 in, 7–8 pt)"
+                    onClick={() => downloadChartLatex(chart.id, chart, idx)}
+                  >
+                    Download LaTeX
+                  </button>
+                  <button type="button" className="secondary-cta small" onClick={() => openEditChart(chart.id, idx)}>
                     Edit
+                  </button>
+                  <button type="button" className="secondary-cta small" onClick={() => openSaveChartPreset(chart.id, idx)}>
+                    Save preset
                   </button>
                   <button type="button" className="danger-ghost-btn" onClick={() => removeChart(chart.id)}>
                     Remove
@@ -959,23 +1787,23 @@ export default function CompareChartWorkspace({
                   return (
                     <ChartCard
                       key={`${chart.id}-${densityLabel}`}
-                      title={`Density ${densityLabel}`}
+                      title={chartUi.cardTitle?.trim() || `Density ${densityLabel}`}
                       rows={rows}
                       xKey="x"
                       xTickFormatter={(value) => (Number(value) === 0 ? "0*" : String(value))}
                       chartType={chart.chartType}
                       defs={defs}
-                      ui={chart.ui ?? defaultChartUi()}
-                      markerByMetric={markerByMetric}
+                      ui={chartUi}
                       chartMode={chart.mode}
                       sideIds={sideIds}
                       sideLabelsById={sideLabelsById}
+                      compareChartInput={compareChartInput}
                     />
                   );
                 })
               ) : (
                 <ChartCard
-                  title="Density mean comparison"
+                  title={chartUi.cardTitle?.trim() || defaultCardTitle || "Density mean comparison"}
                   rows={meanRows}
                   xKey="x"
                   xTickFormatter={(value) => {
@@ -985,11 +1813,11 @@ export default function CompareChartWorkspace({
                   }}
                   chartType={chart.chartType}
                   defs={defs}
-                  ui={chart.ui ?? defaultChartUi()}
-                  markerByMetric={markerByMetric}
+                  ui={chartUi}
                   chartMode={chart.mode}
                   sideIds={sideIds}
                   sideLabelsById={sideLabelsById}
+                  compareChartInput={compareChartInput}
                 />
               )}
             </div>
@@ -999,17 +1827,43 @@ export default function CompareChartWorkspace({
       </div>
 
       <ChartConfigModal
-        open={modalOpen}
-        title={editingId ? "Edit chart config" : "Create new chart"}
-        draft={draft}
+        open={configModalOpen}
+        title="Create new chart"
+        draft={configDraft}
         densityLabels={densityLabels}
         catalog={catalog}
-        onClose={() => {
-          setModalOpen(false);
-          setEditingId(null);
+        presets={chartPresets}
+        onPresetSelect={handleConfigPresetSelect}
+        onPresetDelete={handleDeleteChartPreset}
+        onClose={() => setConfigModalOpen(false)}
+        onDraftChange={setConfigDraft}
+        onSave={saveNewChart}
+      />
+
+      <ChartPresetNameModal
+        open={presetSaveModalOpen}
+        value={presetNameDraft}
+        setValue={setPresetNameDraft}
+        defaultLabel="Chart preset"
+        onCancel={() => {
+          setPresetSaveModalOpen(false);
+          setPresetSaveChartId(null);
+          setPresetNameDraft("");
         }}
-        onDraftChange={setDraft}
-        onSave={saveChart}
+        onConfirm={confirmSaveChartPreset}
+      />
+
+      <ChartAppearanceModal
+        open={appearanceModalOpen}
+        draft={appearanceDraft}
+        chartType={chartConfigs.find((c) => c.id === appearanceChartId)?.chartType ?? "line"}
+        onClose={() => {
+          setAppearanceModalOpen(false);
+          setAppearanceChartId(null);
+          setAppearanceDraft(null);
+        }}
+        onDraftChange={setAppearanceDraft}
+        onSave={saveAppearance}
       />
     </section>
   );

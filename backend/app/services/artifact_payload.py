@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from app.core.paths import artifact_root_for_run
 from app.services.run_artifacts import (
     bundle_as_run_summary,
     episodes_to_delay_csv_text,
@@ -14,8 +15,7 @@ from app.services.run_artifacts import (
 
 
 def _artifact_root(run_id: str) -> Path:
-    # backend/app/services -> QBR repo root (same as app.core.db)
-    return Path(__file__).resolve().parents[3] / "storage" / "artifacts" / run_id
+    return artifact_root_for_run(run_id)
 
 
 def _load_bundle(run_id: str, uri_path: Path | None = None) -> dict[str, Any] | None:

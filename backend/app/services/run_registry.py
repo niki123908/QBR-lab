@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.services.runners.base import AlgorithmRunner
+from app.services.runners.cf_cas_runner import execute_cf_cas
 from app.services.runners.greedy_runner import execute_greedy
 from app.services.runners.qbr_runner import execute_qbr
 
@@ -33,6 +34,7 @@ _QBR_DEFAULT_CONFIG: dict[str, Any] = {
     "temperature_decay_mode": "linear",
     "ucb_c": 1.414,
     "action_axis": "broadcaster",
+    "spread_mode": "normal",
     "completion_bonus_multiplier": 1.0,
     "coverage_reward_enabled": True,
     "lambda_param": 0.0,
@@ -48,6 +50,7 @@ _QBR_CONFIG_SCHEMA: dict[str, Any] = {
         "gamma": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.8},
         "policy_type": {"type": "string", "enum": ["epsilon_greedy", "softmax", "ucb"], "default": "epsilon_greedy"},
         "action_axis": {"type": "string", "enum": ["broadcaster", "receiver"], "default": "broadcaster"},
+        "spread_mode": {"type": "string", "enum": ["normal", "la"], "default": "normal"},
         "epsilon_start": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0},
         "epsilon_end": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.01},
         "epsilon_decay": {"type": "number", "minimum": 0.0, "default": 0.001},
@@ -85,15 +88,25 @@ _QBR_CAPABILITIES: dict[str, bool] = {
     "has_path_signatures": True,
 }
 
-_GREEDY_DEFAULT_CONFIG: dict[str, Any] = {}
+_GREEDY_DEFAULT_CONFIG: dict[str, Any] = {
+    "action_axis": "broadcaster",
+    "spread_mode": "normal",
+}
 
 _GREEDY_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "action_axis": {"type": "string", "enum": ["broadcaster", "receiver"], "default": "broadcaster"},
+        "spread_mode": {"type": "string", "enum": ["normal", "la"], "default": "normal"},
+    },
     "required": [],
 }
 
 _RUN_CONFIG_META_KEYS = frozenset({"run_seed"})
+
+
+def _pick_allowed_config(merged: dict[str, Any], allowed_keys: set[str]) -> dict[str, Any]:
+    return {key: merged[key] for key in merged if key in allowed_keys}
 
 
 def allocate_unique_run_seed() -> int:
@@ -122,6 +135,16 @@ _GREEDY_CAPABILITIES: dict[str, bool] = {
     "has_epoch_compare": False,
     "has_path_signatures": False,
 }
+
+_CF_CAS_DEFAULT_CONFIG: dict[str, Any] = {}
+
+_CF_CAS_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+_CF_CAS_CAPABILITIES: dict[str, bool] = dict(_GREEDY_CAPABILITIES)
 
 
 def _resolve_qbr_config(
@@ -152,6 +175,7 @@ def _resolve_qbr_config(
         temperature_decay = float(merged["temperature_decay"])
         temperature_decay_mode = str(merged["temperature_decay_mode"])
         action_axis = str(merged["action_axis"])
+        spread_mode = str(merged["spread_mode"])
         completion_bonus_multiplier = float(merged["completion_bonus_multiplier"])
         raw_coverage_reward_enabled = merged["coverage_reward_enabled"]
         lambda_param = float(merged["lambda_param"])
@@ -176,6 +200,8 @@ def _resolve_qbr_config(
     if temperature_decay_mode not in {"linear", "multiplicative"}:
         raise ValueError("Failed.")
     if action_axis not in {"broadcaster", "receiver"}:
+        raise ValueError("Failed.")
+    if spread_mode not in {"normal", "la"}:
         raise ValueError("Failed.")
     if action_aggregation_mode not in {"off", "exact_next_state", "incremental_merge"}:
         raise ValueError("Failed.")
@@ -255,6 +281,7 @@ def _resolve_qbr_config(
         "temperature_decay_mode": temperature_decay_mode,
         "ucb_c": ucb_c,
         "action_axis": action_axis,
+        "spread_mode": spread_mode,
         "completion_bonus_multiplier": completion_bonus_multiplier,
         "coverage_reward_enabled": coverage_reward_enabled,
         "lambda_param": lambda_param,
@@ -274,10 +301,33 @@ def _resolve_greedy_config(
 
     merged = {**_GREEDY_DEFAULT_CONFIG, **preset, **(run_config or {})}
     allowed_keys = set(_GREEDY_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
-    unknown_keys = [key for key in merged.keys() if key not in allowed_keys]
-    if unknown_keys:
+    picked = _pick_allowed_config(merged, allowed_keys)
+    action_axis = str(picked.get("action_axis", "broadcaster"))
+    spread_mode = str(picked.get("spread_mode", "normal"))
+    if action_axis not in {"broadcaster", "receiver"}:
         raise ValueError("Failed.")
-    run_seed = _resolve_run_seed_value(merged)
+    if spread_mode not in {"normal", "la"}:
+        raise ValueError("Failed.")
+    run_seed = _resolve_run_seed_value(picked)
+    return {
+        "action_axis": action_axis,
+        "spread_mode": spread_mode,
+        "run_seed": run_seed,
+    }
+
+
+def _resolve_cf_cas_config(
+    run_config: dict[str, Any], preset_id: str, topology_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    _ = topology_context
+    preset: dict[str, Any] = {}
+    if preset_id == "default_v1":
+        preset = {}
+
+    merged = {**_CF_CAS_DEFAULT_CONFIG, **preset, **(run_config or {})}
+    allowed_keys = set(_CF_CAS_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
+    picked = _pick_allowed_config(merged, allowed_keys)
+    run_seed = _resolve_run_seed_value(picked)
     return {"run_seed": run_seed}
 
 
@@ -289,6 +339,10 @@ _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "greedy": AlgorithmSpec(
         runner=execute_greedy,
         resolve_and_validate_config=_resolve_greedy_config,
+    ),
+    "cf_cas": AlgorithmSpec(
+        runner=execute_cf_cas,
+        resolve_and_validate_config=_resolve_cf_cas_config,
     ),
 }
 
@@ -309,6 +363,14 @@ _ALGORITHMS_METADATA: list[dict[str, Any]] = [
         "default_config": _GREEDY_DEFAULT_CONFIG,
         "config_schema": _GREEDY_CONFIG_SCHEMA,
         "capabilities": _GREEDY_CAPABILITIES,
+    },
+    {
+        "algorithm_id": "cf_cas",
+        "display_name": "CF-CAS",
+        "version": "v1",
+        "default_config": _CF_CAS_DEFAULT_CONFIG,
+        "config_schema": _CF_CAS_CONFIG_SCHEMA,
+        "capabilities": _CF_CAS_CAPABILITIES,
     },
 ]
 

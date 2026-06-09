@@ -92,6 +92,7 @@ def train_with_template(
     lambda_param: float = 0.0,
     trace_threshold: float = 0.01,
     action_axis: str = "broadcaster",
+    spread_mode: str = "normal",
     action_aggregation_mode: str = AGGREGATION_MODE_OFF,
     q_snapshot_episodes: set[int] | None = None,
 ) -> TrainingResult:
@@ -172,6 +173,7 @@ def train_with_template(
                     action_candidates,
                     encode_state=state_encoder.encode_state,
                     action_axis=action_axis,
+                    spread_mode=spread_mode,
                     completion_bonus_multiplier=completion_bonus_multiplier,
                     coverage_reward_enabled=coverage_reward_enabled,
                 )
@@ -192,6 +194,7 @@ def train_with_template(
                 completion_bonus_multiplier=completion_bonus_multiplier,
                 coverage_reward_enabled=coverage_reward_enabled,
                 action_axis=action_axis,
+                spread_mode=spread_mode,
             )
             next_state = list(set(next_state))
             next_state_hash = state_encoder.encode_state(next_state)

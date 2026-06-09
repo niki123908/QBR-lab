@@ -13,16 +13,26 @@ BACKEND_DIR = ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from app.core.env import ensure_qbr_env
+
+ensure_qbr_env()
+
 from app.core.db import init_db
-from app.repositories.run_repo import claim_next_queued_run, heartbeat_run, requeue_stale_runs
+from app.repositories.run_repo import (
+    claim_next_queued_run,
+    heartbeat_run,
+    requeue_stale_runs,
+    run_is_owned_by_worker,
+)
 from app.services.run_engine_service import execute_queued_batch_run, execute_queued_single_run
 
 
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{os.getpid()}")
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "2"))
 HEARTBEAT_INTERVAL_SEC = float(os.getenv("HEARTBEAT_INTERVAL_SEC", "5"))
-STALE_AFTER_SEC = int(os.getenv("STALE_AFTER_SEC", "30"))
-STALE_SWEEP_INTERVAL_SEC = float(os.getenv("STALE_SWEEP_INTERVAL_SEC", "10"))
+STALE_AFTER_SEC = int(os.getenv("STALE_AFTER_SEC", "180"))
+STALE_CLAIM_GRACE_SEC = int(os.getenv("STALE_CLAIM_GRACE_SEC", "60"))
+STALE_SWEEP_INTERVAL_SEC = float(os.getenv("STALE_SWEEP_INTERVAL_SEC", "15"))
 
 
 def _run_heartbeat_loop(run_id: str, stop_event: threading.Event) -> None:
@@ -41,7 +51,10 @@ def run_worker_loop(stop_event: threading.Event | None = None, *, worker_id: str
         while stop_event is None or not stop_event.is_set():
             now = time.monotonic()
             if now - last_stale_sweep >= STALE_SWEEP_INTERVAL_SEC:
-                reclaimed = requeue_stale_runs(stale_after_seconds=STALE_AFTER_SEC)
+                reclaimed = requeue_stale_runs(
+                    stale_after_seconds=STALE_AFTER_SEC,
+                    claim_grace_seconds=STALE_CLAIM_GRACE_SEC,
+                )
                 if reclaimed:
                     print(f"[worker] reclaimed stale runs: {', '.join(reclaimed)}")
                 last_stale_sweep = now
@@ -55,6 +68,9 @@ def run_worker_loop(stop_event: threading.Event | None = None, *, worker_id: str
                 continue
 
             print(f"[worker] claimed {claimed.mode} run {claimed.run_id} for topology {claimed.topology_id}")
+            if not run_is_owned_by_worker(claimed.run_id, WORKER_ID):
+                print(f"[worker] lost claim on {claimed.run_id}, skipping")
+                continue
             heartbeat_stop = threading.Event()
             heartbeat_thread = threading.Thread(
                 target=_run_heartbeat_loop,
@@ -64,9 +80,9 @@ def run_worker_loop(stop_event: threading.Event | None = None, *, worker_id: str
             heartbeat_thread.start()
             try:
                 if claimed.mode == "single":
-                    execute_queued_single_run(claimed.run_id)
+                    execute_queued_single_run(claimed.run_id, worker_id=WORKER_ID)
                 else:
-                    execute_queued_batch_run(claimed.run_id)
+                    execute_queued_batch_run(claimed.run_id, worker_id=WORKER_ID)
                 print(f"[worker] completed {claimed.mode} run {claimed.run_id}")
             except KeyboardInterrupt:
                 raise

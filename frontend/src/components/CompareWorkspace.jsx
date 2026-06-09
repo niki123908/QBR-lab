@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import CompareChartWorkspace from "./CompareChartWorkspace.jsx";
+import { readCompareWorkspaceSession, writeCompareWorkspaceSession } from "../utils/compareWorkspaceStorage.js";
 import BatchResultDetailBody, {
   boxplotYAxisFromDensityGroups,
   delayAxisByDensityFromResults,
@@ -253,20 +254,28 @@ export default function CompareWorkspace({
   bestDelayOverlayOpacity = 1,
   onCompareExportChange
 }) {
-  const [compareKind, setCompareKind] = useState("batch");
+  const restoredCompare = useMemo(() => readCompareWorkspaceSession(), []);
+  const [compareKind, setCompareKind] = useState(() => restoredCompare?.compareKind ?? "batch");
   const isChartMode = compareKind === "chart";
   const isBatchMode = compareKind === "batch";
 
-  const [batchIdA, setBatchIdA] = useState("");
-  const [batchIdB, setBatchIdB] = useState("");
+  const [batchIdA, setBatchIdA] = useState(() => restoredCompare?.batchIdA ?? "");
+  const [batchIdB, setBatchIdB] = useState(() => restoredCompare?.batchIdB ?? "");
   const [resultA, setResultA] = useState(null);
   const [resultB, setResultB] = useState(null);
   const [loadingA, setLoadingA] = useState(false);
   const [loadingB, setLoadingB] = useState(false);
   const [errorA, setErrorA] = useState(null);
   const [errorB, setErrorB] = useState(null);
-  const [filterA, setFilterA] = useState("all");
-  const [filterB, setFilterB] = useState("all");
+  const [filterA, setFilterA] = useState(() => restoredCompare?.filterA ?? "all");
+  const [filterB, setFilterB] = useState(() => restoredCompare?.filterB ?? "all");
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      writeCompareWorkspaceSession({ compareKind, batchIdA, batchIdB, filterA, filterB });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [compareKind, batchIdA, batchIdB, filterA, filterB]);
 
   const [topoIdA, setTopoIdA] = useState("");
   const [topoIdB, setTopoIdB] = useState("");
@@ -414,6 +423,12 @@ export default function CompareWorkspace({
   }, [compareKind, resultA, resultB]);
 
   useEffect(() => {
+    if (!onCompareExportChange || compareKind !== "chart") return;
+    onCompareExportChange({ compareKind: "chart" });
+  }, [onCompareExportChange, compareKind]);
+
+  useEffect(() => {
+    if (!onCompareExportChange || compareKind === "chart") return;
     const compareChartInput = {
       ready: compareKind === "batch" && !!resultA && !!resultB,
       compareKind,
@@ -422,7 +437,7 @@ export default function CompareWorkspace({
       batchIdA,
       batchIdB
     };
-    onCompareExportChange?.({
+    onCompareExportChange({
       compareKind,
       resultA,
       resultB,

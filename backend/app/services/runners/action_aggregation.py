@@ -50,6 +50,7 @@ def _probe_next_state_hash(
     action_id: int,
     *,
     action_axis: str,
+    spread_mode: str = "normal",
     completion_bonus_multiplier: float,
     coverage_reward_enabled: bool = True,
     encode_state: Callable[[list[int]], str],
@@ -62,6 +63,7 @@ def _probe_next_state_hash(
             completion_bonus_multiplier=completion_bonus_multiplier,
             coverage_reward_enabled=coverage_reward_enabled,
             action_axis=action_axis,
+            spread_mode=spread_mode,
         )
     finally:
         env.V_ns = v_ns_snapshot
@@ -83,6 +85,7 @@ class StateActionRegistry:
         *,
         encode_state: Callable[[list[int]], str],
         action_axis: str,
+        spread_mode: str = "normal",
         completion_bonus_multiplier: float,
         coverage_reward_enabled: bool = True,
     ) -> list[ActionGroup]:
@@ -100,6 +103,7 @@ class StateActionRegistry:
                 env,
                 action_id,
                 action_axis=action_axis,
+                spread_mode=spread_mode,
                 completion_bonus_multiplier=completion_bonus_multiplier,
                 coverage_reward_enabled=coverage_reward_enabled,
                 encode_state=encode_state,

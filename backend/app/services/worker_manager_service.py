@@ -5,13 +5,12 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
-
+from app.core.paths import qbr_root
 from app.repositories.run_repo import requeue_runs_for_worker
 
-
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = qbr_root()
 WORKER_SCRIPT = ROOT / "worker" / "jobs" / "worker_main.py"
+MAX_MANAGED_WORKERS = max(1, int(os.getenv("QBR_MAX_MANAGED_WORKERS", "4")))
 
 
 @dataclass
@@ -54,6 +53,10 @@ def spawn_managed_worker() -> dict[str, object]:
         raise ValueError("Failed.")
 
     _cleanup_dead_workers()
+    if len(_managed_workers) >= MAX_MANAGED_WORKERS:
+        raise ValueError(
+            f"Failed: max {MAX_MANAGED_WORKERS} managed workers (npm run dev already starts one worker process)."
+        )
     worker_id = f"worker-{uuid.uuid4().hex[:8]}"
     env = os.environ.copy()
     env["WORKER_ID"] = worker_id

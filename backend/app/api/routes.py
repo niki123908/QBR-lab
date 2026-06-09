@@ -84,6 +84,7 @@ from app.services.topology_service import (
     stage_topology_node_update,
 )
 from app.services.run_engine_service import resume_batch_job as resume_batch_job_service
+from app.services.run_engine_service import retry_failed_batch_job as retry_failed_batch_job_service
 from app.services.run_engine_service import run_batch_topologies as run_batch_topologies_service
 from app.services.run_engine_service import run_single_topology as run_single_topology_service
 from app.services.worker_manager_service import kill_managed_worker, list_managed_workers, spawn_managed_worker
@@ -98,8 +99,8 @@ router = APIRouter()
 
 
 def _preset_record_to_out(rec: PresetRecord) -> RunPresetOut:
-    backbone = rec.backbone if rec.backbone in ("qbr", "greedy") else "greedy"
-    algorithm_id = rec.algorithm_id if rec.algorithm_id in ("qbr", "greedy") else backbone
+    backbone = rec.backbone if rec.backbone in ("qbr", "greedy", "cf_cas") else "greedy"
+    algorithm_id = rec.algorithm_id if rec.algorithm_id in ("qbr", "greedy", "cf_cas") else backbone
     return RunPresetOut(id=rec.id, label=rec.label, backbone=backbone, algorithm_id=algorithm_id, run_config=rec.run_config)
 
 
@@ -790,6 +791,15 @@ def resume_batch(batch_run_id: str) -> MessageResponse:
     if not ok:
         raise AppError(message=msg or "Failed.", status_code=400)
     return MessageResponse(message="Resumed.")
+
+
+@router.post("/runs/batch/{batch_run_id}/retry-failed")
+def retry_failed_batch(batch_run_id: str) -> MessageResponse:
+    """Re-queue all failed runs in a completed (or stopped) batch."""
+    ok, msg, count = retry_failed_batch_job_service(batch_run_id)
+    if not ok:
+        raise AppError(message=msg or "Failed.", status_code=400)
+    return MessageResponse(message=f"Re-queued {count} failed run(s).")
 
 
 @router.delete("/runs/batch/{batch_run_id}", response_model=MessageResponse)

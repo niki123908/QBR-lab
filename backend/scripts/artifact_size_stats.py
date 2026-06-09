@@ -1,13 +1,24 @@
 """One-off stats: artifact folder size by run type."""
 from __future__ import annotations
 
-import sqlite3
 import statistics
+import sys
 from pathlib import Path
 
+from sqlalchemy import inspect as sa_inspect, text
+
 ROOT = Path(__file__).resolve().parents[2]
-DB = ROOT / "storage" / "db" / "qbr.db"
-ART = ROOT / "storage" / "artifacts"
+BACKEND_DIR = ROOT / "backend"
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from app.core.db import engine, init_db
+from app.core.env import ensure_qbr_env
+from app.core.paths import storage_root
+
+ensure_qbr_env()
+
+ART = storage_root() / "artifacts"
 
 FULL_ARTIFACT_NAMES = {
     "resolved_run_config.json",
@@ -54,22 +65,19 @@ def summarize(label: str, sizes_mb: list[float]) -> None:
 
 
 def main() -> None:
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    init_db()
+    inspector = sa_inspect(engine)
+    print("runs columns:", [c["name"] for c in inspector.get_columns("runs")])
 
-    cur.execute("PRAGMA table_info(runs)")
-    run_cols = [r[1] for r in cur.fetchall()]
-    print("runs columns:", run_cols)
-
-    cur.execute("SELECT id, status, mode FROM runs WHERE status = 'done' LIMIT 5")
-    print("sample done runs:", [dict(r) for r in cur.fetchall()])
-
-    cur.execute("SELECT mode, COUNT(*) FROM runs GROUP BY mode")
-    print("runs by mode:", cur.fetchall())
-
-    cur.execute("SELECT id, status, mode FROM runs")
-    all_runs = [(str(r["id"]), r["status"], str(r["mode"] or "single")) for r in cur.fetchall()]
+    with engine.connect() as conn:
+        sample = conn.execute(text("SELECT id, status, mode FROM runs WHERE status = 'done' LIMIT 5")).fetchall()
+        print("sample done runs:", [dict(row._mapping) for row in sample])
+        by_mode = conn.execute(text("SELECT mode, COUNT(*) FROM runs GROUP BY mode")).fetchall()
+        print("runs by mode:", by_mode)
+        all_runs = [
+            (str(row.id), row.status, str(row.mode or "single"))
+            for row in conn.execute(text("SELECT id, status, mode FROM runs")).fetchall()
+        ]
 
     single_mb: list[float] = []
     batch_mb: list[float] = []
@@ -77,7 +85,7 @@ def main() -> None:
     partial_mb: list[float] = []
     empty_count = 0
 
-    for run_id, status, mode in all_runs:
+    for run_id, _status, mode in all_runs:
         b = folder_bytes(run_id)
         mb = b / (1024 * 1024)
         names = file_names(run_id)
@@ -105,8 +113,6 @@ def main() -> None:
     summarize("Full artifact set (~11 files)", full_mb)
     summarize("Partial artifact set", partial_mb)
     summarize("All non-empty folders", single_mb + batch_mb)
-
-    conn.close()
 
 
 if __name__ == "__main__":

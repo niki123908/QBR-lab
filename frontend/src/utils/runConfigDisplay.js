@@ -2,7 +2,7 @@
 
 export const CONFIG_FIELD_BLOCKS = [
   { id: "core", title: "Core parameters", fields: ["core_parameters"] },
-  { id: "policy", title: "Preset & policy", fields: ["action_axis"] },
+  { id: "policy", title: "Preset & policy", fields: ["action_axis", "spread_mode"] },
   { id: "epsilon", title: "ε-greedy parameters", fields: ["epsilon_start", "epsilon_end", "epsilon_decay"] },
   { id: "ucb", title: "UCB parameters", fields: ["ucb_c"] },
   { id: "decay", title: "Decay schedule", fields: ["temperature_decay_mode"] },
@@ -36,6 +36,7 @@ export function formatConfigLabel(fieldName) {
   if (fieldName === "core_parameters") return "Core parameters";
   if (fieldName === "export_q_table_all_epoch") return "Export q table of all epoch";
   if (fieldName === "action_axis") return "Action axis";
+  if (fieldName === "spread_mode") return "Spread mode";
   if (fieldName === "policy_type") return "Policy type";
   if (fieldName === "lambda_param") return "Lambda (λ)";
   if (fieldName === "trace_threshold") return "Trace threshold";
@@ -58,6 +59,10 @@ export function formatEnumOptionLabel(fieldName, option) {
   if (fieldName === "action_axis") {
     if (option === "broadcaster") return "Broadcaster";
     if (option === "receiver") return "Receiver";
+  }
+  if (fieldName === "spread_mode") {
+    if (option === "normal") return "Normal";
+    if (option === "la") return "Latency ahead";
   }
   if (fieldName === "policy_type") {
     if (option === "epsilon_greedy") return "ε-greedy";
@@ -82,7 +87,12 @@ export function formatConfigValue(fieldName, value) {
     ];
     return parts.join(" | ");
   }
-  if (fieldName === "policy_type" || fieldName === "action_axis" || fieldName === "action_aggregation_mode") {
+  if (
+    fieldName === "policy_type" ||
+    fieldName === "action_axis" ||
+    fieldName === "spread_mode" ||
+    fieldName === "action_aggregation_mode"
+  ) {
     return formatEnumOptionLabel(fieldName, value);
   }
   if (typeof value === "boolean") return value ? "Yes" : "No";
@@ -142,7 +152,7 @@ export function buildRunConfigResultFromResolved(resolvedPayload, meta = null) {
 /** Fields visible by default: preset label + policy identity + active policy hyperparameters only. */
 export function inferDefaultVisibleKeys(config) {
   const policyType = String(config?.policy_type ?? "epsilon_greedy");
-  const keys = new Set(["action_axis", "action_aggregation_mode"]);
+  const keys = new Set(["action_axis", "spread_mode", "action_aggregation_mode"]);
   const activeBlockId = POLICY_BLOCK_BY_TYPE[policyType];
   if (activeBlockId) {
     const block = CONFIG_FIELD_BLOCKS.find((b) => b.id === activeBlockId);

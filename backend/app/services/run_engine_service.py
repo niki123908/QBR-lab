@@ -17,9 +17,10 @@ from app.core.db import db_session_scope, init_db
 from app.models import Artifact, BatchRunGroup, Run, RunMetric, Topology, TopologyNode
 from app.repositories.run_repo import create_batch_run_enqueued
 from app.repositories.run_repo import create_single_run_enqueued
-from app.repositories.run_repo import get_run_execution_payload
+from app.repositories.run_repo import get_run_execution_payload, run_is_owned_by_worker, run_is_owned_by_worker
 from app.repositories.run_repo import reconcile_batch_run_group
 from app.repositories.run_repo import try_resume_batch
+from app.repositories.run_repo import try_retry_failed_batch
 from app.services.run_registry import get_algorithm_runner, resolve_and_validate_run_config
 from app.services.runners.base import RunExecutionResult, RunnerContext
 
@@ -174,7 +175,9 @@ def _execute_run(
         run_seed = resolved_config.get("run_seed")
         if run_seed is not None:
             np.random.seed(int(run_seed))
-        artifact_root = Path(__file__).resolve().parents[3] / "storage" / "artifacts" / run_id
+        from app.core.paths import artifact_root_for_run
+
+        artifact_root = artifact_root_for_run(run_id)
         resolved_config_path = artifact_root / "resolved_run_config.json"
         _write_json(
             resolved_config_path,
@@ -246,8 +249,11 @@ def run_single_topology(
     return run_id
 
 
-def execute_queued_single_run(run_id: str) -> None:
+def execute_queued_single_run(run_id: str, *, worker_id: str | None = None) -> None:
     started = time.monotonic()
+    owner = (worker_id or "").strip()
+    if owner and not run_is_owned_by_worker(run_id, owner):
+        return
     try:
         payload = get_run_execution_payload(run_id)
         if not payload:
@@ -282,9 +288,12 @@ def _load_batch_payload_and_pairs(batch_run_id: str) -> tuple[dict[str, Any], li
         return payload, [(row.id, row.topology_id) for row in run_rows]
 
 
-def execute_queued_batch_run(run_id: str) -> None:
+def execute_queued_batch_run(run_id: str, *, worker_id: str | None = None) -> None:
     init_db()
     started = time.monotonic()
+    owner = (worker_id or "").strip()
+    if owner and not run_is_owned_by_worker(run_id, owner):
+        return
     batch_run_id = ""
     topology_id = ""
     try:
@@ -342,6 +351,12 @@ def resume_batch_job(batch_run_id: str) -> tuple[bool, str]:
     init_db()
     ok, msg = try_resume_batch(batch_run_id)
     return ok, msg
+
+
+def retry_failed_batch_job(batch_run_id: str) -> tuple[bool, str, int]:
+    init_db()
+    ok, msg, count = try_retry_failed_batch(batch_run_id)
+    return ok, msg, count
 
 
 def _expand_partial_artifact_types(types: list[str]) -> set[str]:

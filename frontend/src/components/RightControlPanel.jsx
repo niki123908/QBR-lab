@@ -4,7 +4,7 @@ import { BatchPolicyTraceCard } from "./BatchResultDetailBody.jsx";
 import RunConfigVisibilityTable from "./RunConfigVisibilityTable.jsx";
 import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
+import { API_BASE } from "../apiBase.js";
 
 function normalizeFieldValue(rawValue, schemaType) {
   if (schemaType === "boolean") return Boolean(rawValue);
@@ -41,6 +41,10 @@ function formatEnumOptionLabel(fieldName, option) {
     if (option === "broadcaster") return "Broadcaster";
     if (option === "receiver") return "Receiver";
   }
+  if (fieldName === "spread_mode") {
+    if (option === "normal") return "Normal";
+    if (option === "la") return "Latency ahead";
+  }
   if (fieldName === "policy_type" && option === "ucb") return "UCB";
   if (fieldName === "action_aggregation_mode") {
     if (option === "off") return "Off";
@@ -63,12 +67,20 @@ function stableStringify(value) {
 
 const BACKBONE_OPTIONS = [
   { id: "qbr", label: "QBR" },
-  { id: "greedy", label: "GREEDY" }
+  { id: "greedy", label: "GREEDY" },
+  { id: "cf_cas", label: "CF-CAS" }
 ];
 
 function presetOptionLabel(p) {
   if (!p || typeof p !== "object") return "";
-  const tag = p.backbone === "qbr" ? "QBR" : p.backbone === "greedy" ? "GREEDY" : String(p.backbone || "");
+  const tag =
+    p.backbone === "qbr"
+      ? "QBR"
+      : p.backbone === "greedy"
+        ? "GREEDY"
+        : p.backbone === "cf_cas"
+          ? "CF-CAS"
+          : String(p.backbone || "");
   return `${p.label} · ${tag}`;
 }
 
@@ -115,7 +127,7 @@ const POLICY_AXIS_FIELDS = new Set(["policy_type", "action_axis"]);
 const CONFIG_FIELD_BLOCKS = [
   { id: "training", title: "Training", fields: ["episodes"] },
   { id: "rl_core", title: "RL core", fields: ["alpha", "gamma"] },
-  { id: "policy", title: "Policy & actions", fields: ["policy_type", "action_axis"] },
+  { id: "policy", title: "Policy & actions", fields: ["policy_type", "action_axis", "spread_mode"] },
   { id: "epsilon", title: "ε-greedy", fields: ["epsilon_start", "epsilon_end", "epsilon_decay"] },
   { id: "ucb", title: "UCB", fields: ["ucb_c"] },
   { id: "decay", title: "Decay schedule", fields: ["temperature_decay_mode"] },
@@ -440,7 +452,7 @@ function RunTopologyPanel({
   }
 
   function onIdleBackboneChange(backboneId) {
-    const algorithm_id = backboneId === "qbr" ? "qbr" : "greedy";
+    const algorithm_id = backboneId;
     const list = sortedRunPresets.filter((p) => p.backbone === backboneId);
     const pick = list[0] ?? null;
     setForm((prev) => ({
@@ -480,7 +492,7 @@ function RunTopologyPanel({
   }
 
   function onWizardBackbonePick(backboneId) {
-    const algorithm_id = backboneId === "qbr" ? "qbr" : "greedy";
+    const algorithm_id = backboneId;
     const defaults = { ...(algorithmDefaultConfigById[algorithm_id] ?? {}) };
     setForm((prev) => ({
       ...prev,
@@ -805,7 +817,7 @@ function RunMultiPanel({
   }
 
   function onIdleBackboneChange(backboneId) {
-    const algorithm_id = backboneId === "qbr" ? "qbr" : "greedy";
+    const algorithm_id = backboneId;
     const list = sortedRunPresets.filter((p) => p.backbone === backboneId);
     const pick = list[0] ?? null;
     setForm((prev) => ({
@@ -845,7 +857,7 @@ function RunMultiPanel({
   }
 
   function onWizardBackbonePick(backboneId) {
-    const algorithm_id = backboneId === "qbr" ? "qbr" : "greedy";
+    const algorithm_id = backboneId;
     const defaults = { ...(algorithmDefaultConfigById[algorithm_id] ?? {}) };
     setForm((prev) => ({
       ...prev,
@@ -1676,6 +1688,7 @@ function PlaygroundPanel({
   playgroundState,
   playgroundNextStateCount,
   setPlaygroundMode,
+  setPlaygroundSpreadMode,
   setPlaygroundViewSlot,
   onReset,
   decisionTreeRowSpread,
@@ -1721,9 +1734,27 @@ function PlaygroundPanel({
             Receiver
           </button>
         </div>
+        <div className="playground-mode-switch">
+          <button
+            type="button"
+            className={`tab-pill ${playgroundState?.spreadMode !== "la" ? "active" : ""}`}
+            onClick={() => setPlaygroundSpreadMode("normal")}
+          >
+            Spread: Normal
+          </button>
+          <button
+            type="button"
+            className={`tab-pill ${playgroundState?.spreadMode === "la" ? "active" : ""}`}
+            onClick={() => setPlaygroundSpreadMode("la")}
+          >
+            Spread: LA
+          </button>
+        </div>
         <dl>
           <dt>Topology</dt>
           <dd>{selectedTopology?.topology_name ?? "-"}</dd>
+          <dt>Lower bound</dt>
+          <dd>{selectedTopology?.lower_bound ?? "-"}</dd>
           <dt>Current timeslot</dt>
           <dd>{currentSlot}</dd>
           <dt>Viewing slot</dt>
@@ -2282,6 +2313,7 @@ export default function RightControlPanel({
   ucbTool,
   updateUcbFontScale,
   setPlaygroundMode,
+  setPlaygroundSpreadMode,
   setPlaygroundViewSlot,
   onResetPlayground,
   decisionTreeRowSpread,
@@ -2476,6 +2508,7 @@ export default function RightControlPanel({
               playgroundState={playgroundState}
               playgroundNextStateCount={playgroundNextStateCount}
               setPlaygroundMode={setPlaygroundMode}
+              setPlaygroundSpreadMode={setPlaygroundSpreadMode}
               setPlaygroundViewSlot={setPlaygroundViewSlot}
               onReset={onResetPlayground}
               decisionTreeRowSpread={decisionTreeRowSpread}

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from app.core.db import db_session_scope, init_db
 from app.models import Artifact, Batch, BatchRunGroup, Run, RunMetric, Topology
@@ -348,53 +348,76 @@ def create_single_run_enqueued(
         return run.id
 
 
+def _candidate_may_be_claimed(session, candidate: Run) -> bool:
+    if candidate.batch_run_group_id is None:
+        return True
+    group = session.get(BatchRunGroup, candidate.batch_run_group_id)
+    if group is None:
+        return True
+    return group.status != "stopped" and not group.stop_requested
+
+
+def run_is_owned_by_worker(run_id: str, worker_id: str) -> bool:
+    init_db()
+    with db_session_scope() as session:
+        row = session.get(Run, run_id)
+        return row is not None and row.status == "running" and row.worker_id == worker_id
+
+
 def claim_next_queued_run(worker_id: str, *, modes: tuple[str, ...] | None = None) -> ClaimedRunRecord | None:
+    """Atomically claim one queued run (safe with multiple worker processes)."""
     init_db()
     with db_session_scope() as session:
         query = select(Run).where(Run.status == "queued")
         if modes:
             query = query.where(Run.mode.in_(modes))
-        candidates = session.scalars(query.order_by(Run.queue_priority.asc(), Run.created_at.asc(), Run.id.asc()).limit(50)).all()
-        row: Run | None = None
-        for candidate in candidates:
-            if candidate.batch_run_group_id is None:
-                row = candidate
-                break
-            group = session.get(BatchRunGroup, candidate.batch_run_group_id)
-            if group is None:
-                row = candidate
-                break
-            if group.status == "stopped" or group.stop_requested:
-                continue
-            row = candidate
-            break
-        if row is None:
-            return None
+        candidates = session.scalars(
+            query.order_by(Run.queue_priority.asc(), Run.created_at.asc(), Run.id.asc()).limit(50)
+        ).all()
 
         now = _utcnow()
-        row.status = "running"
-        row.worker_id = worker_id
-        row.claimed_at = now
-        row.heartbeat_at = now
-        row.started_at = row.started_at or now
-        row.attempt_count = int(row.attempt_count or 0) + 1
-        if row.batch_run_group_id:
-            group = session.get(BatchRunGroup, row.batch_run_group_id)
-            if group is not None:
-                group.status = "running"
-                group.started_at = group.started_at or now
-                group.ended_at = None
+        for candidate in candidates:
+            if not _candidate_may_be_claimed(session, candidate):
+                continue
 
-        return ClaimedRunRecord(
-            run_id=row.id,
-            topology_id=row.topology_id,
-            mode=row.mode,
-            batch_run_group_id=row.batch_run_group_id,
-            algorithm_id=row.algorithm_id,
-            preset_id=row.config_id,
-            queue_priority=row.queue_priority,
-            attempt_count=row.attempt_count,
-        )
+            new_attempt = int(candidate.attempt_count or 0) + 1
+            result = session.execute(
+                update(Run)
+                .where(Run.id == candidate.id, Run.status == "queued")
+                .values(
+                    status="running",
+                    worker_id=worker_id,
+                    claimed_at=now,
+                    heartbeat_at=now,
+                    started_at=now,
+                    attempt_count=new_attempt,
+                )
+            )
+            if result.rowcount != 1:
+                continue
+
+            row = session.get(Run, candidate.id)
+            if row is None:
+                continue
+
+            if row.batch_run_group_id:
+                group = session.get(BatchRunGroup, row.batch_run_group_id)
+                if group is not None:
+                    group.status = "running"
+                    group.started_at = group.started_at or now
+                    group.ended_at = None
+
+            return ClaimedRunRecord(
+                run_id=row.id,
+                topology_id=row.topology_id,
+                mode=row.mode,
+                batch_run_group_id=row.batch_run_group_id,
+                algorithm_id=row.algorithm_id,
+                preset_id=row.config_id,
+                queue_priority=row.queue_priority,
+                attempt_count=row.attempt_count,
+            )
+        return None
 
 
 def get_run_execution_payload(run_id: str) -> dict | None:
@@ -470,15 +493,17 @@ def requeue_runs_for_worker(worker_id: str) -> int:
         return len(rows)
 
 
-def requeue_stale_runs(*, stale_after_seconds: int) -> list[str]:
+def requeue_stale_runs(*, stale_after_seconds: int, claim_grace_seconds: int = 60) -> list[str]:
     init_db()
     stale_before = _utcnow() - timedelta(seconds=max(0, int(stale_after_seconds)))
+    claim_grace_before = _utcnow() - timedelta(seconds=max(0, int(claim_grace_seconds)))
     with db_session_scope() as session:
         rows = session.scalars(
             select(Run).where(
                 Run.status == "running",
+                Run.claimed_at.isnot(None),
+                Run.claimed_at < claim_grace_before,
                 or_(
-                    Run.worker_id.is_(None),
                     Run.heartbeat_at.is_(None),
                     Run.heartbeat_at < stale_before,
                 ),
@@ -582,6 +607,46 @@ def try_resume_batch(batch_run_id: str) -> tuple[bool, str]:
         g.status = "queued"
         g.ended_at = None
         return True, "ok"
+
+
+def try_retry_failed_batch(batch_run_id: str) -> tuple[bool, str, int]:
+    """Re-queue failed runs in a batch so workers can execute them again."""
+    init_db()
+    with db_session_scope() as session:
+        g = session.get(BatchRunGroup, batch_run_id)
+        if g is None:
+            return False, "not_found", 0
+        if g.status in ("running", "queued"):
+            return False, "batch_active", 0
+
+        failed_rows = session.scalars(
+            select(Run).where(Run.batch_run_group_id == batch_run_id, Run.status == "failed")
+        ).all()
+        if not failed_rows:
+            return False, "nothing_to_retry", 0
+
+        for row in failed_rows:
+            metric = session.get(RunMetric, row.id)
+            if metric is not None:
+                session.delete(metric)
+            for artifact in session.scalars(select(Artifact).where(Artifact.run_id == row.id)).all():
+                session.delete(artifact)
+            row.status = "queued"
+            row.ended_at = None
+            row.error_message = None
+            row.worker_id = None
+            row.heartbeat_at = None
+            row.claimed_at = None
+            row.runtime_sec = None
+            row.started_at = None
+            topology = session.get(Topology, row.topology_id)
+            if topology is not None and not topology.is_deleted:
+                topology.status = "new"
+
+        g.stop_requested = False
+        g.status = "queued"
+        g.ended_at = None
+        return True, "ok", len(failed_rows)
 
 
 def reconcile_batch_run_group(batch_run_id: str) -> str | None:

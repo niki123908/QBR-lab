@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -12,6 +10,12 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qbr} -d ${POSTGRES_DB:-qbr}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   backend:
     build:
@@ -19,9 +23,11 @@ services:
     container_name: qbr-backend
     environment:
       APP_ENV: ${APP_ENV:-dev}
+      QBR_ROOT: /app
       DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
@@ -36,17 +42,57 @@ services:
     ports:
       - "${FRONTEND_PORT:-5173}:80"
 
-  worker:
+  worker-1:
     build:
       context: .
       dockerfile: ./worker/Dockerfile
-    container_name: qbr-worker
+    container_name: qbr-worker-1
     depends_on:
-      - backend
-      - postgres
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
     environment:
       APP_ENV: ${APP_ENV:-dev}
+      QBR_ROOT: /app
       DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      WORKER_ID: worker-1
+    volumes:
+      - storage_data:/app/storage
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    container_name: qbr-worker-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      QBR_ROOT: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      WORKER_ID: worker-2
+    volumes:
+      - storage_data:/app/storage
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    container_name: qbr-worker-3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      QBR_ROOT: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      WORKER_ID: worker-3
     volumes:
       - storage_data:/app/storage
 

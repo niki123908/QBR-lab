@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from app.algorithms.br_env import Br_Env
+from app.algorithms.common import trees
+from app.algorithms.common.node import Node
+
 Mode = Literal["broadcaster", "receiver"]
+SpreadMode = Literal["normal", "la"]
 
 
 def _build_adjacency(nodes: list[Any], tx_range: float) -> dict[int, set[int]]:
@@ -41,21 +46,23 @@ def derive_playground_candidates(
     )
 
 
-def _map_receiver_to_broadcaster(
-    receiver_id: int,
-    broadcaster_candidates: list[int],
-    receiver_candidates: list[int],
-    adjacency: dict[int, set[int]],
-) -> int | None:
-    receiver_candidate_set = set(receiver_candidates)
-    broadcasters = [node_id for node_id in broadcaster_candidates if receiver_id in adjacency.get(node_id, set())]
-    if not broadcasters:
-        return None
-
-    def cover_count(node_id: int) -> int:
-        return len([n for n in adjacency.get(node_id, set()) if n in receiver_candidate_set])
-
-    return sorted(broadcasters, key=lambda node_id: (-cover_count(node_id), node_id))[0]
+def _nodes_to_br_env(nodes: list[Any], tx_range: float, covered_node_ids: list[int]) -> Br_Env:
+    adjacency = _build_adjacency(nodes, tx_range)
+    node_list: list[Node] = []
+    for row in nodes:
+        node_id = int(row.node_id)
+        node = Node(ID=node_id, x=float(row.x), y=float(row.y), timeslot=1)
+        node.neighbors = sorted(adjacency.get(node_id, set()))
+        node_list.append(node)
+    node_list.sort(key=lambda item: item.ID)
+    env = Br_Env(node_list, 1)
+    covered = sorted({int(v) for v in covered_node_ids if int(v) >= 0})
+    if not covered:
+        covered = [0]
+    env.V_s = list(covered)
+    env.V_ns = [node_id for node_id in env.V_ids if node_id not in set(covered)]
+    env._find_br_rcv_cands()
+    return env
 
 
 def simulate_playground_slot(
@@ -64,64 +71,46 @@ def simulate_playground_slot(
     covered_node_ids: list[int] | None,
     mode: Mode,
     selected_node_id: int,
+    *,
+    spread_mode: SpreadMode = "normal",
 ) -> dict[str, Any] | None:
-    covered = {int(v) for v in (covered_node_ids or []) if int(v) >= 0}
-    broadcaster_candidates, receiver_candidates, adjacency = derive_playground_candidates(nodes, tx_range, list(covered))
-    receiver_candidate_set = set(receiver_candidates)
-    first_pick: int | None = None
+    covered = sorted({int(v) for v in (covered_node_ids or []) if int(v) >= 0}) or [0]
+    env = _nodes_to_br_env(nodes, tx_range, covered)
+    normalized_spread = str(spread_mode or "normal").strip().lower()
+    if normalized_spread not in {"normal", "la"}:
+        normalized_spread = "normal"
 
-    if mode == "receiver":
-        first_pick = _map_receiver_to_broadcaster(
-            int(selected_node_id), broadcaster_candidates, receiver_candidates, adjacency
-        )
-    elif int(selected_node_id) in broadcaster_candidates:
+    if normalized_spread == "la":
+        trees.prepare_latency_ahead(env.V)
+    else:
+        trees.build_bfs(env.V)
+
+    action_axis = str(mode)
+    first_pick: int | None = None
+    if action_axis == "receiver":
+        if int(selected_node_id) in env.rcv_cands:
+            first_pick = int(selected_node_id)
+    elif int(selected_node_id) in env.br_cands:
         first_pick = int(selected_node_id)
 
     if first_pick is None:
         return None
 
-    broadcasters_remaining = list(broadcaster_candidates)
-    transmitters: list[int] = []
-    receivers: list[int] = []
-
-    def collect_receivers_for(node_id: int) -> list[int]:
-        return sorted(
-            n
-            for n in adjacency.get(node_id, set())
-            if n not in covered and n in receiver_candidate_set
-        )
-
-    first_index = broadcasters_remaining.index(first_pick)
-    if first_index >= 0:
-        covered_by_first = collect_receivers_for(first_pick)
-        transmitters.append(first_pick)
-        receivers.extend(covered_by_first)
-        broadcasters_remaining.pop(first_index)
-
-    broadcasters_remaining.sort(
-        key=lambda node_id: (-len(collect_receivers_for(node_id)), node_id)
+    _, _, _, br_set, rcv_set = env.proceed_action(
+        first_pick,
+        action_axis=action_axis,
+        spread_mode=normalized_spread,
+        coverage_reward_enabled=False,
     )
-
-    idx = 0
-    while idx < len(broadcasters_remaining):
-        broadcaster_id = broadcasters_remaining[idx]
-        candidate_receivers = collect_receivers_for(broadcaster_id)
-        if any(node_id in receivers for node_id in candidate_receivers):
-            broadcasters_remaining.pop(idx)
-            continue
-        if candidate_receivers:
-            transmitters.append(broadcaster_id)
-            receivers.extend(candidate_receivers)
-        broadcasters_remaining.pop(idx)
-
-    unique_receivers = sorted(set(receivers))
+    unique_receivers = sorted({int(v) for v in rcv_set})
     if not unique_receivers:
         return None
 
     return {
         "first_pick": first_pick,
         "mode": mode,
-        "transmitters": sorted(set(transmitters)),
+        "spread_mode": normalized_spread,
+        "transmitters": sorted({int(v) for v in br_set}),
         "receivers": unique_receivers,
     }
 
@@ -132,6 +121,7 @@ def enumerate_playground_transitions(
     covered_node_ids: list[int] | None,
     *,
     modes: tuple[Mode, ...] = ("broadcaster", "receiver"),
+    spread_mode: SpreadMode = "normal",
 ) -> list[dict[str, Any]]:
     covered = sorted({int(v) for v in (covered_node_ids or []) if int(v) >= 0}) or [0]
     broadcaster_candidates, receiver_candidates, _ = derive_playground_candidates(nodes, tx_range, covered)
@@ -140,7 +130,14 @@ def enumerate_playground_transitions(
     for mode in modes:
         actions = receiver_candidates if mode == "receiver" else broadcaster_candidates
         for action in actions:
-            slot = simulate_playground_slot(nodes, tx_range, covered, mode, int(action))
+            slot = simulate_playground_slot(
+                nodes,
+                tx_range,
+                covered,
+                mode,
+                int(action),
+                spread_mode=spread_mode,
+            )
             if not slot:
                 continue
             next_covered = sorted(set(covered) | {int(v) for v in slot["receivers"]})
@@ -148,6 +145,7 @@ def enumerate_playground_transitions(
                 {
                     "action": int(action),
                     "mode": mode,
+                    "spread_mode": spread_mode,
                     "to_covered_node_ids": next_covered,
                 }
             )

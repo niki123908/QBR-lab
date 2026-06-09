@@ -188,6 +188,25 @@ def build_greedy_run_bundle(
     }
 
 
+def build_cf_cas_run_bundle(
+    *,
+    run_id: str,
+    summary_payload: dict[str, Any],
+    transmission_payload: dict[str, Any],
+    state_action_payload: dict[str, Any],
+) -> dict[str, Any]:
+    delay = int(state_action_payload.get("delay") or summary_payload.get("finished_delay") or 0)
+    return {
+        "schema_version": RUN_BUNDLE_SCHEMA_VERSION,
+        "algorithm_id": "cf_cas",
+        "run_id": run_id,
+        "metrics": summary_payload,
+        "policy": {"policy_type": "cf_cas"},
+        "episodes": [{"episode": 1, "delay": delay, "total_reward": 0.0, "path_signature": ""}],
+        "transmission": {"last": transmission_payload, "best": transmission_payload},
+    }
+
+
 def q_table_learning_stats(qtable: dict[str, Any]) -> tuple[int, int]:
     """Return (unique_states, state_action_pairs) from final Q-table."""
     if not isinstance(qtable, dict):

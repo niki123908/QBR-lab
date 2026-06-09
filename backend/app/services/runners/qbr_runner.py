@@ -200,6 +200,7 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     temperature_decay = float(config.get("temperature_decay", 0.001))
     temperature_decay_mode = str(config.get("temperature_decay_mode", "linear"))
     action_axis = str(config.get("action_axis", "broadcaster"))
+    spread_mode = str(config.get("spread_mode", "normal"))
     completion_bonus_multiplier = float(config.get("completion_bonus_multiplier", 1.0))
     coverage_reward_enabled = bool(config.get("coverage_reward_enabled", True))
     lambda_param = float(config.get("lambda_param", 0.0))
@@ -242,13 +243,18 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         action_policy=action_policy,
         update_rule=QLearningUpdateRule(),
         candidate_finder=BroadcastCandidateFinder(),
-        on_episode_start=lambda runtime_env: trees.build_bfs(runtime_env.V),
+        on_episode_start=lambda runtime_env: (
+            trees.prepare_latency_ahead(runtime_env.V)
+            if spread_mode == "la"
+            else trees.build_bfs(runtime_env.V)
+        ),
         export_q_table_all_epoch=False,
         completion_bonus_multiplier=completion_bonus_multiplier,
         coverage_reward_enabled=coverage_reward_enabled,
         lambda_param=lambda_param,
         trace_threshold=trace_threshold,
         action_axis=action_axis,
+        spread_mode=spread_mode,
         action_aggregation_mode=action_aggregation_mode,
         q_snapshot_episodes={200, 450, 700, 1000, episodes},
     )
@@ -290,7 +296,9 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         action_axis=action_axis,
     )
 
-    artifact_root = Path(__file__).resolve().parents[4] / "storage" / "artifacts" / run_id
+    from app.core.paths import artifact_root_for_run
+
+    artifact_root = artifact_root_for_run(run_id)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     last_episode_payload = episodes_steps[-1] if episodes_steps else {"episode": 0, "delay": 0, "steps": []}

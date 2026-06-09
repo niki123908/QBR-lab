@@ -12,6 +12,11 @@ def hash_state(state) -> str:
     return "/".join(str(x) for x in sorted(state))
 
 
+def _normalize_spread_mode(spread_mode: str) -> str:
+    mode = str(spread_mode or "normal").strip().lower()
+    return mode if mode in {"normal", "la"} else "normal"
+
+
 class Br_Env:
     V = []
     V_ids = []
@@ -58,7 +63,19 @@ class Br_Env:
         self.br_cands = list(br_cands)
         self.rcv_cands = list(rcv_cands)
 
-    def _greedy_spread_broadcaster(self, first_picked):
+    def _count_neighbors_in_rcv_cands(self, broadcaster):
+        return len([v for v in self.V[broadcaster].neighbors if v in self.rcv_cands])
+
+    def _future_neighbor_count(self, receiver):
+        br_set = set(self.br_cands)
+        rcv_set = set(self.rcv_cands)
+        count = 0
+        for neighbor in self.V[receiver].neighbors:
+            if neighbor in self.V_ns and neighbor not in rcv_set and neighbor not in br_set:
+                count += 1
+        return count
+
+    def _greedy_spread_broadcaster(self, first_picked, spread_mode="normal"):
         br_set = []
         br_temp = copy.deepcopy(self.br_cands)
         rcv_set = []
@@ -69,10 +86,15 @@ class Br_Env:
             rcv_set.extend(covered)
             br_temp.remove(first_picked)
 
-        def count_neighbors_in_rcv_cands(b):
-            return len([v for v in self.V[b].neighbors if v in self.rcv_cands])
-
-        br_temp.sort(key=count_neighbors_in_rcv_cands, reverse=True)
+        if _normalize_spread_mode(spread_mode) == "la":
+            br_temp.sort(
+                key=lambda b: (
+                    -int(getattr(self.V[b], "latency_ahead", -1)),
+                    -int(b),
+                )
+            )
+        else:
+            br_temp.sort(key=self._count_neighbors_in_rcv_cands, reverse=True)
 
         i = 0
         while i < len(br_temp):
@@ -109,7 +131,7 @@ class Br_Env:
             rcv_temp.remove(receiver)
         return covered
 
-    def _greedy_spread_receiver(self, first_picked):
+    def _greedy_spread_receiver(self, first_picked, spread_mode="normal"):
         br_set = []
         br_temp = copy.deepcopy(self.br_cands)
         rcv_temp = copy.deepcopy(self.rcv_cands)
@@ -126,7 +148,11 @@ class Br_Env:
         if first_picked is not None and first_picked in rcv_temp:
             pick_parent_for_receiver(first_picked)
 
-        rcv_temp.sort(key=lambda x: (-int(getattr(self.V[x], "latency_ahead", -1)), int(x)))
+        if _normalize_spread_mode(spread_mode) == "la":
+            rcv_temp.sort(key=lambda x: (-int(getattr(self.V[x], "latency_ahead", -1)), int(x)))
+        else:
+            rcv_temp.sort(key=lambda x: (-self._future_neighbor_count(x), int(x)))
+
         while br_temp and rcv_temp:
             receiver = rcv_temp[0]
             before_count = len(rcv_temp)
@@ -153,11 +179,13 @@ class Br_Env:
         completion_bonus_multiplier=1.0,
         coverage_reward_enabled=True,
         action_axis="broadcaster",
+        spread_mode="normal",
     ):
+        normalized_spread = _normalize_spread_mode(spread_mode)
         if str(action_axis) == "receiver":
-            br_set, rcv_set = self._greedy_spread_receiver(first_pick)
+            br_set, rcv_set = self._greedy_spread_receiver(first_pick, normalized_spread)
         else:
-            br_set, rcv_set = self._greedy_spread_broadcaster(first_pick)
+            br_set, rcv_set = self._greedy_spread_broadcaster(first_pick, normalized_spread)
         completion_bonus = 0
         total_nodes_covered = len(set(self.V_s).union(rcv_set))
         total_nodes_in_topo = len(self.V_ids)

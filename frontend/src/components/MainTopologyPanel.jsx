@@ -8,6 +8,20 @@ import BatchResultDetailBody, { linearAxisTicks } from "./BatchResultDetailBody"
 import CompareWorkspace from "./CompareWorkspace";
 import PlaygroundStateTree from "./PlaygroundStateTree";
 import { formatRunLearningStatsSuffix } from "../utils/runLearningStats.js";
+import {
+  colorForPlaygroundHopDistance,
+  computeHopDistanceFromSink,
+  computeLowerBoundPathEdges,
+  computeTopologyFitScale,
+  resolvePlaygroundLowerBound
+} from "../utils/playgroundNodeMetrics.js";
+
+const PLAYGROUND_NODE_RADIUS = 3.1;
+const PLAYGROUND_LABEL_SIZE = 4.2;
+const PLAYGROUND_EDGE_WIDTH = 0.55;
+const LOWER_BOUND_PATH_COLOR = "#dc2626";
+/** Reuse one array so `?? []` in deps does not create a new reference every render. */
+const STABLE_EMPTY_LIST = [];
 
 function buildEdges(nodes, txRange) {
   if (!nodes || nodes.length === 0) return [];
@@ -79,6 +93,33 @@ const TIMESLOT_COLORS = [
 function colorForTimeslot(timeslot) {
   if (!Number.isFinite(timeslot) || timeslot <= 0) return "#9da5bf";
   return TIMESLOT_COLORS[(timeslot - 1) % TIMESLOT_COLORS.length];
+}
+
+function PlaygroundLowerBoundScale({ lowerBound }) {
+  const lb = Math.max(0, Math.round(Number(lowerBound) || 0));
+  const hopValues = lb > 0 ? Array.from({ length: lb }, (_, idx) => idx + 1) : [];
+  return (
+    <div className="playground-lb-scale" aria-label={`Hop distance colors 0 to ${lb}`}>
+      <div className="playground-lb-scale-segments">
+        <span className="playground-lb-scale-swatch playground-lb-scale-swatch--sink" title="Sink (hop 0)">
+          0
+        </span>
+        {hopValues.map((hop) => (
+          <span
+            key={`lb-hop-${hop}`}
+            className="playground-lb-scale-swatch"
+            style={{ background: colorForPlaygroundHopDistance(hop) ?? "#9da5bf" }}
+            title={`Hop distance ${hop}`}
+          >
+            {hop}
+          </span>
+        ))}
+      </div>
+      <p className="muted playground-lb-scale-caption">
+        Hop distance from sink — each value uses the same color as timeslot replay
+      </p>
+    </div>
+  );
 }
 
 function computeReceiveTimeslotMap(timeslots = []) {
@@ -1119,7 +1160,10 @@ function TopologyGraph({
   onNodeLeave = null,
   onNodeClick = null,
   clickableNodeIds = [],
-  hoveredNodeId = null
+  hoveredNodeId = null,
+  autoFitToBounds = false,
+  latencyAheadById = null,
+  showLatencyAhead = false
 }) {
   if (!graph) {
     return <div className={`topology-thumb ${className}`} />;
@@ -1140,7 +1184,9 @@ function TopologyGraph({
             to,
             color: edge.color ?? edgeColor,
             width: edge.width ?? edgeWidth,
-            directed: Boolean(edge.directed)
+            directed: Boolean(edge.directed),
+            lbPath: Boolean(edge.lbPath),
+            key: edge.key
           };
         })
         .filter(Boolean);
@@ -1161,6 +1207,7 @@ function TopologyGraph({
   const maxScale = 6;
   const [scale, setScale] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const shellRef = useRef(null);
   const svgRef = useRef(null);
   const dragStateRef = useRef({ active: false, lastX: 0, lastY: 0 });
   const clickableIdSet = useMemo(
@@ -1169,9 +1216,26 @@ function TopologyGraph({
   );
 
   useEffect(() => {
-    setScale(1);
+    const nextScale = autoFitToBounds ? computeTopologyFitScale(graph) : 1;
+    setScale(clampScale(nextScale));
     setPan({ x: 0, y: 0 });
-  }, [graph.topology_id]);
+  }, [graph.topology_id, autoFitToBounds, rawNodes.length]);
+
+  useEffect(() => {
+    if (!interactive) return undefined;
+    const shell = shellRef.current;
+    if (!shell) return undefined;
+
+    function onWheel(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const delta = event.deltaY > 0 ? -0.2 : 0.2;
+      setScale((prev) => Math.min(maxScale, Math.max(minScale, prev + delta)));
+    }
+
+    shell.addEventListener("wheel", onWheel, { passive: false });
+    return () => shell.removeEventListener("wheel", onWheel);
+  }, [interactive, minScale, maxScale]);
 
   function clampScale(nextScale) {
     return Math.min(maxScale, Math.max(minScale, nextScale));
@@ -1183,19 +1247,9 @@ function TopologyGraph({
   }
 
   function resetView() {
-    setScale(1);
+    const next = autoFitToBounds ? computeTopologyFitScale(graph) : 1;
+    setScale(clampScale(next));
     setPan({ x: 0, y: 0 });
-  }
-
-  function handleWheel(event) {
-    if (!interactive) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.nativeEvent?.stopImmediatePropagation) {
-      event.nativeEvent.stopImmediatePropagation();
-    }
-    const delta = event.deltaY > 0 ? -0.2 : 0.2;
-    setScale((prev) => clampScale(prev + delta));
   }
 
   function handleMouseDown(event) {
@@ -1236,8 +1290,8 @@ function TopologyGraph({
 
   return (
     <div
+      ref={shellRef}
       className={`topology-graph-shell ${interactive ? "interactive" : ""}`}
-      onWheelCapture={interactive ? handleWheel : undefined}
     >
       {interactive ? (
         <div className="graph-toolbar">
@@ -1252,7 +1306,6 @@ function TopologyGraph({
         ref={svgRef}
         viewBox={`0 0 ${width} ${height}`}
         className={`topology-svg ${className}`}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -1267,13 +1320,15 @@ function TopologyGraph({
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${scale})`} transformOrigin={`${width / 2} ${height / 2}`}>
           {edges.map((edge, idx) => (
             <line
-              key={`${edge.from.node_id}-${edge.to.node_id}-${idx}`}
+              key={edge.key ?? `${edge.from.node_id}-${edge.to.node_id}-${idx}`}
               x1={edge.from.x}
               y1={height - edge.from.y}
               x2={edge.to.x}
               y2={height - edge.to.y}
               stroke={edge.color ?? edgeColor}
               strokeWidth={edge.width ?? edgeWidth ?? (interactive ? 0.35 : 0.45)}
+              strokeOpacity={edge.lbPath ? 1 : undefined}
+              className={edge.lbPath ? "topology-edge--lower-bound" : undefined}
               markerEnd={edge.directed ? "url(#topology-arrow)" : undefined}
             />
           ))}
@@ -1303,6 +1358,11 @@ function TopologyGraph({
                   onClick={onNodeClick && clickableIdSet.has(node.node_id) ? () => onNodeClick(node.node_id) : undefined}
                 >
                   {node.node_id}
+                  {showLatencyAhead && Number.isFinite(latencyAheadById?.[node.node_id]) ? (
+                    <tspan className="node-latency-ahead" x={node.x + 1.4} dy="1.05em">
+                      {`LA:${latencyAheadById[node.node_id]}`}
+                    </tspan>
+                  ) : null}
                 </text>
               ) : null}
               {hoveredNodeId === node.node_id ? (
@@ -1528,6 +1588,7 @@ export default function MainTopologyPanel({
   batchRunProgress,
   onBatchStop,
   onBatchResume,
+  onBatchRetryFailed,
   onDeleteBatchRunResult,
   onRenameBatchRunResult,
   graphByTopologyId,
@@ -1616,7 +1677,7 @@ export default function MainTopologyPanel({
   const playgroundShellRef = useRef(null);
   const decisionTreeExportRef = useRef(null);
   const [decisionTreeExporting, setDecisionTreeExporting] = useState(false);
-  const [topoScalePx, setTopoScalePx] = useState(6);
+  const [showPlaygroundLowerBound, setShowPlaygroundLowerBound] = useState(true);
 
   const temperatureProbabilityRows = useMemo(
     () => computeTemperatureProbabilities(temperatureTool?.qValues ?? [], temperatureTool?.tau ?? 1),
@@ -1634,49 +1695,23 @@ export default function MainTopologyPanel({
   );
   const focusedGraph = focusedTopologyId ? graphByTopologyId[focusedTopologyId] : null;
 
-  useEffect(() => {
-    if (!isTopologyPlayground || !playgroundShellRef.current) return;
-    const shell = playgroundShellRef.current;
-    const spaceW = Number(focusedGraph?.space_width) || 100;
-    const spaceH = Number(focusedGraph?.space_height) || 100;
-
-    const measure = () => {
-      const svg = shell.querySelector("svg.topology-svg");
-      if (!svg) return;
-      const rect = svg.getBoundingClientRect();
-      if (rect.width < 1 || rect.height < 1) return;
-      setTopoScalePx(Math.min(rect.width / spaceW, rect.height / spaceH));
-    };
-
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(shell);
-    return () => observer.disconnect();
-  }, [
-    isTopologyPlayground,
-    focusedGraph?.topology_id,
-    focusedGraph?.space_width,
-    focusedGraph?.space_height,
-    graphDisplaySettings.node_size,
-    graphDisplaySettings.label_size
-  ]);
   const focusedTopo = focusedTopologyId
     ? topologies.find((item) => item.topology_id === focusedTopologyId) ?? selectedTopology
     : null;
   const focusedBatch = focusedBatchId ? batches.find((batch) => batch.batch_id === focusedBatchId) : null;
-  const topologiesInBatch = focusedBatch?.topologies ?? [];
+  const topologiesInBatch = focusedBatch?.topologies ?? STABLE_EMPTY_LIST;
   const runFocusedBatch = focusedBatchId ? runBatches.find((batch) => batch.batch_id === focusedBatchId) : null;
-  const runTopologies = runFocusedBatch?.topologies ?? [];
+  const runTopologies = runFocusedBatch?.topologies ?? STABLE_EMPTY_LIST;
   const resultsSingleFocusedBatch = focusedBatchId
     ? (resultsSingleRunBatches ?? []).find((batch) => batch.batch_id === focusedBatchId) ?? null
     : null;
-  const resultsSingleTopologies = resultsSingleFocusedBatch?.topologies ?? [];
+  const resultsSingleTopologies = resultsSingleFocusedBatch?.topologies ?? STABLE_EMPTY_LIST;
   const runMultiSelectedBatch = useMemo(
-    () => (runBatchTopologies ?? []).find((batch) => batch.batch_id === runMultiForm?.batch_id) ?? null,
+    () => (runBatchTopologies ?? STABLE_EMPTY_LIST).find((batch) => batch.batch_id === runMultiForm?.batch_id) ?? null,
     [runBatchTopologies, runMultiForm?.batch_id]
   );
-  const runMultiTopologies = runMultiSelectedBatch?.topologies ?? [];
-  const resultTopologies = focusedBatchRunResult?.topologies ?? [];
+  const runMultiTopologies = runMultiSelectedBatch?.topologies ?? STABLE_EMPTY_LIST;
+  const resultTopologies = focusedBatchRunResult?.topologies ?? STABLE_EMPTY_LIST;
   const isRunMultiRepeatMode = runMultiSubMode === "repeat";
 
   const { panelHeading, panelSubtitle } = useMemo(() => {
@@ -1841,6 +1876,14 @@ export default function MainTopologyPanel({
   );
   const playgroundLatestSlot = playgroundState?.timeslots?.length ?? 0;
   const playgroundViewSlot = Math.min(Math.max(0, Number(playgroundState?.viewSlot) || 0), playgroundLatestSlot);
+  const playgroundHopDist = useMemo(
+    () => (focusedGraph ? computeHopDistanceFromSink(focusedGraph) : {}),
+    [focusedGraph]
+  );
+  const playgroundLowerBoundValue = useMemo(
+    () => resolvePlaygroundLowerBound(playgroundHopDist, focusedTopo?.lower_bound),
+    [playgroundHopDist, focusedTopo?.lower_bound]
+  );
   const playgroundIsLatestView = playgroundViewSlot === playgroundLatestSlot;
   const playgroundActionLocked = !playgroundIsLatestView || Boolean(playgroundState?.isComplete);
   const playgroundPreview = playgroundActionLocked ? null : playgroundState?.hoverPreview ?? null;
@@ -1862,35 +1905,85 @@ export default function MainTopologyPanel({
     }
     return broadcasterCandidates;
   }, [focusedGraph, playgroundActionLocked, playgroundState?.coveredNodeIds, playgroundState?.mode]);
+  const playgroundLowerBoundPathEdges = useMemo(
+    () => (showPlaygroundLowerBound && focusedGraph ? computeLowerBoundPathEdges(focusedGraph) : []),
+    [showPlaygroundLowerBound, focusedGraph]
+  );
   const playgroundEdges = useMemo(() => {
     if (!focusedGraph) return [];
+    const lbEdges = playgroundLowerBoundPathEdges.map((edge, idx) => ({
+      from: edge.from,
+      to: edge.to,
+      color: LOWER_BOUND_PATH_COLOR,
+      width: 1.5,
+      directed: false,
+      lbPath: true,
+      key: `lb-${edge.from}-${edge.to}-${idx}`
+    }));
+    if (showPlaygroundLowerBound) {
+      const baseEdges = buildEdges(focusedGraph.nodes, focusedGraph.tx_range).map(([from, to]) => ({
+        from: from.node_id,
+        to: to.node_id,
+        color: "#d0d5ea",
+        width: PLAYGROUND_EDGE_WIDTH
+      }));
+      return [...baseEdges, ...lbEdges];
+    }
     const committedEdges = buildReplayLayeredEdges(focusedGraph, playgroundState?.timeslots ?? [], playgroundViewSlot, {
       hideBaseEdgesAtEnd: Boolean(playgroundState?.isComplete)
     });
-    if (!playgroundPreview) return committedEdges;
-    const previewSlot = {
-      timeslot: playgroundViewSlot + 1,
-      transmitters: playgroundPreview.transmitters,
-      receivers: playgroundPreview.receivers
-    };
-    return [
-      ...committedEdges,
-      ...buildTransmissionDiagnosticEdges(focusedGraph, [previewSlot], "all", playgroundViewSlot + 1).map((edge) => ({
-        ...edge,
-        color: "#d9485f"
-      }))
-    ];
-  }, [focusedGraph, playgroundPreview, playgroundState?.isComplete, playgroundState?.timeslots, playgroundViewSlot]);
+    const transmission = !playgroundPreview
+      ? committedEdges
+      : [
+          ...committedEdges,
+          ...buildTransmissionDiagnosticEdges(
+            focusedGraph,
+            [
+              {
+                timeslot: playgroundViewSlot + 1,
+                transmitters: playgroundPreview.transmitters,
+                receivers: playgroundPreview.receivers
+              }
+            ],
+            "all",
+            playgroundViewSlot + 1
+          ).map((edge) => ({
+            ...edge,
+            color: "#d9485f"
+          }))
+        ];
+    return [...transmission, ...lbEdges];
+  }, [
+    focusedGraph,
+    playgroundPreview,
+    playgroundState?.isComplete,
+    playgroundState?.timeslots,
+    playgroundViewSlot,
+    playgroundLowerBoundPathEdges,
+    showPlaygroundLowerBound
+  ]);
   const playgroundVisual = useMemo(() => {
     const fillById = { 0: "#ec5bb8" };
     const strokeById = {};
     const strokeWidthById = {};
-    const committedTimeslotMap = computeReceiveTimeslotMap((playgroundState?.timeslots ?? []).slice(0, playgroundViewSlot));
-    Object.entries(committedTimeslotMap).forEach(([nodeId, ts]) => {
-      if (Number(nodeId) !== 0) {
-        fillById[nodeId] = colorForTimeslot(Number(ts));
-      }
-    });
+    if (showPlaygroundLowerBound) {
+      Object.entries(playgroundHopDist).forEach(([nodeId, hop]) => {
+        const id = Number(nodeId);
+        if (id === 0) return;
+        const color = colorForPlaygroundHopDistance(hop);
+        if (color) fillById[id] = color;
+      });
+    } else {
+      const committedTimeslotMap = computeReceiveTimeslotMap(
+        (playgroundState?.timeslots ?? []).slice(0, playgroundViewSlot)
+      );
+      Object.entries(committedTimeslotMap).forEach(([nodeId, ts]) => {
+        if (Number(nodeId) !== 0) {
+          fillById[nodeId] = colorForTimeslot(Number(ts));
+        }
+      });
+    }
+
     (playgroundCandidateIds ?? []).forEach((nodeId) => {
       strokeById[nodeId] = "#d62839";
       strokeWidthById[nodeId] = 0.7;
@@ -1902,13 +1995,25 @@ export default function MainTopologyPanel({
         strokeWidthById[nodeId] = 0.85;
       });
       (playgroundPreview.receivers ?? []).forEach((nodeId) => {
-        fillById[nodeId] = previewColor;
+        if (showPlaygroundLowerBound) {
+          const hopColor = colorForPlaygroundHopDistance(playgroundHopDist[nodeId]);
+          if (hopColor) fillById[nodeId] = hopColor;
+        } else {
+          fillById[nodeId] = previewColor;
+        }
         strokeById[nodeId] = "#d75a1a";
         strokeWidthById[nodeId] = 0.75;
       });
     }
     return { fillById, strokeById, strokeWidthById };
-  }, [playgroundCandidateIds, playgroundPreview, playgroundState?.timeslots, playgroundViewSlot]);
+  }, [
+    playgroundCandidateIds,
+    playgroundHopDist,
+    playgroundPreview,
+    playgroundState?.timeslots,
+    playgroundViewSlot,
+    showPlaygroundLowerBound
+  ]);
 
   const replayVisual = useMemo(() => {
     const fillById = { 0: "#ec5bb8" };
@@ -2070,7 +2175,8 @@ export default function MainTopologyPanel({
   }, [focusedTopo?.topology_name, isRunDerivedTreeMode, playgroundRunSourceId]);
 
   useEffect(() => {
-    onExportSnapshotPatch?.({
+    if (!onExportSnapshotPatch || compareViewMode) return;
+    onExportSnapshotPatch({
       temperatureRows: temperatureProbabilityRows,
       ucbRows: ucbScoreRows,
       qTableRows,
@@ -2080,10 +2186,11 @@ export default function MainTopologyPanel({
       batchResultAliasMap,
       resultsSingleFocusedBatch,
       focusedBatchTopologies: topologiesInBatch,
-      runBatchTopologies: runBatchTopologies ?? []
+      runBatchTopologies: runBatchTopologies ?? STABLE_EMPTY_LIST
     });
   }, [
     onExportSnapshotPatch,
+    compareViewMode,
     temperatureProbabilityRows,
     ucbScoreRows,
     qTableRows,
@@ -2892,6 +2999,13 @@ export default function MainTopologyPanel({
                           Resume
                         </button>
                       ) : null}
+                      {batchRunProgress.failed > 0 &&
+                      batchRunProgress.batch_status !== "running" &&
+                      batchRunProgress.batch_status !== "queued" ? (
+                        <button type="button" className="primary-cta small" onClick={onBatchRetryFailed}>
+                          Retry failed
+                        </button>
+                      ) : null}
                     </div>
                     {Array.isArray(batchRunProgress.rows) && batchRunProgress.rows.length > 0 ? (
                       <div className="batch-progress-table-wrap">
@@ -3473,14 +3587,30 @@ export default function MainTopologyPanel({
             >
               {isTopologyPlayground ? (
                 <div className="playground-shell" ref={playgroundShellRef}>
+                  <div className="playground-topo-metrics-bar">
+                    {showPlaygroundLowerBound ? (
+                      <span className="playground-metric-pill">
+                        Lower bound: <strong>{playgroundLowerBoundValue}</strong>
+                      </span>
+                    ) : null}
+                    <label className="playground-metric-toggle compare-chart-check">
+                      <input
+                        type="checkbox"
+                        checked={showPlaygroundLowerBound}
+                        onChange={(e) => setShowPlaygroundLowerBound(e.target.checked)}
+                      />
+                      <span>Lower bound</span>
+                    </label>
+                  </div>
                   <TopologyGraph
                     graph={focusedGraph}
                     className="full-graph"
                     interactive
                     showLabels
-                    nodeRadius={graphDisplaySettings.node_size}
-                    labelSize={graphDisplaySettings.label_size}
-                    edgeWidth={graphDisplaySettings.edge_width}
+                    autoFitToBounds
+                    nodeRadius={PLAYGROUND_NODE_RADIUS}
+                    labelSize={PLAYGROUND_LABEL_SIZE}
+                    edgeWidth={PLAYGROUND_EDGE_WIDTH}
                     edgeColor="#d0d5ea"
                     customEdges={playgroundEdges}
                     nodeFillById={playgroundVisual.fillById}
@@ -3492,25 +3622,29 @@ export default function MainTopologyPanel({
                     onNodeLeave={isRunDerivedTreeMode ? undefined : clearPlaygroundHoverPreview}
                     onNodeClick={isRunDerivedTreeMode ? undefined : commitPlaygroundNode}
                   />
-                  <div className="replay-bar-wrap playground-bar-wrap">
-                    <input
-                      type="range"
-                      min={0}
-                      max={playgroundLatestSlot}
-                      value={playgroundViewSlot}
-                      onChange={(e) => setPlaygroundViewSlot(Number(e.target.value))}
-                    />
-                    <div className="replay-bar-meta">
-                      <span>Timeslot: {playgroundViewSlot}</span>
-                      <span>
-                        {playgroundActionLocked
-                          ? playgroundState?.isComplete
-                            ? "Done"
-                            : "Viewing history"
-                          : `Mode: ${playgroundState?.mode === "receiver" ? "Receiver" : "Broadcaster"}`}
-                      </span>
+                  {showPlaygroundLowerBound ? (
+                    <PlaygroundLowerBoundScale lowerBound={playgroundLowerBoundValue} />
+                  ) : (
+                    <div className="replay-bar-wrap playground-bar-wrap">
+                      <input
+                        type="range"
+                        min={0}
+                        max={playgroundLatestSlot}
+                        value={playgroundViewSlot}
+                        onChange={(e) => setPlaygroundViewSlot(Number(e.target.value))}
+                      />
+                      <div className="replay-bar-meta">
+                        <span>Timeslot: {playgroundViewSlot}</span>
+                        <span>
+                          {playgroundActionLocked
+                            ? playgroundState?.isComplete
+                              ? "Done"
+                              : "Viewing history"
+                            : `Mode: ${playgroundState?.mode === "receiver" ? "Receiver" : "Broadcaster"} · Spread: ${playgroundState?.spreadMode === "la" ? "LA" : "Normal"}`}
+                        </span>
+                      </div>
                     </div>
-                  </div>
+                  )}
                   <div className="playground-decision-tree-block">
                     <div className="playground-state-tree-header">
                       <h5>Decision tree</h5>

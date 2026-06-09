@@ -15,7 +15,28 @@ from app.services.run_artifacts import (
 from app.services.runners.base import RunExecutionResult, RunnerContext, TOPOLOGY_RUN_TIMEOUT_SEC
 
 
-def _pick_first_broadcaster(env: Br_Env) -> int:
+def _pick_first_action(env: Br_Env, action_axis: str, spread_mode: str) -> int:
+    axis = str(action_axis)
+    mode = str(spread_mode)
+
+    if axis == "receiver":
+        if mode == "la":
+            return int(
+                max(
+                    env.rcv_cands,
+                    key=lambda node_id: (int(getattr(env.V[node_id], "latency_ahead", -1)), -int(node_id)),
+                )
+            )
+        return int(max(env.rcv_cands, key=lambda node_id: (env._future_neighbor_count(node_id), -int(node_id))))
+
+    if mode == "la":
+        return int(
+            max(
+                env.br_cands,
+                key=lambda node_id: (int(getattr(env.V[node_id], "latency_ahead", -1)), -int(node_id)),
+            )
+        )
+
     def cover_count(node_id: int) -> tuple[int, int]:
         count = len([nbr for nbr in env.V[node_id].neighbors if nbr in env.rcv_cands])
         return count, -node_id
@@ -26,15 +47,21 @@ def _pick_first_broadcaster(env: Br_Env) -> int:
 def execute_greedy(context: RunnerContext) -> RunExecutionResult:
     run_id = context.run_id
     nodes = context.nodes
+    config = context.config or {}
+    action_axis = str(config.get("action_axis", "broadcaster"))
+    spread_mode = str(config.get("spread_mode", "normal"))
 
     env = Br_Env(nodes, 1)
     lower_bound = int(env.network_diameter())
+    if spread_mode == "la":
+        trees.prepare_latency_ahead(env.V)
     timeout_sec = TOPOLOGY_RUN_TIMEOUT_SEC
     started = time.monotonic()
 
     done = env.reset()
     env.cur_time = 0
-    trees.build_bfs(env.V)
+    if spread_mode != "la":
+        trees.build_bfs(env.V)
     total_reward = 0.0
     step_rows: list[dict[str, Any]] = []
     state_id_mapping: dict[str, int] = {}
@@ -50,8 +77,12 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
             continue
 
         state_hash = hash_state(env.V_s)
-        first_pick = _pick_first_broadcaster(env)
-        next_state, reward, done, br_set, rcv_set = env.proceed_action(first_pick)
+        first_pick = _pick_first_action(env, action_axis, spread_mode)
+        next_state, reward, done, br_set, rcv_set = env.proceed_action(
+            first_pick,
+            action_axis=action_axis,
+            spread_mode=spread_mode,
+        )
         next_state = list(set(next_state))
         next_state_hash = hash_state(next_state)
 
@@ -81,7 +112,9 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
         env.V_s = next_state
         total_reward += reward
 
-    artifact_root = Path(__file__).resolve().parents[4] / "storage" / "artifacts" / run_id
+    from app.core.paths import artifact_root_for_run
+
+    artifact_root = artifact_root_for_run(run_id)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     run_bundle_path = artifact_root / "run_bundle.json.gz"
@@ -107,6 +140,8 @@ def execute_greedy(context: RunnerContext) -> RunExecutionResult:
         "best_delay_explored": int(env.cur_time),
         "lower_bound": lower_bound,
         "reward_final": float(total_reward),
+        "action_axis": action_axis,
+        "spread_mode": spread_mode,
     }
 
     write_gzip_json(

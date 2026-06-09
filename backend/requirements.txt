@@ -4,4 +4,6 @@ pydantic
 sqlalchemy
 alembic
 python-multipart
+python-dotenv
+psycopg[binary]
 numpy

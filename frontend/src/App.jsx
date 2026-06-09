@@ -19,10 +19,30 @@ import { resolveExportContext } from "./export/exportContexts.js";
 import { getInitialDecisionTreeLayout, saveDecisionTreeLayoutAsDefault, refreshInitialDecisionTreeLayoutCache } from "./utils/decisionTreeLayoutStorage.js";
 import { hydrateLegacyRunArtifactState } from "./utils/runArtifactHydration.js";
 import { buildPolicyTraceFromConfig } from "./utils/policyTrace.js";
+import { derivePlaygroundCandidates, simulateGreedySpread } from "./utils/greedySpread.js";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
+import { API_BASE } from "./apiBase.js";
 
 const PANEL_LAYOUT_STORAGE_KEY = "qbr.panel-layout";
+const ACTIVE_MENU_STORAGE_KEY = "qbr.active-menu";
+const ACTIVE_MENU_IDS = new Set([
+  "home",
+  "topologies",
+  "generate",
+  "run_topo",
+  "run_multi",
+  "results",
+  "compare"
+]);
+
+function readStoredActiveMenu() {
+  try {
+    const value = localStorage.getItem(ACTIVE_MENU_STORAGE_KEY);
+    return ACTIVE_MENU_IDS.has(value) ? value : "home";
+  } catch {
+    return "home";
+  }
+}
 const SIDEBAR_WIDTH_DEFAULT = 280;
 const RIGHT_PANEL_WIDTH_DEFAULT = 420;
 const SIDEBAR_WIDTH_MIN = 220;
@@ -67,6 +87,7 @@ const LARGE_TOPO_CONFIRM_MESSAGE =
 function resolveBackboneId(algorithmId) {
   if (algorithmId === "qbr") return "qbr";
   if (algorithmId === "greedy") return "greedy";
+  if (algorithmId === "cf_cas") return "cf_cas";
   return String(algorithmId || "");
 }
 
@@ -133,6 +154,7 @@ const INITIAL_GRAPH_DISPLAY_SETTINGS = {
 };
 const INITIAL_PLAYGROUND_STATE = {
   mode: "broadcaster",
+  spreadMode: "normal",
   timeslots: [],
   currentSlot: 0,
   viewSlot: 0,
@@ -176,127 +198,8 @@ const LEGACY_PRESET_LOCAL_STORAGE_KEYS = [
   "qbr_run_multi_preset_wizard_v1"
 ];
 
-function buildAdjacencyFromGraph(graph) {
-  if (!graph || !Array.isArray(graph.nodes)) return new Map();
-  const adjacency = new Map(graph.nodes.map((node) => [node.node_id, new Set()]));
-  const txRange = Number(graph.tx_range) || 0;
-  const txRangeSq = txRange * txRange;
-  const nodes = graph.nodes;
-  for (let i = 0; i < nodes.length; i += 1) {
-    for (let j = i + 1; j < nodes.length; j += 1) {
-      const a = nodes[i];
-      const b = nodes[j];
-      const dx = a.x - b.x;
-      const dy = a.y - b.y;
-      if (dx * dx + dy * dy <= txRangeSq) {
-        adjacency.get(a.node_id)?.add(b.node_id);
-        adjacency.get(b.node_id)?.add(a.node_id);
-      }
-    }
-  }
-  return adjacency;
-}
-
-function derivePlaygroundCandidates(graph, coveredNodeIds) {
-  const covered = new Set(coveredNodeIds ?? []);
-  const adjacency = buildAdjacencyFromGraph(graph);
-  const broadcasterCandidates = [];
-  const receiverCandidatesSet = new Set();
-
-  covered.forEach((nodeId) => {
-    const neighbors = adjacency.get(nodeId) ?? new Set();
-    const canReachUncovered = Array.from(neighbors).some((neighborId) => !covered.has(neighborId));
-    if (canReachUncovered) {
-      broadcasterCandidates.push(nodeId);
-      neighbors.forEach((neighborId) => {
-        if (!covered.has(neighborId)) {
-          receiverCandidatesSet.add(neighborId);
-        }
-      });
-    }
-  });
-
-  return {
-    adjacency,
-    broadcasterCandidates: broadcasterCandidates.sort((a, b) => a - b),
-    receiverCandidates: Array.from(receiverCandidatesSet).sort((a, b) => a - b)
-  };
-}
-
-function mapReceiverToBroadcaster(receiverId, broadcasterCandidates, receiverCandidates, adjacency) {
-  const receiverCandidateSet = new Set(receiverCandidates);
-  const broadcasters = broadcasterCandidates.filter((nodeId) => adjacency.get(nodeId)?.has(receiverId));
-  if (!broadcasters.length) return null;
-  return [...broadcasters].sort((a, b) => {
-    const aCover = Array.from(adjacency.get(a) ?? []).filter((nodeId) => receiverCandidateSet.has(nodeId)).length;
-    const bCover = Array.from(adjacency.get(b) ?? []).filter((nodeId) => receiverCandidateSet.has(nodeId)).length;
-    if (bCover !== aCover) return bCover - aCover;
-    return a - b;
-  })[0];
-}
-
-function simulatePlaygroundSlot(graph, coveredNodeIds, mode, selectedNodeId) {
-  const covered = new Set(coveredNodeIds ?? []);
-  const { adjacency, broadcasterCandidates, receiverCandidates } = derivePlaygroundCandidates(graph, coveredNodeIds);
-  const receiverCandidateSet = new Set(receiverCandidates);
-  let firstPick = null;
-
-  if (mode === "receiver") {
-    firstPick = mapReceiverToBroadcaster(selectedNodeId, broadcasterCandidates, receiverCandidates, adjacency);
-  } else if (broadcasterCandidates.includes(selectedNodeId)) {
-    firstPick = selectedNodeId;
-  }
-
-  if (firstPick === null || firstPick === undefined) {
-    return null;
-  }
-
-  const broadcastersRemaining = [...broadcasterCandidates];
-  const transmitters = [];
-  const receivers = [];
-
-  function collectReceiversFor(nodeId) {
-    return Array.from(adjacency.get(nodeId) ?? [])
-      .filter((neighborId) => !covered.has(neighborId) && receiverCandidateSet.has(neighborId))
-      .sort((a, b) => a - b);
-  }
-
-  const firstIndex = broadcastersRemaining.indexOf(firstPick);
-  if (firstIndex >= 0) {
-    const coveredByFirst = collectReceiversFor(firstPick);
-    transmitters.push(firstPick);
-    receivers.push(...coveredByFirst);
-    broadcastersRemaining.splice(firstIndex, 1);
-  }
-
-  broadcastersRemaining.sort((a, b) => collectReceiversFor(b).length - collectReceiversFor(a).length || a - b);
-
-  let idx = 0;
-  while (idx < broadcastersRemaining.length) {
-    const broadcasterId = broadcastersRemaining[idx];
-    const candidateReceivers = collectReceiversFor(broadcasterId);
-    if (candidateReceivers.some((nodeId) => receivers.includes(nodeId))) {
-      broadcastersRemaining.splice(idx, 1);
-      continue;
-    }
-    if (candidateReceivers.length > 0) {
-      transmitters.push(broadcasterId);
-      receivers.push(...candidateReceivers);
-    }
-    broadcastersRemaining.splice(idx, 1);
-  }
-
-  const uniqueReceivers = Array.from(new Set(receivers)).sort((a, b) => a - b);
-  if (uniqueReceivers.length === 0) {
-    return null;
-  }
-
-  return {
-    firstPick,
-    mode,
-    transmitters: Array.from(new Set(transmitters)).sort((a, b) => a - b),
-    receivers: uniqueReceivers
-  };
+function simulatePlaygroundSlot(graph, coveredNodeIds, mode, selectedNodeId, spreadMode = "normal") {
+  return simulateGreedySpread(graph, coveredNodeIds, mode, selectedNodeId, spreadMode);
 }
 
 export function playgroundStateHash(coveredNodeIds) {
@@ -305,13 +208,13 @@ export function playgroundStateHash(coveredNodeIds) {
   return sorted.join("/");
 }
 
-function countUniqueNextPlaygroundStates(graph, coveredNodeIds, mode) {
+function countUniqueNextPlaygroundStates(graph, coveredNodeIds, mode, spreadMode = "normal") {
   if (!graph) return 0;
   const { broadcasterCandidates, receiverCandidates } = derivePlaygroundCandidates(graph, coveredNodeIds);
   const actions = mode === "receiver" ? receiverCandidates : broadcasterCandidates;
   const uniqueStateHashes = new Set();
   actions.forEach((nodeId) => {
-    const nextSlot = simulatePlaygroundSlot(graph, coveredNodeIds, mode, nodeId);
+    const nextSlot = simulatePlaygroundSlot(graph, coveredNodeIds, mode, nodeId, spreadMode);
     if (!nextSlot) return;
     const nextCovered = Array.from(new Set([...(coveredNodeIds ?? []), ...(nextSlot.receivers ?? [])])).sort((a, b) => a - b);
     uniqueStateHashes.add(nextCovered.join("/"));
@@ -384,7 +287,7 @@ function computeSoftmaxProbabilities(qValues, tau) {
 }
 
 export default function App() {
-  const [activeMenu, setActiveMenu] = useState("home");
+  const [activeMenu, setActiveMenu] = useState(readStoredActiveMenu);
   const [activePanel2Tab, setActivePanel2Tab] = useState("detail");
   const [statusFilter, setStatusFilter] = useState("");
   const [nodeFilter, setNodeFilter] = useState("");
@@ -1691,6 +1594,14 @@ export default function App() {
     }));
   }
 
+  function setPlaygroundSpreadMode(spreadMode) {
+    setPlaygroundState((prev) => ({
+      ...prev,
+      spreadMode: spreadMode === "la" ? "la" : "normal",
+      hoverPreview: null
+    }));
+  }
+
   function setPlaygroundViewSlot(slot) {
     setPlaygroundState((prev) => ({
       ...prev,
@@ -1710,7 +1621,7 @@ export default function App() {
         if (prev.hoverPreview === null) return prev;
         return { ...prev, hoverPreview: null };
       }
-      const preview = simulatePlaygroundSlot(graph, prev.coveredNodeIds, prev.mode, nodeId);
+      const preview = simulatePlaygroundSlot(graph, prev.coveredNodeIds, prev.mode, nodeId, prev.spreadMode);
       if (!preview) {
         if (prev.hoverPreview === null) return prev;
         return { ...prev, hoverPreview: null };
@@ -1737,7 +1648,7 @@ export default function App() {
     setPlaygroundState((prev) => {
       const latestSlot = prev.timeslots.length;
       if (prev.isComplete || prev.viewSlot !== latestSlot) return prev;
-      const nextSlot = simulatePlaygroundSlot(graph, prev.coveredNodeIds, prev.mode, nodeId);
+      const nextSlot = simulatePlaygroundSlot(graph, prev.coveredNodeIds, prev.mode, nodeId, prev.spreadMode);
       if (!nextSlot) return prev;
       const fromHash = playgroundStateHash(prev.coveredNodeIds);
       const nextCovered = Array.from(new Set([...prev.coveredNodeIds, ...nextSlot.receivers])).sort((a, b) => a - b);
@@ -1760,7 +1671,8 @@ export default function App() {
             transmitters: nextSlot.transmitters,
             receivers: nextSlot.receivers,
             firstPick: nextSlot.firstPick,
-            mode: prev.mode
+            mode: prev.mode,
+            spreadMode: prev.spreadMode ?? "normal"
           }
         ],
         currentSlot: timeslot,
@@ -2332,6 +2244,33 @@ export default function App() {
     }
   }
 
+  async function handleBatchRetryFailed() {
+    if (!focusedBatchRunId) return;
+    try {
+      const response = await fetch(`${API_BASE}/runs/batch/${focusedBatchRunId}/retry-failed`, {
+        method: "POST"
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Retry failed."));
+        return;
+      }
+      batchDetailRefreshKeyRef.current = "";
+      setMessage(data?.message || "Re-queued failed runs.");
+      try {
+        const progressResponse = await fetch(`${API_BASE}/runs/batch/${focusedBatchRunId}/progress`);
+        const progressData = await progressResponse.json();
+        if (progressResponse.ok) {
+          setBatchRunProgress(progressData);
+        }
+      } catch {
+        // progress poll will catch up
+      }
+    } catch {
+      setMessage("Failed.");
+    }
+  }
+
   async function handleRenameBatchRunResult(batchRunId, resultLabel) {
     if (!batchRunId) return false;
     const payload =
@@ -2582,6 +2521,14 @@ export default function App() {
     );
   }, [sidebarWidth, rightPanelWidth]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_MENU_STORAGE_KEY, activeMenu);
+    } catch {
+      /* ignore */
+    }
+  }, [activeMenu]);
+
   const dashboardGridColumns = useMemo(() => {
     if (isNarrowLayout) {
       return hideRightPanel ? "260px minmax(0, 1fr)" : "260px minmax(0, 1fr)";
@@ -2723,6 +2670,7 @@ export default function App() {
         batchRunProgress={batchRunProgress}
         onBatchStop={handleBatchStop}
         onBatchResume={handleBatchResume}
+        onBatchRetryFailed={handleBatchRetryFailed}
         onDeleteBatchRunResult={handleDeleteBatchRunResult}
         onRenameBatchRunResult={handleRenameBatchRunResult}
         graphByTopologyId={graphByTopologyId}
@@ -2732,11 +2680,13 @@ export default function App() {
             ? countUniqueNextPlaygroundStates(
                 graphByTopologyId[focusedTopologyId],
                 playgroundState.coveredNodeIds,
-                playgroundState.mode
+                playgroundState.mode,
+                playgroundState.spreadMode
               )
             : 0
         }
         setPlaygroundMode={setPlaygroundMode}
+        setPlaygroundSpreadMode={setPlaygroundSpreadMode}
         setPlaygroundViewSlot={setPlaygroundViewSlot}
         setPlaygroundHoverNode={setPlaygroundHoverNode}
         clearPlaygroundHoverPreview={clearPlaygroundHoverPreview}
@@ -2912,7 +2862,8 @@ export default function App() {
               ? countUniqueNextPlaygroundStates(
                   graphByTopologyId[focusedTopologyId],
                   playgroundState.coveredNodeIds,
-                  playgroundState.mode
+                  playgroundState.mode,
+                  playgroundState.spreadMode
                 )
               : 0
           }
@@ -2922,6 +2873,7 @@ export default function App() {
           ucbTool={ucbTool}
           updateUcbFontScale={updateUcbFontScale}
           setPlaygroundMode={setPlaygroundMode}
+          setPlaygroundSpreadMode={setPlaygroundSpreadMode}
           setPlaygroundViewSlot={setPlaygroundViewSlot}
           onResetPlayground={resetPlaygroundState}
           decisionTreeRowSpread={decisionTreeRowSpread}

@@ -525,7 +525,9 @@ def _read_artifact_path(session, run_id: str, artifact_type: str) -> Path | None
         path = Path(row.uri)
         if path.exists() and path.is_file():
             return path
-    artifact_root = Path(__file__).resolve().parents[3] / "storage" / "artifacts" / run_id
+    from app.core.paths import artifact_root_for_run
+
+    artifact_root = artifact_root_for_run(run_id)
     for name in (artifact_type, f"{artifact_type}.json", f"{artifact_type}.json.gz", f"{artifact_type}.csv"):
         candidate = artifact_root / name
         if candidate.exists() and candidate.is_file():
