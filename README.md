@@ -1,145 +1,156 @@
-# QBR — Hướng dẫn triển khai
+# QBR — Deployment Guide
 
-## Yêu cầu
+## Requirements
 
-| Thành phần | Phiên bản |
-|------------|-----------|
-| Node.js | 20+ |
-| Python | 3.11+ |
-| Docker | Bắt buộc cho Postgres dev (`npm run dev`) và stack Docker đầy đủ |
-| PostgreSQL | Bắt buộc (SQLite không còn hỗ trợ) |
+| Component  | Version                                                           |
+| ---------- | ----------------------------------------------------------------- |
+| Node.js    | 20+                                                               |
+| Python     | 3.11+                                                             |
+| Docker     | Required for PostgreSQL in development and full Docker deployment |
+| PostgreSQL | Required                                                          |
 
 ---
 
-## 1. Cấu hình môi trường
+## 1. Environment Setup
 
-Tạo file env từ mẫu (chỉ cần làm một lần):
+Initialize environment files:
 
 ```bash
 cp .env.example .env
 cp frontend/.env.example frontend/.env
 ```
 
-### `QBR/.env`
+### Root `.env`
 
-| Biến | Mặc định | Ghi chú |
-|------|----------|---------|
-| `DATABASE_URL` | `postgresql://qbr:qbr@127.0.0.1:5433/qbr` | Kết nối từ máy host tới Postgres Docker |
-| `POSTGRES_PORT` | `5433` | Dùng **5433** nếu máy đã có Postgres khác ở port 5432 (thường gặp trên Windows) |
-| `BACKEND_PORT` | `8000` | API |
-| `FRONTEND_PORT` | `5173` | UI (dev) |
+| Variable        | Default Value                             |
+| --------------- | ----------------------------------------- |
+| `DATABASE_URL`  | `postgresql://qbr:qbr@127.0.0.1:5433/qbr` |
+| `POSTGRES_PORT` | `5433`                                    |
+| `BACKEND_PORT`  | `8000`                                    |
+| `FRONTEND_PORT` | `5173`                                    |
 
-### `QBR/frontend/.env`
+### `frontend/.env`
 
 ```env
 VITE_API_BASE=/api
 ```
 
-UI và API dùng **cùng một cổng** qua Vite proxy (`/api` → `127.0.0.1:8000`). Phù hợp cho Cloudflare Tunnel.
+The frontend accesses the backend through the Vite proxy (`/api` → `127.0.0.1:8000`).
 
-Dữ liệu artifact lưu tại `storage/artifacts/` — backend và worker phải cùng thấy thư mục này.
+Artifacts are stored in:
+
+```text
+storage/artifacts/
+```
+
+Backend and worker services must have access to this directory.
 
 ---
 
-## 2. Cài đặt lần đầu
+## 2. Initial Installation
 
-Trong thư mục `QBR/`:
+From the project root:
 
 ```bash
 npm install
 pip install -r backend/requirements.txt
 ```
 
-Khuyến nghị dùng Python venv:
+Using a Python virtual environment:
 
 ```bash
 python -m venv .venv
-# Windows:  .venv\Scripts\activate
-# Linux:    source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+
+# Linux/macOS
+source .venv/bin/activate
+
 pip install -r backend/requirements.txt
 ```
 
 ---
 
-## 3. Chạy dev (khuyến nghị hàng ngày)
+## 3. Development Mode
+
+Start the development environment:
 
 ```bash
 npm run dev
 ```
 
-Lệnh này tự động:
+This launches:
 
-1. Khởi động Postgres container (`predev`)
-2. Frontend Vite — **http://localhost:5173**
-3. Backend API — http://localhost:8000 (proxy qua UI tại `/api`)
-4. **3 worker** xử lý queue
+* PostgreSQL container
+* Frontend (Vite)
+* Backend API
+* Three worker processes
 
-### Kiểm tra
+### Endpoints
 
-| Mục | URL / lệnh |
-|-----|------------|
-| UI | http://localhost:5173 |
-| API trực tiếp | http://localhost:8000/health |
-| Postgres container | `docker compose ps postgres` |
+| Service      | URL                          |
+| ------------ | ---------------------------- |
+| Frontend     | http://localhost:5173        |
+| Backend API  | http://localhost:8000        |
+| Health Check | http://localhost:8000/health |
 
-### Lệnh phụ
+### Additional Commands
 
 ```bash
-npm run dev:postgres   # chỉ Postgres
-npm run dev:worker     # một worker (debug)
+npm run dev:postgres
+npm run dev:worker
 ```
 
 ---
 
-## 4. Chia sẻ cho người khác (Cloudflare Tunnel)
+## 4. Sharing a Development Instance
 
-Cần `npm install` (đã có package `cloudflared` trong project).
-
-**Một lệnh** — dev + tunnel:
+Start the development environment and create a Cloudflare Tunnel:
 
 ```bash
 npm run share
 ```
 
-Khi tunnel sẵn sàng, terminal in khối:
-
-```
-============================================================
-  CHIA SE LINK NAY CHO NGUOI KHAC:
-  https://xxxx.trycloudflare.com
-============================================================
-```
-
-**Hai terminal** (dev đã chạy rồi):
+Alternatively:
 
 ```bash
-npm run dev      # terminal 1
-npm run tunnel   # terminal 2
+npm run dev
+npm run tunnel
 ```
 
-Chỉ tunnel **một cổng 5173** — không cần expose 8000.
+The generated Cloudflare URL can be used to access the application remotely.
+
+Only the frontend port (`5173`) is exposed. API requests are routed through the Vite proxy.
 
 ---
 
-## 5. Docker Compose (full stack)
+## 5. Docker Compose Deployment
 
-Chạy toàn bộ trong container: Postgres + backend + frontend + 3 worker.
+Start the full stack:
 
 ```bash
 cp .env.example .env
 cp frontend/.env.example frontend/.env
+
 docker compose up --build
 ```
 
-| Dịch vụ | URL |
-|---------|-----|
-| UI | http://localhost:5173 |
-| API | http://localhost:8000 |
-| Postgres (host) | `127.0.0.1:5433` (theo `POSTGRES_PORT` trong `.env`) |
+Services:
 
-Trong container, backend/worker dùng `DATABASE_URL=postgresql://qbr:qbr@postgres:5432/qbr` (Compose tự gán).
+| Service           | URL                   |
+| ----------------- | --------------------- |
+| Frontend          | http://localhost:5173 |
+| Backend API       | http://localhost:8000 |
+| PostgreSQL (host) | 127.0.0.1:5433        |
 
-Dừng stack:
+Within the Docker network, backend and worker services use:
+
+```text
+postgresql://qbr:qbr@postgres:5432/qbr
+```
+
+Stop the stack:
 
 ```bash
 docker compose down
@@ -149,85 +160,125 @@ docker compose down
 
 ## 6. Ubuntu (22.04 / 24.04)
 
-### Dev native
+### Native Development
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv git curl build-essential docker.io docker-compose-v2
+
+sudo apt install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    curl \
+    build-essential \
+    docker.io \
+    docker-compose-v2
+
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
-sudo usermod -aG docker "$USER"   # đăng xuất / đăng nhập lại
+
+sudo usermod -aG docker "$USER"
 
 cd QBR
-python3 -m venv .venv && source .venv/bin/activate
+
+python3 -m venv .venv
+source .venv/bin/activate
+
 pip install -r backend/requirements.txt
-cp .env.example .env && cp frontend/.env.example frontend/.env
+
+cp .env.example .env
+cp frontend/.env.example frontend/.env
+
 npm install
 npm run dev
 ```
 
-### Server — Docker Compose
+### Docker Deployment
 
 ```bash
 cd QBR
+
 cp .env.example .env
 cp frontend/.env.example frontend/.env
+
 docker compose up --build -d
+
 docker compose logs -f backend worker-1
 ```
 
-### Postgres cài trực tiếp (không Docker DB)
+### Local PostgreSQL Installation
 
 ```bash
 sudo apt install -y postgresql postgresql-contrib
+
 sudo -u postgres createuser -P qbr
 sudo -u postgres createdb -O qbr qbr
 ```
 
-Sửa `.env`:
+Update `.env`:
 
 ```env
-DATABASE_URL=postgresql://qbr:<mat-khau>@127.0.0.1:5432/qbr
+DATABASE_URL=postgresql://qbr:<password>@127.0.0.1:5432/qbr
 POSTGRES_PORT=5432
 ```
 
-Chạy backend + worker (vd. `npm run dev` hoặc systemd).
+Start the application using the preferred runtime method (e.g. `npm run dev`, systemd, or Docker).
 
 ---
 
-## 7. Xử lý sự cố thường gặp
+## 7. Troubleshooting
 
-### `password authentication failed for user "qbr"`
+### PostgreSQL Authentication Failure
 
-Máy có Postgres khác đang chiếm port 5432. Trong `.env` đặt:
+```text
+password authentication failed for user "qbr"
+```
+
+Update `.env`:
 
 ```env
 POSTGRES_PORT=5433
 DATABASE_URL=postgresql://qbr:qbr@127.0.0.1:5433/qbr
 ```
 
-Rồi:
+Then restart PostgreSQL:
 
 ```bash
 docker compose down
 docker compose up postgres -d --wait
+
 npm run dev
 ```
 
-### `Port 5173 is in use`
+### Port 5173 Already in Use
 
-Tắt session `npm run dev` cũ (Ctrl+C) hoặc kill process Node/Python thừa, chạy lại `npm run dev`.
+Terminate the existing process using port `5173` and restart:
 
-### `cloudflared` không nhận lệnh
+```bash
+npm run dev
+```
 
-Dùng script qua npm (không cần cài global):
+### Cloudflare Tunnel Command Not Found
+
+Use the project scripts:
 
 ```bash
 npm run tunnel
-# hoặc
+```
+
+or
+
+```bash
 npm run share
 ```
 
-### UI load nhưng API lỗi khi dùng tunnel
+### API Requests Fail Through Tunnel
 
-Đảm bảo `frontend/.env` có `VITE_API_BASE=/api` và chạy lại `npm run dev`.
+Verify:
+
+```env
+VITE_API_BASE=/api
+```
+
+Then restart the frontend development server.
