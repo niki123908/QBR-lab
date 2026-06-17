@@ -2633,6 +2633,8 @@ export default function App() {
         transmissionLastPayload={transmissionLastPayload}
         transmissionBestPayload={transmissionBestPayload}
         qTablePayload={qTablePayload}
+        stateActionLastPayload={stateActionLastPayload}
+        stateActionBestPayload={stateActionBestPayload}
         transmissionAllPayload={transmissionAllPayload}
         qTableAllEpochsPayload={qTableAllEpochsPayload}
         resultsViewMode={resultsViewMode}

@@ -24,7 +24,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       QBR_ROOT: /app
-      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://qbr:qbr@postgres:5432/qbr}
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,7 +55,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       QBR_ROOT: /app
-      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://qbr:qbr@postgres:5432/qbr}
       WORKER_ID: worker-1
     volumes:
       - storage_data:/app/storage
@@ -73,7 +73,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       QBR_ROOT: /app
-      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://qbr:qbr@postgres:5432/qbr}
       WORKER_ID: worker-2
     volumes:
       - storage_data:/app/storage
@@ -91,7 +91,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       QBR_ROOT: /app
-      DATABASE_URL: ${DATABASE_URL:-postgresql://qbr:qbr@postgres:5432/qbr}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://qbr:qbr@postgres:5432/qbr}
       WORKER_ID: worker-3
     volumes:
       - storage_data:/app/storage

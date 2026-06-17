@@ -241,6 +241,7 @@ function defaultChartUi() {
     yPaddingPct: 8,
     showGrid: true,
     showLegend: true,
+    showLineValues: false,
     leadingZeroPad: true,
     seriesStyles: {},
     yAxisManual: false,
@@ -429,7 +430,38 @@ function ChartCard({
   const useFixedPathCountScale = isPathOverlay || isPathCountOnlyChart(plotDefs);
   const pathLegendItems = isPathOverlay ? pathOverlayLegendPayload(plotDefs, sideLabelsById) : [];
   const convergenceSeriesOnly = plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
+  const showLineValues =
+    uiSafe.showLineValues === true || (uiSafe.showLineValues !== false && convergenceSeriesOnly);
   const yTickFormatter = convergenceSeriesOnly ? (value) => `${Math.round(Number(value) || 0)}%` : valueTick;
+
+  function linePointValueLabel(def, plotIdx, seriesCount) {
+    return ({ x, y, value }) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      const px = Number(x);
+      const py = Number(y);
+      const text = convergenceSeriesOnly ? `${Math.round(n)}%` : valueTick(n);
+      // Near chart top, labels above the point are clipped — place below instead.
+      // Alternate above/below when multiple series share the same x bucket.
+      const stack = Math.floor(plotIdx / 2);
+      const preferBelow = py < 24 || (seriesCount > 1 && plotIdx % 2 === 1);
+      const labelY = preferBelow ? py + 14 + stack * 10 : py - 10 - stack * 11;
+      return (
+        <text
+          x={px}
+          y={labelY}
+          textAnchor="middle"
+          dominantBaseline={preferBelow ? "hanging" : "text-after-edge"}
+          fontSize="10"
+          fill={def.color}
+          fillOpacity="0.95"
+        >
+          {text}
+        </text>
+      );
+    };
+  }
+
   const autoYDomain = computeChartAutoYDomain({
     rows,
     plotDefs,
@@ -464,8 +496,10 @@ function ChartCard({
         }
       : undefined;
   const legendBottomPad = !isBar && uiSafe.showLegend ? (uiSafe.showXAxisLabel ? 36 : 28) : 0;
+  const valueLabelTopPad =
+    !isBar && showLineValues ? Math.max(18, 10 + Math.ceil(plotDefs.length / 2) * 10) : 0;
   const chartMargin = {
-    top: 12,
+    top: 12 + valueLabelTopPad,
     right: 22,
     left: uiSafe.showYAxisLabel ? 28 : 20,
     bottom: (uiSafe.showXAxisLabel ? 22 : 8) + legendBottomPad
@@ -607,7 +641,7 @@ function ChartCard({
                   shape={convergenceOverlayShapeFactory(SIDE_COLORS.A.light, "#FBCFE8", "#C4B5FD")}
                 />
               ) : null}
-              {plotDefs.map((def) => {
+              {plotDefs.map((def, plotIdx) => {
                 const markerShape = def.marker || "circle";
                 return (
                 <Line
@@ -620,31 +654,7 @@ function ChartCard({
                   connectNulls
                   isAnimationActive={false}
                   strokeOpacity={def.opacity ?? 0.5}
-                  label={
-                    convergenceSeriesOnly
-                      ? ({ x, y, value }) => {
-                          const n = Number(value);
-                          if (!Number.isFinite(n)) return null;
-                          const px = Number(x);
-                          const py = Number(y);
-                          const plotIdx = Math.max(0, plotDefs.findIndex((d) => d.dataKey === def.dataKey));
-                          const labelY = py - 10 - plotIdx * 11;
-                          return (
-                            <text
-                              x={px}
-                              y={labelY}
-                              textAnchor="middle"
-                              dominantBaseline="text-after-edge"
-                              fontSize="10"
-                              fill={def.color}
-                              fillOpacity="0.95"
-                            >
-                              {`${Math.round(n)}%`}
-                            </text>
-                          );
-                        }
-                      : undefined
-                  }
+                  label={showLineValues ? linePointValueLabel(def, plotIdx, plotDefs.length) : undefined}
                   dot={
                     markerShape === "none"
                       ? false
@@ -1267,16 +1277,26 @@ function ChartAppearanceModal({ open, draft, chartType, onClose, onDraftChange, 
               <span>Show legend</span>
             </label>
             {chartType === "line" ? (
-              <label className="field-label compare-chart-line-width">
-                <span>Line width</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={8}
-                  value={draft.lineWidth}
-                  onChange={(e) => onDraftChange({ ...draft, lineWidth: Number(e.target.value) })}
-                />
-              </label>
+              <>
+                <label className="compare-chart-check">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draft.showLineValues)}
+                    onChange={(e) => onDraftChange({ ...draft, showLineValues: e.target.checked })}
+                  />
+                  <span>Show point values</span>
+                </label>
+                <label className="field-label compare-chart-line-width">
+                  <span>Line width</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={8}
+                    value={draft.lineWidth}
+                    onChange={(e) => onDraftChange({ ...draft, lineWidth: Number(e.target.value) })}
+                  />
+                </label>
+              </>
             ) : null}
           </div>
         </section>
@@ -1541,11 +1561,14 @@ export default function CompareChartWorkspace({
       compareChartInput
     });
     setAppearanceChartId(chartId);
+    const convergenceSeriesOnly =
+      plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
     setAppearanceDraft(
       buildAppearanceDraft(found, baseDefs, chartIdx, {
         autoYDomain,
         catalogMap,
-        defaultAxisLabels: defaultChartAxisLabels(found.mode, found.selectedMetricKeys, catalogMap)
+        defaultAxisLabels: defaultChartAxisLabels(found.mode, found.selectedMetricKeys, catalogMap),
+        convergenceSeriesOnly
       })
     );
     setAppearanceModalOpen(true);

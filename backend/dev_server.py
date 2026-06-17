@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -16,8 +15,16 @@ ensure_qbr_env()
 
 
 def main() -> None:
-    os.environ["QBR_AUTO_WORKER"] = "0"
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, app_dir=str(BACKEND_DIR))
+    # Watch only backend Python sources — not storage/artifacts (workers write constantly).
+    reload_dirs = [str(BACKEND_DIR / "app")]
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        app_dir=str(BACKEND_DIR),
+        reload_dirs=reload_dirs,
+    )
 
 
 if __name__ == "__main__":

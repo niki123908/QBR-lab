@@ -8,6 +8,8 @@ import BatchResultDetailBody, { linearAxisTicks } from "./BatchResultDetailBody"
 import CompareWorkspace from "./CompareWorkspace";
 import PlaygroundStateTree from "./PlaygroundStateTree";
 import { formatRunLearningStatsSuffix } from "../utils/runLearningStats.js";
+import { buildPathLearningSummary } from "../utils/pathLearningStats.js";
+import PathLearningTables from "./PathLearningTables.jsx";
 import {
   colorForPlaygroundHopDistance,
   computeHopDistanceFromSink,
@@ -15,6 +17,16 @@ import {
   computeTopologyFitScale,
   resolvePlaygroundLowerBound
 } from "../utils/playgroundNodeMetrics.js";
+import {
+  ACTION_SPACE_CANDIDATE_COLOR,
+  ACTION_SPACE_GROUP_COLOR,
+  buildActiveActionSpacePanel,
+  dualChartYMax
+} from "../utils/actionSpaceTimeslotChart.js";
+import {
+  downloadActionSpaceTimeslotCsv,
+  downloadActionSpaceTimeslotLatex
+} from "../utils/actionSpaceTimeslotLatexExport.js";
 
 const PLAYGROUND_NODE_RADIUS = 3.1;
 const PLAYGROUND_LABEL_SIZE = 4.2;
@@ -841,51 +853,11 @@ function HomeExplorationToolsWorkspace({
   );
 }
 
-function pickActionSpaceSummary(payload, groupKeys, candidateKeys) {
-  for (const key of groupKeys) {
-    const summary = payload?.[key];
-    if (Array.isArray(summary?.timeslots) && summary.timeslots.length > 0) {
-      return { summary, source: "group" };
-    }
-  }
-  for (const key of candidateKeys) {
-    const summary = payload?.[key];
-    if (Array.isArray(summary?.timeslots) && summary.timeslots.length > 0) {
-      return { summary, source: "candidate_fallback" };
-    }
-  }
-  return { summary: null, source: "none" };
-}
-
 function hasNativeGroupSummaries(payload) {
   if (!payload || typeof payload !== "object") return false;
   return ["action_space_by_timeslot_group", "action_space_by_timeslot_group_rcv", "action_space_by_timeslot_group_br"].some(
     (key) => Array.isArray(payload[key]?.timeslots) && payload[key].timeslots.length > 0
   );
-}
-
-function buildActionSpaceCompareRows(candidateSummary, groupSummary) {
-  const bySlot = new Map();
-  const ingest = (summary, field) => {
-    (summary?.timeslots ?? []).forEach((row) => {
-      const slot = row?.timeslot;
-      if (slot === undefined || slot === null) return;
-      const key = String(slot);
-      const existing = bySlot.get(key) ?? { timeslot: slot };
-      const mean = Number(row?.mean_candidate_count);
-      if (Number.isFinite(mean)) {
-        existing[field] = mean;
-      }
-      const nPaths = Number(row?.n_unique_paths);
-      if (Number.isFinite(nPaths)) {
-        existing.n_unique_paths = nPaths;
-      }
-      bySlot.set(key, existing);
-    });
-  };
-  ingest(candidateSummary, "mean_candidate_count");
-  ingest(groupSummary, "mean_group_count");
-  return [...bySlot.values()].sort((a, b) => Number(a.timeslot) - Number(b.timeslot));
 }
 
 function ActionSpaceCompareTable({ rows }) {
@@ -926,35 +898,41 @@ function ActionSpaceCompareTable({ rows }) {
   );
 }
 
-function ActionSpaceMeanBarChart({
-  summary,
-  yMax,
-  meanField = "mean_candidate_count",
-  entityLabel = "candidate",
-  barColor = "#63a5c7"
-}) {
-  const rows = Array.isArray(summary?.timeslots) ? summary.timeslots : [];
-  const rawAxis = String(summary?.action_axis ?? "");
-  const axisLabel = rawAxis === "receiver" || rawAxis === "rcv_cands" ? "rcv_cands" : "br_cands";
-  const axisText = axisLabel === "rcv_cands" ? "receive" : "broadcast";
-  if (rows.length === 0) {
-    return <p className="muted">No aggregate candidate data.</p>;
+function hollowBarRect(x, y, w, h, stroke, strokeWidth = 2) {
+  return (
+    <rect
+      x={x}
+      y={y}
+      width={w}
+      height={Math.max(h, 1)}
+      fill="none"
+      stroke={stroke}
+      strokeWidth={strokeWidth}
+      rx={2}
+    />
+  );
+}
+
+function ActionSpaceDualBarChart({ rows, axisText, yMax }) {
+  const data = Array.isArray(rows) ? rows : [];
+  if (!data.length) {
+    return <p className="muted">No action-space summary.</p>;
   }
-  const counts = rows.map((row) => Number(row[meanField])).filter((n) => Number.isFinite(n));
-  const computedMaxC = Math.max(...counts, 1e-6);
-  const maxC = Number.isFinite(Number(yMax)) ? Math.max(Number(yMax), 1e-6) : computedMaxC;
-  const n = rows.length;
+  const maxC = Math.max(Number(yMax) || 0, 1e-6);
+  const n = data.length;
   const padL = 54;
   const padR = 22;
-  const padT = 16;
+  const padT = 28;
   const padB = 52;
-  const innerW = Math.max(420, Math.min(880, n * 28));
+  const innerW = Math.max(420, Math.min(960, n * 32));
   const width = padL + innerW + padR;
-  const height = 300;
+  const height = 320;
   const chartW = innerW;
   const chartH = height - padT - padB;
   const slotW = chartW / Math.max(n, 1);
-  const barW = Math.max(6, slotW * 0.58);
+  const pairW = Math.max(10, slotW * 0.62);
+  const barW = Math.max(5, pairW * 0.42);
+  const gap = Math.max(2, pairW * 0.08);
   const yTicksRaw = linearAxisTicks(0, maxC, 6).filter((t) => t <= maxC + 1e-9);
   const yTicks = yTicksRaw.length > 0 ? yTicksRaw : [0, maxC];
   const yToSvg = (v) => padT + chartH - (v / maxC) * chartH;
@@ -962,7 +940,21 @@ function ActionSpaceMeanBarChart({
   const xLabelStep = n > 48 ? 3 : n > 32 ? 2 : 1;
 
   return (
-    <div className="delay-chart-wrap action-space-mean-chart">
+    <div className="delay-chart-wrap action-space-mean-chart action-space-dual-chart">
+      <div className="action-space-dual-legend" aria-hidden>
+        <span className="action-space-dual-legend-item">
+          <svg width="18" height="12" className="action-space-dual-legend-swatch">
+            <rect x="2" y="2" width="14" height="8" fill="none" stroke={ACTION_SPACE_CANDIDATE_COLOR} strokeWidth="2" rx="1" />
+          </svg>
+          Candidate
+        </span>
+        <span className="action-space-dual-legend-item">
+          <svg width="18" height="12" className="action-space-dual-legend-swatch">
+            <rect x="2" y="2" width="14" height="8" fill="none" stroke={ACTION_SPACE_GROUP_COLOR} strokeWidth="2" rx="1" />
+          </svg>
+          Group
+        </span>
+      </div>
       <svg
         viewBox={`0 0 ${width} ${height}`}
         className="delay-chart action-space-mean-chart-svg"
@@ -971,51 +963,41 @@ function ActionSpaceMeanBarChart({
         <rect x="0" y="0" width={width} height={height} fill="#fbfbff" />
         {yTicks.map((t) => (
           <g key={`yt-${t}`}>
-            <line
-              x1={padL}
-              x2={padL + chartW}
-              y1={yToSvg(t)}
-              y2={yToSvg(t)}
-              stroke="#e2e5f0"
-              strokeWidth="1"
-            />
-            <text
-              x={padL - 8}
-              y={yToSvg(t) + 4}
-              textAnchor="end"
-              fontSize="12"
-              fill="#4d5478"
-            >
+            <line x1={padL} x2={padL + chartW} y1={yToSvg(t)} y2={yToSvg(t)} stroke="#e2e5f0" strokeWidth="1" />
+            <text x={padL - 8} y={yToSvg(t) + 4} textAnchor="end" fontSize="12" fill="#4d5478">
               {formatYTick(t)}
             </text>
           </g>
         ))}
-        <line
-          x1={padL}
-          y1={padT + chartH}
-          x2={padL + chartW}
-          y2={padT + chartH}
-          stroke="#2b2f3a"
-          strokeWidth="1.2"
-        />
+        <line x1={padL} y1={padT + chartH} x2={padL + chartW} y2={padT + chartH} stroke="#2b2f3a" strokeWidth="1.2" />
         <line x1={padL} y1={padT} x2={padL} y2={padT + chartH} stroke="#2b2f3a" strokeWidth="1.2" />
         <text x={padL + chartW / 2} y={height - 8} textAnchor="middle" fontSize="12" fill="#4d5478">
           Timeslot
         </text>
-        <text x={padL} y={padT - 2} textAnchor="start" fontSize="11" fill="#4d5478">
-          {`Mean ${axisText} ${entityLabel}`}
+        <text x={padL} y={padT - 10} textAnchor="start" fontSize="11" fill="#4d5478">
+          {`Mean ${axisText} count (candidate vs group)`}
         </text>
-        {rows.map((row, i) => {
-          const mean = Number(row[meanField]);
-          if (!Number.isFinite(mean)) return null;
-          const h = (mean / maxC) * chartH;
+        {data.map((row, i) => {
+          const cand = Number(row.mean_candidate_count);
+          const grp = Number(row.mean_group_count);
           const xCenter = padL + i * slotW + slotW / 2;
-          const x = xCenter - barW / 2;
-          const y = padT + chartH - h;
+          const candX = xCenter - gap / 2 - barW;
+          const grpX = xCenter + gap / 2;
           const ts = row.timeslot;
           return (
-            <g key={`${row.timeslot}-${i}`}>
-              <rect x={x} y={y} width={barW} height={Math.max(h, 1)} fill={barColor} rx={2} />
+            <g key={`dual-${row.timeslot}-${i}`}>
+              {Number.isFinite(cand)
+                ? hollowBarRect(
+                    candX,
+                    yToSvg(cand),
+                    barW,
+                    (cand / maxC) * chartH,
+                    ACTION_SPACE_CANDIDATE_COLOR
+                  )
+                : null}
+              {Number.isFinite(grp)
+                ? hollowBarRect(grpX, yToSvg(grp), barW, (grp / maxC) * chartH, ACTION_SPACE_GROUP_COLOR)
+                : null}
               {i % xLabelStep === 0 ? (
                 <text
                   x={xCenter}
@@ -1033,29 +1015,11 @@ function ActionSpaceMeanBarChart({
       </svg>
       <div className="delay-chart-meta">
         <span>
-          {n} timeslots · mean {axisText} {entityLabel}
+          {n} timeslots · {axisText} · hollow bars: blue = candidate, red = group
         </span>
       </div>
     </div>
   );
-}
-
-function sharedMeanCandidateYMax(...summaries) {
-  const vals = summaries.flatMap((summary) =>
-    (summary?.timeslots ?? [])
-      .map((row) => Number(row.mean_candidate_count))
-      .filter((n) => Number.isFinite(n))
-  );
-  return vals.length ? Math.max(...vals) : 0;
-}
-
-function sharedMeanGroupYMax(...summaries) {
-  const vals = summaries.flatMap((summary) =>
-    (summary?.timeslots ?? [])
-      .map((row) => Number(row.mean_candidate_count))
-      .filter((n) => Number.isFinite(n))
-  );
-  return vals.length ? Math.max(...vals) : 0;
 }
 
 function QProfileEpochBarChart({ chart, actionAxis }) {
@@ -1554,6 +1518,8 @@ export default function MainTopologyPanel({
   transmissionLastPayload,
   transmissionBestPayload,
   qTablePayload,
+  stateActionLastPayload,
+  stateActionBestPayload,
   transmissionAllPayload,
   qTableAllEpochsPayload,
   resultsViewMode,
@@ -2063,62 +2029,24 @@ export default function MainTopologyPanel({
     () => hasNativeGroupSummaries(runSummaryPayload),
     [runSummaryPayload]
   );
-  const actionSpaceBrCandidate = useMemo(
-    () =>
-      pickActionSpaceSummary(runSummaryPayload, [], [
-        "action_space_by_timeslot_br",
-        "action_space_by_timeslot"
-      ]),
+  const actionSpacePanel = useMemo(
+    () => buildActiveActionSpacePanel(runSummaryPayload),
     [runSummaryPayload]
   );
-  const actionSpaceRcvCandidate = useMemo(
+  const showActionSpacePanel = actionSpacePanel.hasData;
+  const actionSpaceDualYMax = useMemo(
+    () => dualChartYMax(actionSpacePanel.compareRows),
+    [actionSpacePanel.compareRows]
+  );
+  const pathLearningSummary = useMemo(
     () =>
-      pickActionSpaceSummary(runSummaryPayload, [], [
-        "action_space_by_timeslot_rcv",
-        "action_space_by_timeslot"
-      ]),
-    [runSummaryPayload]
+      buildPathLearningSummary({
+        stateActionBestPayload,
+        stateActionLastPayload,
+        qTablePayload
+      }),
+    [stateActionBestPayload, stateActionLastPayload, qTablePayload]
   );
-  const actionSpaceBrGroup = useMemo(
-    () =>
-      pickActionSpaceSummary(
-        runSummaryPayload,
-        ["action_space_by_timeslot_group_br", "action_space_by_timeslot_group"],
-        ["action_space_by_timeslot_br", "action_space_by_timeslot"]
-      ),
-    [runSummaryPayload]
-  );
-  const actionSpaceRcvGroup = useMemo(
-    () =>
-      pickActionSpaceSummary(
-        runSummaryPayload,
-        ["action_space_by_timeslot_group_rcv", "action_space_by_timeslot_group"],
-        ["action_space_by_timeslot_rcv", "action_space_by_timeslot"]
-      ),
-    [runSummaryPayload]
-  );
-  const actionSpaceBrCompareRows = useMemo(
-    () => buildActionSpaceCompareRows(actionSpaceBrCandidate.summary, actionSpaceBrGroup.summary),
-    [actionSpaceBrCandidate.summary, actionSpaceBrGroup.summary]
-  );
-  const actionSpaceRcvCompareRows = useMemo(
-    () => buildActionSpaceCompareRows(actionSpaceRcvCandidate.summary, actionSpaceRcvGroup.summary),
-    [actionSpaceRcvCandidate.summary, actionSpaceRcvGroup.summary]
-  );
-  const showActionSpacePanel = useMemo(() => {
-    const keys = [
-      actionSpaceRcvCandidate.summary,
-      actionSpaceBrCandidate.summary,
-      actionSpaceRcvGroup.summary,
-      actionSpaceBrGroup.summary
-    ];
-    return keys.some((s) => Array.isArray(s?.timeslots) && s.timeslots.length > 0);
-  }, [
-    actionSpaceBrCandidate.summary,
-    actionSpaceBrGroup.summary,
-    actionSpaceRcvCandidate.summary,
-    actionSpaceRcvGroup.summary
-  ]);
   const hasTransmissionTrace = latestRunCapabilities?.has_transmission_trace ?? true;
   const hasQTable = latestRunCapabilities?.has_q_table ?? true;
   const hasEpochCompare = latestRunCapabilities?.has_epoch_compare ?? true;
@@ -3279,6 +3207,17 @@ export default function MainTopologyPanel({
                       </div>
                     )}
                   </div>
+                  {pathLearningSummary ? (
+                    <div className="qtable-panel action-space-below-qtable path-learning-panel">
+                      <div className="qtable-header">
+                        <h4>Path Q by timeslot</h4>
+                      </div>
+                      <PathLearningTables
+                        bestRows={pathLearningSummary.bestRows}
+                        lastRows={pathLearningSummary.lastRows}
+                      />
+                    </div>
+                  ) : null}
                   {runSummaryPayload?.q_profile_by_epoch?.charts?.length ? (
                     <div className="qtable-panel action-space-below-qtable">
                       <div className="qtable-header">
@@ -3306,33 +3245,51 @@ export default function MainTopologyPanel({
                   ) : null}
                 </>
               ) : null}
+              {!hasQTable && pathLearningSummary ? (
+                <div className="qtable-panel path-learning-panel">
+                  <div className="qtable-header">
+                    <h4>Path Q by timeslot</h4>
+                  </div>
+                  <PathLearningTables
+                    bestRows={pathLearningSummary.bestRows}
+                    lastRows={pathLearningSummary.lastRows}
+                  />
+                </div>
+              ) : null}
               {showActionSpacePanel ? (
                 <div className="qtable-panel action-space-below-qtable" id="action-space-mean-panel">
                   <div className="qtable-header">
-                    <h4>Mean candidate &amp; group count by timeslot</h4>
+                    <h4>
+                      Mean candidate &amp; group count by timeslot
+                      <span className="action-space-axis-chip">({actionSpacePanel.axisLabel})</span>
+                    </h4>
                     <div className="qtable-actions">
                       <button
                         type="button"
                         className="qtable-sort-btn"
-                        title="Download compare CSV (receive)"
-                        onClick={() => {
-                          const lines = [
-                            "timeslot,mean_candidate_count,mean_group_count,n_unique_paths",
-                            ...actionSpaceRcvCompareRows.map(
-                              (r) =>
-                                `${String(r.timeslot)},${String(r.mean_candidate_count ?? "")},${String(r.mean_group_count ?? "")},${String(r.n_unique_paths ?? "")}`
-                            )
-                          ].join("\n");
-                          const blob = new Blob([lines], { type: "text/csv;charset=utf-8;" });
-                          const url = URL.createObjectURL(blob);
-                          const link = document.createElement("a");
-                          link.href = url;
-                          link.download = "action_space_rcv_candidate_vs_group.csv";
-                          link.click();
-                          URL.revokeObjectURL(url);
-                        }}
+                        title={`Download compare CSV (${actionSpacePanel.axisText})`}
+                        onClick={() =>
+                          downloadActionSpaceTimeslotCsv(
+                            actionSpacePanel.compareRows,
+                            actionSpacePanel.axisText
+                          )
+                        }
                       >
                         CSV
+                      </button>
+                      <button
+                        type="button"
+                        className="qtable-sort-btn"
+                        title={`Download LaTeX figure (${actionSpacePanel.axisText})`}
+                        onClick={() =>
+                          downloadActionSpaceTimeslotLatex({
+                            compareRows: actionSpacePanel.compareRows,
+                            axisText: actionSpacePanel.axisText,
+                            topologyName: focusedTopo?.topology_name ?? ""
+                          })
+                        }
+                      >
+                        LaTeX
                       </button>
                     </div>
                   </div>
@@ -3344,46 +3301,15 @@ export default function MainTopologyPanel({
                       khi bật action aggregation).
                     </p>
                   ) : null}
-                  <div className="mean-cands-grid">
-                    <div className="mean-cands-column">
-                      <h4 className="chart-subheading">Mean broadcast candidate</h4>
-                      <ActionSpaceMeanBarChart
-                        summary={actionSpaceBrCandidate.summary}
-                        yMax={sharedMeanCandidateYMax(
-                          actionSpaceRcvCandidate.summary,
-                          actionSpaceBrCandidate.summary
-                        )}
-                      />
-                      <h4 className="chart-subheading chart-subheading--nested">Mean broadcast group</h4>
-                      <ActionSpaceMeanBarChart
-                        summary={actionSpaceBrGroup.summary}
-                        entityLabel="group"
-                        barColor="#7b6cb5"
-                        yMax={sharedMeanGroupYMax(actionSpaceRcvGroup.summary, actionSpaceBrGroup.summary)}
-                      />
-                      <h4 className="chart-subheading chart-subheading--nested">Broadcast: candidate vs group (table)</h4>
-                      <ActionSpaceCompareTable rows={actionSpaceBrCompareRows} />
-                    </div>
-                    <div className="mean-cands-column">
-                      <h4 className="chart-subheading">Mean receive candidate</h4>
-                      <ActionSpaceMeanBarChart
-                        summary={actionSpaceRcvCandidate.summary}
-                        yMax={sharedMeanCandidateYMax(
-                          actionSpaceRcvCandidate.summary,
-                          actionSpaceBrCandidate.summary
-                        )}
-                      />
-                      <h4 className="chart-subheading chart-subheading--nested">Mean receive group</h4>
-                      <ActionSpaceMeanBarChart
-                        summary={actionSpaceRcvGroup.summary}
-                        entityLabel="group"
-                        barColor="#7b6cb5"
-                        yMax={sharedMeanGroupYMax(actionSpaceRcvGroup.summary, actionSpaceBrGroup.summary)}
-                      />
-                      <h4 className="chart-subheading chart-subheading--nested">Receive: candidate vs group (table)</h4>
-                      <ActionSpaceCompareTable rows={actionSpaceRcvCompareRows} />
-                    </div>
-                  </div>
+                  <ActionSpaceDualBarChart
+                    rows={actionSpacePanel.compareRows}
+                    axisText={actionSpacePanel.axisText}
+                    yMax={actionSpaceDualYMax}
+                  />
+                  <h4 className="chart-subheading chart-subheading--nested">
+                    {actionSpacePanel.axisLabel}: candidate vs group (table)
+                  </h4>
+                  <ActionSpaceCompareTable rows={actionSpacePanel.compareRows} />
                 </div>
               ) : null}
               </section>

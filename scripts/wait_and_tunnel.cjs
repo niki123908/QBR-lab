@@ -37,6 +37,29 @@ function printShareLink(url) {
   console.log("");
 }
 
+async function verifyTunnelApi(url) {
+  const healthUrl = `${url.replace(/\/$/, "")}/health`;
+  const apiUrl = `${url.replace(/\/$/, "")}/api/presets`;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    try {
+      const health = await fetch(healthUrl);
+      const presets = await fetch(apiUrl);
+      if (health.ok && presets.ok) {
+        console.log("[tunnel] Kiem tra API qua tunnel: OK (/health, /api/presets)");
+        return true;
+      }
+      console.log(
+        `[tunnel] Kiem tra API lan ${attempt}: health=${health.status} presets=${presets.status}`
+      );
+    } catch (err) {
+      console.log(`[tunnel] Kiem tra API lan ${attempt}: ${err.message || err}`);
+    }
+    await sleep(1500);
+  }
+  console.warn("[tunnel] CANH BAO: API qua tunnel chua phan hoi. Thu F5 hoac doi 10s roi mo lai link.");
+  return false;
+}
+
 async function main() {
   if (!skipWait) {
     console.log(`[tunnel] Dang cho ${target} ...`);
@@ -48,7 +71,10 @@ async function main() {
   console.log("[tunnel] Dang tao Cloudflare tunnel...");
   const tunnel = Tunnel.quick(target);
 
-  tunnel.once("url", (url) => printShareLink(url));
+  tunnel.once("url", async (url) => {
+    printShareLink(url);
+    await verifyTunnelApi(url);
+  });
   tunnel.on("connected", () => console.log("[tunnel] Da ket noi Cloudflare. Link o tren."));
   tunnel.on("error", (err) => console.error("[tunnel] Loi:", err.message || err));
   tunnel.on("exit", (code) => process.exit(code ?? 0));

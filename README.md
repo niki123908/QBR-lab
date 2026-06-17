@@ -112,16 +112,24 @@ Start the development environment and create a Cloudflare Tunnel:
 npm run share
 ```
 
-Alternatively:
+Alternatively, in two terminals:
 
 ```bash
-npm run dev
-npm run tunnel
+npm run dev:tunnel   # terminal 1 (Vite tunnel mode — required for Cloudflare links)
+npm run tunnel       # terminal 2
 ```
 
-The generated Cloudflare URL can be used to access the application remotely.
+When the tunnel is ready, the terminal prints a shareable URL:
 
-Only the frontend port (`5173`) is exposed. API requests are routed through the Vite proxy.
+```text
+============================================================
+  CHIA SE LINK NAY CHO NGUOI KHAC:
+  https://xxxx.trycloudflare.com
+============================================================
+```
+
+Only the frontend port (`5173`) is exposed. API requests are routed through the Vite proxy.  
+The `trycloudflare.com` link changes each time you restart the tunnel — always use the latest URL printed in the terminal.
 
 ---
 
@@ -275,10 +283,12 @@ npm run share
 
 ### API Requests Fail Through Tunnel
 
-Verify:
+1. Use `npm run share` or `npm run dev:tunnel` (plain `npm run dev` is not enough when sharing remotely).
+2. Verify `frontend/.env` contains:
 
 ```env
 VITE_API_BASE=/api
 ```
 
-Then restart the frontend development server.
+3. Open the **latest** URL from the `CHIA SE LINK NAY` block (old links expire after restart).
+4. Wait for `[tunnel] Kiem tra API qua tunnel: OK`, then refresh the page.

@@ -100,6 +100,10 @@ export function buildAppearanceDraft(chart, defs, idx, axisContext = null) {
     latexLabel: ui.latexLabel ?? "",
     showGrid: ui.showGrid !== false,
     showLegend: ui.showLegend !== false,
+    showLineValues:
+      ui.showLineValues != null
+        ? ui.showLineValues === true
+        : Boolean(axisContext?.convergenceSeriesOnly),
     lineWidth: Number(ui.lineWidth) || 3,
     yAxisManual: Boolean(ui.yAxisManual),
     yAxisMin: Number.isFinite(Number(ui.yAxisMin)) ? Number(ui.yAxisMin) : autoY[0],
@@ -154,6 +158,7 @@ export function appearanceDraftToUi(draft, prevUi = {}) {
     ...prevUi,
     showGrid: Boolean(draft.showGrid),
     showLegend: Boolean(draft.showLegend),
+    showLineValues: Boolean(draft.showLineValues),
     lineWidth: Math.min(8, Math.max(1, Number(draft.lineWidth) || 3)),
     yAxisManual: Boolean(draft.yAxisManual),
     yAxisMin: Number(draft.yAxisMin),

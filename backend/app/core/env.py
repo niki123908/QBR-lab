@@ -20,4 +20,4 @@ def ensure_qbr_env() -> None:
 
 
 def default_database_url() -> str:
-    return "postgresql://qbr:qbr@127.0.0.1:5433/qbr"
+    return "postgresql+psycopg://qbr:qbr@127.0.0.1:5433/qbr"

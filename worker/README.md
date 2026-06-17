@@ -17,7 +17,6 @@ Worker process hien tai co cac trach nhiem:
 - Docker: `docker-compose.yml` co `worker-1`, `worker-2`, `worker-3` (moi worker co `WORKER_ID` rieng).
 - Claim dung `UPDATE ... WHERE status='queued'` (atomic) — nhieu worker khong claim trung mot run.
 - Stale requeue: heartbeat mat > `STALE_AFTER_SEC` (mac dinh 180s), co grace `STALE_CLAIM_GRACE_SEC` (60s) sau khi claim.
-- Backend dev (`dev_server.py`) tat embedded worker (`QBR_AUTO_WORKER=0`). Worker luon la process rieng.
 - Worker va backend phai cung thay `storage/artifacts` neu chay tach process/container (`QBR_ROOT` + volume `/app/storage` trong Docker).
 
 ## Entry point
