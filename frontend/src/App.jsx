@@ -1942,6 +1942,19 @@ export default function App() {
     });
   }
 
+  function addMultiNodeCount(nodeCount) {
+    const n = Math.trunc(Number(nodeCount));
+    if (!Number.isFinite(n) || n < 2) return false;
+    setMultiGenerateForm((prev) => {
+      if (prev.node_counts.includes(n)) return prev;
+      return {
+        ...prev,
+        node_counts: [...prev.node_counts, n].sort((a, b) => a - b)
+      };
+    });
+    return true;
+  }
+
   async function handleDeleteTopology(topo) {
     try {
       const response = await fetch(`${API_BASE}/topologies/${topo.topology_id}`, {
@@ -2611,6 +2624,7 @@ export default function App() {
         updateGenerateField={updateGenerateField}
         updateMultiGenerateField={updateMultiGenerateField}
         toggleMultiNodeCount={toggleMultiNodeCount}
+        addMultiNodeCount={addMultiNodeCount}
         handleGenerate={handleGenerate}
         handleGenerateMulti={handleGenerateMulti}
         isGenerating={isGenerating}
@@ -2789,6 +2803,7 @@ export default function App() {
           focusedTopologyId={focusedTopologyId}
           focusedBatch={focusedBatchForPanel}
           selectedTopology={selectedTopology}
+          topologies={topologies}
           nodeOptions={NODE_OPTIONS}
           runTopoForm={runTopoForm}
           setRunTopoForm={setRunTopoForm}

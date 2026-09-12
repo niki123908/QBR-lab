@@ -1232,6 +1232,25 @@ body.panel-resize-active * {
   font-size: 12px;
 }
 
+.multi-node-option--custom {
+  background: #eef6ff;
+  border-radius: 8px;
+  padding: 2px 6px;
+}
+
+.multi-node-custom-row {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.multi-node-custom-row .field-label {
+  min-width: 160px;
+}
+
 .main-panel-header h1 {
   margin: 0;
   font-size: 30px;
@@ -2611,6 +2630,16 @@ body.panel-resize-active * {
   justify-content: space-between;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.cumulative-unique-path-chart-header {
+  margin-top: 12px;
+}
+
+.cumulative-unique-path-chart-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .delay-path-count-table-wrap {

@@ -1610,6 +1610,7 @@ export default function MainTopologyPanel({
   updateGenerateField,
   updateMultiGenerateField,
   toggleMultiNodeCount,
+  addMultiNodeCount,
   handleGenerate,
   handleGenerateMulti,
   isGenerating,
@@ -1638,6 +1639,7 @@ export default function MainTopologyPanel({
   const [batchPickerOpen, setBatchPickerOpen] = useState(false);
   const [runPickerOpen, setRunPickerOpen] = useState(false);
   const [generateBatchModalOpen, setGenerateBatchModalOpen] = useState(false);
+  const [customNodeCountDraft, setCustomNodeCountDraft] = useState("");
   const [generateBatchModalName, setGenerateBatchModalName] = useState("");
   const isTopologyPlayground = activeMenu === "topologies" && focusedTopologyId && activePanel2Tab === "playground";
   const playgroundShellRef = useRef(null);
@@ -2622,6 +2624,43 @@ export default function MainTopologyPanel({
                     {n}
                   </label>
                 ))}
+                {(multiGenerateForm.node_counts ?? [])
+                  .filter((n) => !(nodeOptions ?? []).includes(n))
+                  .map((n) => (
+                    <label key={`custom-${n}`} className="multi-node-option multi-node-option--custom">
+                      <input type="checkbox" checked onChange={() => toggleMultiNodeCount(n)} />
+                      {n}
+                    </label>
+                  ))}
+              </div>
+              <div className="multi-node-custom-row">
+                <label className="field-label">
+                  Custom node count
+                  <input
+                    type="number"
+                    min={2}
+                    step={1}
+                    placeholder="e.g. 75"
+                    value={customNodeCountDraft}
+                    onChange={(e) => setCustomNodeCountDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter") return;
+                      e.preventDefault();
+                      const ok = addMultiNodeCount?.(customNodeCountDraft);
+                      if (ok) setCustomNodeCountDraft("");
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="secondary-cta"
+                  onClick={() => {
+                    const ok = addMultiNodeCount?.(customNodeCountDraft);
+                    if (ok) setCustomNodeCountDraft("");
+                  }}
+                >
+                  Add
+                </button>
               </div>
               <div className="generate-inline-form">
                 <label className="field-label">

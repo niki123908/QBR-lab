@@ -406,20 +406,20 @@ class AlgorithmSummary(BaseModel):
 class RunPresetOut(BaseModel):
     id: str
     label: str
-    backbone: Literal["qbr", "greedy", "cf_cas"]
-    algorithm_id: Literal["qbr", "greedy", "cf_cas"]
+    backbone: Literal["qbr", "greedy", "cf_cas", "milp"]
+    algorithm_id: Literal["qbr", "greedy", "cf_cas", "milp"]
     run_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunPresetCreate(BaseModel):
     label: str
-    backbone: Literal["qbr", "greedy", "cf_cas"]
-    algorithm_id: Literal["qbr", "greedy", "cf_cas"]
+    backbone: Literal["qbr", "greedy", "cf_cas", "milp"]
+    algorithm_id: Literal["qbr", "greedy", "cf_cas", "milp"]
     run_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunPresetUpdate(BaseModel):
     label: str | None = None
-    backbone: Literal["qbr", "greedy", "cf_cas"] | None = None
-    algorithm_id: Literal["qbr", "greedy", "cf_cas"] | None = None
+    backbone: Literal["qbr", "greedy", "cf_cas", "milp"] | None = None
+    algorithm_id: Literal["qbr", "greedy", "cf_cas", "milp"] | None = None
     run_config: dict[str, Any] | None = None

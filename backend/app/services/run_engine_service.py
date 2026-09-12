@@ -230,6 +230,11 @@ def run_single_topology(
         ).all()
         nodes = _build_node_list(topology=topology, rows=node_rows)
 
+        if str(algorithm_id) == "milp":
+            from app.services.runners.milp_runner import assert_milp_node_limit
+
+            assert_milp_node_limit(topology.node_count)
+
         _ = nodes  # validate before enqueue
 
     run_id = create_single_run_enqueued(
@@ -386,6 +391,17 @@ def run_batch_topologies(
 ) -> str:
     if not topology_ids:
         raise ValueError("Failed.")
+    if str(algorithm_id) == "milp":
+        from app.services.runners.milp_runner import assert_milp_node_limit
+
+        init_db()
+        with db_session_scope() as session:
+            for topology_id in topology_ids:
+                topology = session.get(Topology, topology_id)
+                if topology is None or topology.is_deleted:
+                    raise ValueError("Failed.")
+                assert_milp_node_limit(topology.node_count)
+
     batch_run_id = str(uuid4())
     payload: dict[str, Any] = {
         "algorithm_id": algorithm_id,

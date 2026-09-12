@@ -6,6 +6,7 @@ from typing import Any, Callable
 from app.services.runners.base import AlgorithmRunner
 from app.services.runners.cf_cas_runner import execute_cf_cas
 from app.services.runners.greedy_runner import execute_greedy
+from app.services.runners.milp_runner import MILP_MAX_NODE_COUNT_EXCLUSIVE, execute_milp
 from app.services.runners.qbr_runner import execute_qbr
 
 
@@ -331,6 +332,53 @@ def _resolve_cf_cas_config(
     return {"run_seed": run_seed}
 
 
+_MILP_DEFAULT_CONFIG: dict[str, Any] = {
+    "solver_timeout_sec": 60,
+}
+
+_MILP_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "solver_timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
+    },
+    "required": [],
+}
+
+_MILP_CAPABILITIES: dict[str, bool] = {
+    "has_q_table": False,
+    "has_policy_trace": False,
+    "has_state_action_trace": True,
+    "has_transmission_trace": True,
+    "has_episode_series": False,
+    "has_epoch_compare": False,
+    "has_path_signatures": False,
+}
+
+
+def _resolve_milp_config(
+    run_config: dict[str, Any], preset_id: str, topology_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if isinstance(topology_context, dict):
+        node_count = topology_context.get("node_count")
+        if node_count is not None:
+            from app.services.runners.milp_runner import assert_milp_node_limit
+
+            assert_milp_node_limit(int(node_count))
+
+    preset: dict[str, Any] = {}
+    if preset_id == "default_v1":
+        preset = {}
+
+    merged = {**_MILP_DEFAULT_CONFIG, **preset, **(run_config or {})}
+    allowed_keys = set(_MILP_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
+    picked = _pick_allowed_config(merged, allowed_keys)
+    timeout = int(picked.get("solver_timeout_sec", 60))
+    if timeout < 1 or timeout > 600:
+        raise ValueError("Failed.")
+    run_seed = _resolve_run_seed_value(picked)
+    return {"solver_timeout_sec": timeout, "run_seed": run_seed}
+
+
 _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "qbr": AlgorithmSpec(
         runner=execute_qbr,
@@ -343,6 +391,10 @@ _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "cf_cas": AlgorithmSpec(
         runner=execute_cf_cas,
         resolve_and_validate_config=_resolve_cf_cas_config,
+    ),
+    "milp": AlgorithmSpec(
+        runner=execute_milp,
+        resolve_and_validate_config=_resolve_milp_config,
     ),
 }
 
@@ -371,6 +423,15 @@ _ALGORITHMS_METADATA: list[dict[str, Any]] = [
         "default_config": _CF_CAS_DEFAULT_CONFIG,
         "config_schema": _CF_CAS_CONFIG_SCHEMA,
         "capabilities": _CF_CAS_CAPABILITIES,
+    },
+    {
+        "algorithm_id": "milp",
+        "display_name": "MILP",
+        "version": "v1",
+        "default_config": _MILP_DEFAULT_CONFIG,
+        "config_schema": _MILP_CONFIG_SCHEMA,
+        "capabilities": _MILP_CAPABILITIES,
+        "limits": {"max_node_count_exclusive": MILP_MAX_NODE_COUNT_EXCLUSIVE},
     },
 ]
 

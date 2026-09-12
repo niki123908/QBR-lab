@@ -100,7 +100,7 @@ router = APIRouter()
 
 def _preset_record_to_out(rec: PresetRecord) -> RunPresetOut:
     backbone = rec.backbone if rec.backbone in ("qbr", "greedy", "cf_cas") else "greedy"
-    algorithm_id = rec.algorithm_id if rec.algorithm_id in ("qbr", "greedy", "cf_cas") else backbone
+    algorithm_id = rec.algorithm_id if rec.algorithm_id in ("qbr", "greedy", "cf_cas", "milp") else backbone
     return RunPresetOut(id=rec.id, label=rec.label, backbone=backbone, algorithm_id=algorithm_id, run_config=rec.run_config)
 
 

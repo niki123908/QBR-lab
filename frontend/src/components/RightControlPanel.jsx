@@ -1,10 +1,19 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { buildRunConfigResultFromResolved, mergeDisplayConfig } from "../utils/runConfigDisplay.js";
+import {
+  buildCumulativeUniquePathRows,
+  downloadCumulativeUniquePathCsv
+} from "../utils/cumulativeUniquePathChart.js";
 import { BatchPolicyTraceCard } from "./BatchResultDetailBody.jsx";
+import CumulativeUniquePathChart from "./CumulativeUniquePathChart.jsx";
 import RunConfigVisibilityTable from "./RunConfigVisibilityTable.jsx";
 import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
 
 import { API_BASE } from "../apiBase.js";
+import {
+  isAlgorithmDisabledForNodeCount,
+  milpDisabledReason
+} from "../utils/algorithmNodeLimits.js";
 
 function normalizeFieldValue(rawValue, schemaType) {
   if (schemaType === "boolean") return Boolean(rawValue);
@@ -68,7 +77,8 @@ function stableStringify(value) {
 const BACKBONE_OPTIONS = [
   { id: "qbr", label: "QBR" },
   { id: "greedy", label: "GREEDY" },
-  { id: "cf_cas", label: "CF-CAS" }
+  { id: "cf_cas", label: "CF-CAS" },
+  { id: "milp", label: "MILP" }
 ];
 
 function presetOptionLabel(p) {
@@ -80,8 +90,42 @@ function presetOptionLabel(p) {
         ? "GREEDY"
         : p.backbone === "cf_cas"
           ? "CF-CAS"
-          : String(p.backbone || "");
+          : p.backbone === "milp"
+            ? "MILP"
+            : String(p.backbone || "");
   return `${p.label} · ${tag}`;
+}
+
+function BackboneToggle({
+  options = BACKBONE_OPTIONS,
+  activeId,
+  onPick,
+  nodeCount,
+  algorithmOptions,
+  dense = true
+}) {
+  return (
+    <div className={`segmented-toggle${dense ? " segmented-toggle--dense" : ""}`}>
+      {options.map((o) => {
+        const meta = (algorithmOptions ?? []).find((item) => item.algorithm_id === o.id) ?? null;
+        const disabled = isAlgorithmDisabledForNodeCount(o.id, nodeCount, meta);
+        return (
+          <button
+            key={o.id}
+            type="button"
+            className={`segment-btn ${activeId === o.id ? "active" : ""}`}
+            disabled={disabled}
+            title={disabled ? milpDisabledReason(nodeCount, meta) : undefined}
+            onClick={() => {
+              if (!disabled) onPick(o.id);
+            }}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 const IDLE_PRESET_WIZARD = { phase: "idle", draftClientId: "", snapshot: null };
@@ -411,6 +455,7 @@ function RunTopologyPanel({
   onRun,
   isRunningSingle,
   selectedAlgorithmMeta,
+  algorithmOptions,
   runConfigForm,
   setRunConfigForm,
   runPresets,
@@ -424,12 +469,34 @@ function RunTopologyPanel({
   runBackbone
 }) {
   const currentBackbone = runBackbone;
+  const topologyNodeCount = Number(selectedTopology?.node_count);
   const sortedRunPresets = useMemo(() => sortPresetsAlphabetically(runPresets), [runPresets]);
   const selectedPreset = useMemo(
     () => sortedRunPresets.find((p) => p.id === form.preset_id) ?? null,
     [sortedRunPresets, form.preset_id]
   );
   const phase = presetWizard.phase;
+
+  useEffect(() => {
+    const milpMeta = (algorithmOptions ?? []).find((item) => item.algorithm_id === "milp") ?? null;
+    if (!isAlgorithmDisabledForNodeCount(form.algorithm_id, topologyNodeCount, milpMeta)) return;
+    const fallback = (algorithmOptions ?? []).find((item) => item.algorithm_id === "qbr") ?? (algorithmOptions ?? [])[0];
+    if (!fallback) return;
+    setForm((prev) => ({
+      ...prev,
+      algorithm_id: fallback.algorithm_id
+    }));
+    setSharedRunConfigForBackbone(fallback.algorithm_id, {
+      ...(algorithmDefaultConfigById?.[fallback.algorithm_id] ?? {})
+    });
+  }, [
+    topologyNodeCount,
+    form.algorithm_id,
+    algorithmOptions,
+    algorithmDefaultConfigById,
+    setForm,
+    setSharedRunConfigForBackbone
+  ]);
 
   const schemaProperties = selectedAlgorithmMeta?.config_schema?.properties ?? {};
   const allEntries = Object.entries(schemaProperties);
@@ -639,16 +706,15 @@ function RunTopologyPanel({
           <>
             <p className="preset-banner">Đang tạo preset nháp</p>
             {phase === "add_backbone" ? (
-      <label className="field-label">
+              <label className="field-label">
                 Backbone
-                <div className="segmented-toggle segmented-toggle--dense">
-                  {BACKBONE_OPTIONS.map((o) => (
-                    <button key={o.id} type="button" className="segment-btn" onClick={() => onWizardBackbonePick(o.id)}>
-                      {o.label}
-                    </button>
-                  ))}
-                </div>
-      </label>
+                <BackboneToggle
+                  activeId={null}
+                  onPick={onWizardBackbonePick}
+                  nodeCount={topologyNodeCount}
+                  algorithmOptions={algorithmOptions}
+                />
+              </label>
             ) : null}
             {showWizardPolicy ? (
               <>
@@ -726,21 +792,15 @@ function RunTopologyPanel({
                 Xóa
               </button>
             </div>
-      <label className="field-label">
+            <label className="field-label">
               Backbone
-              <div className="segmented-toggle segmented-toggle--dense">
-                {BACKBONE_OPTIONS.map((o) => (
-                  <button
-                    key={o.id}
-                    type="button"
-                    className={`segment-btn ${currentBackbone === o.id ? "active" : ""}`}
-                    onClick={() => onIdleBackboneChange(o.id)}
-                  >
-                    {o.label}
-                  </button>
-                ))}
-              </div>
-      </label>
+              <BackboneToggle
+                activeId={currentBackbone}
+                onPick={onIdleBackboneChange}
+                nodeCount={topologyNodeCount}
+                algorithmOptions={algorithmOptions}
+              />
+            </label>
           </>
         )}
       </div>
@@ -771,6 +831,7 @@ function RunMultiPanel({
   onRun,
   isRunningBatch,
   selectedAlgorithmMeta,
+  algorithmOptions,
   runConfigForm,
   setRunConfigForm,
   runPresets,
@@ -785,16 +846,51 @@ function RunMultiPanel({
   runMultiSubMode = "multi",
   repeatTopologyId = "",
   selectedTopology = null,
+  topologies = [],
   repeatRunCount = 5,
   setRepeatRunCount
 }) {
   const currentBackbone = runBackbone;
+  const topologyNodeCount = useMemo(() => {
+    if (runMultiSubMode === "repeat") {
+      return Number(selectedTopology?.node_count);
+    }
+    const ids = new Set(form.selected_topology_ids ?? []);
+    let maxN = 0;
+    (topologies ?? []).forEach((topo) => {
+      if (!ids.has(topo.topology_id)) return;
+      const n = Number(topo.node_count);
+      if (Number.isFinite(n) && n > maxN) maxN = n;
+    });
+    return maxN || Number.NaN;
+  }, [runMultiSubMode, selectedTopology?.node_count, form.selected_topology_ids, topologies]);
   const sortedRunPresets = useMemo(() => sortPresetsAlphabetically(runPresets), [runPresets]);
   const selectedPreset = useMemo(
     () => sortedRunPresets.find((p) => p.id === form.preset_id) ?? null,
     [sortedRunPresets, form.preset_id]
   );
   const phase = presetWizard.phase;
+
+  useEffect(() => {
+    const milpMeta = (algorithmOptions ?? []).find((item) => item.algorithm_id === "milp") ?? null;
+    if (!isAlgorithmDisabledForNodeCount(form.algorithm_id, topologyNodeCount, milpMeta)) return;
+    const fallback = (algorithmOptions ?? []).find((item) => item.algorithm_id === "qbr") ?? (algorithmOptions ?? [])[0];
+    if (!fallback) return;
+    setForm((prev) => ({
+      ...prev,
+      algorithm_id: fallback.algorithm_id
+    }));
+    setSharedRunConfigForBackbone(fallback.algorithm_id, {
+      ...(algorithmDefaultConfigById?.[fallback.algorithm_id] ?? {})
+    });
+  }, [
+    topologyNodeCount,
+    form.algorithm_id,
+    algorithmOptions,
+    algorithmDefaultConfigById,
+    setForm,
+    setSharedRunConfigForBackbone
+  ]);
 
   const schemaProperties = selectedAlgorithmMeta?.config_schema?.properties ?? {};
   const allEntries = Object.entries(schemaProperties);
@@ -1040,16 +1136,15 @@ function RunMultiPanel({
           <>
             <p className="preset-banner">Đang tạo preset nháp</p>
             {phase === "add_backbone" ? (
-      <label className="field-label">
+              <label className="field-label">
                 Backbone
-                <div className="segmented-toggle segmented-toggle--dense">
-                  {BACKBONE_OPTIONS.map((o) => (
-                    <button key={o.id} type="button" className="segment-btn" onClick={() => onWizardBackbonePick(o.id)}>
-                      {o.label}
-                    </button>
-                  ))}
-                </div>
-      </label>
+                <BackboneToggle
+                  activeId={null}
+                  onPick={onWizardBackbonePick}
+                  nodeCount={topologyNodeCount}
+                  algorithmOptions={algorithmOptions}
+                />
+              </label>
             ) : null}
             {showWizardPolicy ? (
               <>
@@ -1129,18 +1224,12 @@ function RunMultiPanel({
             </div>
             <label className="field-label">
               Backbone
-              <div className="segmented-toggle segmented-toggle--dense">
-                {BACKBONE_OPTIONS.map((o) => (
-                  <button
-                    key={o.id}
-                    type="button"
-                    className={`segment-btn ${currentBackbone === o.id ? "active" : ""}`}
-                    onClick={() => onIdleBackboneChange(o.id)}
-                  >
-                    {o.label}
-                  </button>
-                ))}
-              </div>
+              <BackboneToggle
+                activeId={currentBackbone}
+                onPick={onIdleBackboneChange}
+                nodeCount={topologyNodeCount}
+                algorithmOptions={algorithmOptions}
+              />
             </label>
           </>
         )}
@@ -1425,6 +1514,10 @@ function ResultsPanel({
     () => buildDelayPathCountRows(parseCsvRows(delayPerEpisodePayload), parseCsvRows(pathSignaturesPayload)),
     [delayPerEpisodePayload, pathSignaturesPayload]
   );
+  const cumulativeUniquePathRows = useMemo(
+    () => buildCumulativeUniquePathRows(parseCsvRows(pathSignaturesPayload)),
+    [pathSignaturesPayload]
+  );
   return (
     <div className="results-panel">
       {singleRunConfigResult ? <RunConfigPanel result={singleRunConfigResult} showDivider={false} /> : null}
@@ -1461,6 +1554,22 @@ function ResultsPanel({
             <dt>Episodes at best delay</dt>
             <dd>{Number.isFinite(bestDelay) ? bestDelayEpisodes.size : (runSummaryPayload?.best_delay_episode_count ?? "-")}</dd>
           </dl>
+          {cumulativeUniquePathRows.length > 0 ? (
+            <>
+              <div className="inline-title-row cumulative-unique-path-chart-header">
+                <h4 className="cumulative-unique-path-chart-title">Unique paths so far (by episode)</h4>
+                <button
+                  type="button"
+                  className="qtable-sort-btn"
+                  title="Download cumulative unique paths CSV"
+                  onClick={() => downloadCumulativeUniquePathCsv(cumulativeUniquePathRows)}
+                >
+                  CSV
+                </button>
+              </div>
+              <CumulativeUniquePathChart rows={cumulativeUniquePathRows} />
+            </>
+          ) : null}
         </>
       ) : null}
       {hasStateActionTrace ? (
@@ -2237,6 +2346,7 @@ export default function RightControlPanel({
   focusedTopologyId,
   focusedBatch,
   selectedTopology,
+  topologies = [],
   runTopoForm,
   setRunTopoForm,
   runMultiForm,
@@ -2541,6 +2651,7 @@ export default function RightControlPanel({
                 onRun={runMultiTopologies}
                 isRunningBatch={isRunningBatch}
                 selectedAlgorithmMeta={selectedRunMultiAlgorithmMeta}
+                algorithmOptions={algorithmOptions}
                 runConfigForm={runMultiConfigForm}
                 setRunConfigForm={setRunMultiConfigForm}
                 runPresets={runPresets}
@@ -2555,6 +2666,7 @@ export default function RightControlPanel({
                 runMultiSubMode={runMultiSubMode}
                 repeatTopologyId={repeatTopologyId}
                 selectedTopology={selectedTopology}
+                topologies={topologies}
                 repeatRunCount={repeatRunCount}
                 setRepeatRunCount={setRepeatRunCount}
               />
@@ -2566,6 +2678,7 @@ export default function RightControlPanel({
                 onRun={runSingleTopology}
                 isRunningSingle={isRunningSingle}
                 selectedAlgorithmMeta={selectedAlgorithmMeta}
+                algorithmOptions={algorithmOptions}
                 runConfigForm={runTopoConfigForm}
                 setRunConfigForm={setRunTopoConfigForm}
                 runPresets={runPresets}
