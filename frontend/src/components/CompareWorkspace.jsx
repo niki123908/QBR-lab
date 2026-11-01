@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import CompareChartWorkspace from "./CompareChartWorkspace.jsx";
+import CompareRepeatWorkspace from "./CompareRepeatWorkspace.jsx";
 import { readCompareWorkspaceSession, writeCompareWorkspaceSession } from "../utils/compareWorkspaceStorage.js";
 import BatchResultDetailBody, {
   boxplotYAxisFromDensityGroups,
@@ -258,6 +259,8 @@ export default function CompareWorkspace({
   const [compareKind, setCompareKind] = useState(() => restoredCompare?.compareKind ?? "batch");
   const isChartMode = compareKind === "chart";
   const isBatchMode = compareKind === "batch";
+  const isRepeatMode = compareKind === "repeat";
+  const isAbColumnsMode = compareKind === "batch" || compareKind === "single";
 
   const [batchIdA, setBatchIdA] = useState(() => restoredCompare?.batchIdA ?? "");
   const [batchIdB, setBatchIdB] = useState(() => restoredCompare?.batchIdB ?? "");
@@ -487,23 +490,30 @@ export default function CompareWorkspace({
           </button>
           <button
             type="button"
+            className={compareKind === "repeat" ? "active" : ""}
+            onClick={() => setCompareKind("repeat")}
+          >
+            Repeat topo batches
+          </button>
+          <button
+            type="button"
             className={compareKind === "chart" ? "active" : ""}
             onClick={() => setCompareKind("chart")}
           >
             Chart
           </button>
         </div>
-        {(isBatchMode || isChartMode) && isLoadingBatchRunResults ? (
+        {(isBatchMode || isChartMode || isRepeatMode) && isLoadingBatchRunResults ? (
           <span className="muted compare-toolbar-hint">Loading batch list…</span>
         ) : null}
-        {(isBatchMode || isChartMode) && batchRunResultsError ? (
+        {(isBatchMode || isChartMode || isRepeatMode) && batchRunResultsError ? (
           <button type="button" className="secondary-cta small" onClick={onRetryBatchRunResults}>
             Retry list
           </button>
         ) : null}
       </div>
 
-      {(isBatchMode || isChartMode) && batchRunResultsError ? (
+      {(isBatchMode || isChartMode || isRepeatMode) && batchRunResultsError ? (
         <div className="empty-topology-state batch-results-error compare-list-error">
           <p>{batchRunResultsError}</p>
         </div>
@@ -517,7 +527,16 @@ export default function CompareWorkspace({
           batchRunResultsError={batchRunResultsError}
           onRetryBatchRunResults={onRetryBatchRunResults}
         />
-      ) : (
+      ) : isRepeatMode ? (
+        <CompareRepeatWorkspace
+          apiBase={apiBase}
+          batchRunResults={batchRunResults}
+          isLoadingBatchRunResults={isLoadingBatchRunResults}
+          batchRunResultsError={batchRunResultsError}
+          onRetryBatchRunResults={onRetryBatchRunResults}
+          bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+        />
+      ) : isAbColumnsMode ? (
       <div className="compare-columns">
         <CompareColumn
           sideLabel="A"
@@ -576,7 +595,7 @@ export default function CompareWorkspace({
           sharedDelayAxisByDensity={sharedDelayAxisByDensity}
         />
       </div>
-      )}
+      ) : null}
     </div>
   );
 }

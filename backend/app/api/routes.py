@@ -21,6 +21,8 @@ from app.schemas import (
     CreateBatchRequest,
     UpdateBatchRequest,
     BatchActionResponse,
+    DeployFromBatchRequest,
+    DeployFromRunRequest,
     GenerateMultiTopologiesRequest,
     GenerateMultiTopologiesResponse,
     GenerateTopologyRequest,
@@ -87,6 +89,8 @@ from app.services.run_engine_service import resume_batch_job as resume_batch_job
 from app.services.run_engine_service import retry_failed_batch_job as retry_failed_batch_job_service
 from app.services.run_engine_service import run_batch_topologies as run_batch_topologies_service
 from app.services.run_engine_service import run_single_topology as run_single_topology_service
+from app.services.run_engine_service import deploy_from_source_batch as deploy_from_source_batch_service
+from app.services.run_engine_service import deploy_from_source_run as deploy_from_source_run_service
 from app.services.worker_manager_service import kill_managed_worker, list_managed_workers, spawn_managed_worker
 from app.services.run_registry import list_algorithms, resolve_and_validate_run_config
 from app.repositories.preset_repo import PresetRecord
@@ -96,6 +100,26 @@ from app.repositories.preset_repo import list_presets as list_presets_repo
 from app.repositories.preset_repo import update_preset as update_preset_repo
 
 router = APIRouter()
+
+
+def _batch_run_list_item(item) -> BatchRunListItem:
+    return BatchRunListItem(
+        batch_run_id=item.batch_run_id,
+        batch_name=item.batch_name,
+        algorithm_id=item.algorithm_id,
+        preset_id=item.preset_id,
+        preset_name=item.preset_name,
+        result_label=item.result_label,
+        custom_result_label=item.custom_result_label,
+        total_topologies=item.total_topologies,
+        successful=item.successful,
+        failed=item.failed,
+        created_at=item.created_at.isoformat() if hasattr(item.created_at, "isoformat") else str(item.created_at),
+        batch_status=item.batch_status,
+        unique_topology_count=int(getattr(item, "unique_topology_count", 0) or 0),
+        repeat_topology_id=getattr(item, "repeat_topology_id", None),
+        repeat_topology_name=getattr(item, "repeat_topology_name", None),
+    )
 
 
 def _preset_record_to_out(rec: PresetRecord) -> RunPresetOut:
@@ -453,6 +477,7 @@ def get_run_history(topology_id: str) -> list[RunHistoryItem]:
             total_states=row.total_states,
             total_state_actions=row.total_state_actions,
             decision_graph_edges=row.decision_graph_edges,
+            rollout_runtime_ms=row.rollout_runtime_ms,
         )
         for row in rows
     ]
@@ -561,6 +586,7 @@ def get_run_detail(run_id: str) -> RunDetailResponse:
         total_states=row.total_states,
         total_state_actions=row.total_state_actions,
         decision_graph_edges=row.decision_graph_edges,
+        rollout_runtime_ms=row.rollout_runtime_ms,
         artifacts=[
             ArtifactRef(
                 artifact_type=item.artifact_type,
@@ -613,26 +639,36 @@ def run_batch(payload: BatchRunRequest) -> BatchRunResponse:
     return BatchRunResponse(batch_run_id=batch_run_id, accepted=True, total_topologies=len(payload.topology_ids))
 
 
+@router.post("/runs/{run_id}/deploy", response_model=RunSingleResponse)
+def deploy_run_from_q_table(run_id: str, payload: DeployFromRunRequest | None = None) -> RunSingleResponse:
+    """Enqueue a greedy Q-table deploy rollout for the same topology as the source QBR run."""
+    body = payload or DeployFromRunRequest()
+    try:
+        deploy_run_id = deploy_from_source_run_service(run_id, result_label=body.result_label)
+    except ValueError:
+        raise AppError(message="Failed.", status_code=400) from None
+    except Exception:
+        raise AppError(message="Failed.", status_code=500) from None
+    return RunSingleResponse(run_id=deploy_run_id, completed=False, message="Deploy queued.")
+
+
+@router.post("/runs/batch/{batch_run_id}/deploy", response_model=BatchRunResponse)
+def deploy_batch_from_q_table(batch_run_id: str, payload: DeployFromBatchRequest | None = None) -> BatchRunResponse:
+    """Enqueue deploy for every done QBR topo in the source batch (each uses its own Q-table)."""
+    body = payload or DeployFromBatchRequest()
+    try:
+        new_batch_run_id, total = deploy_from_source_batch_service(batch_run_id, result_label=body.result_label)
+    except ValueError:
+        raise AppError(message="Failed.", status_code=400) from None
+    except Exception:
+        raise AppError(message="Failed.", status_code=500) from None
+    return BatchRunResponse(batch_run_id=new_batch_run_id, accepted=True, total_topologies=total)
+
+
 @router.get("/runs/batch/results", response_model=list[BatchRunListItem])
 def list_batch_results() -> list[BatchRunListItem]:
     rows = list_batch_runs_repo()
-    return [
-        BatchRunListItem(
-            batch_run_id=item.batch_run_id,
-            batch_name=item.batch_name,
-            algorithm_id=item.algorithm_id,
-            preset_id=item.preset_id,
-            preset_name=item.preset_name,
-            result_label=item.result_label,
-            custom_result_label=item.custom_result_label,
-            total_topologies=item.total_topologies,
-            successful=item.successful,
-            failed=item.failed,
-            created_at=item.created_at.isoformat(),
-            batch_status=item.batch_status,
-        )
-        for item in rows
-    ]
+    return [_batch_run_list_item(item) for item in rows]
 
 
 @router.patch("/runs/batch/{batch_run_id}/result-label", response_model=BatchRunListItem)
@@ -643,20 +679,7 @@ def patch_batch_run_result_label(batch_run_id: str, body: BatchRunResultLabelUpd
     row = next((item for item in rows if item.batch_run_id == batch_run_id), None)
     if row is None:
         raise AppError(message="Failed.", status_code=404)
-    return BatchRunListItem(
-        batch_run_id=row.batch_run_id,
-        batch_name=row.batch_name,
-        algorithm_id=row.algorithm_id,
-        preset_id=row.preset_id,
-        preset_name=row.preset_name,
-        result_label=row.result_label,
-        custom_result_label=row.custom_result_label,
-        total_topologies=row.total_topologies,
-        successful=row.successful,
-        failed=row.failed,
-        created_at=row.created_at.isoformat(),
-        batch_status=row.batch_status,
-    )
+    return _batch_run_list_item(row)
 
 
 @router.get("/runs/batch/{batch_run_id}/progress", response_model=BatchRunProgressResponse)
@@ -681,6 +704,7 @@ def get_batch_progress(batch_run_id: str) -> BatchRunProgressResponse:
                 topology_name=r.topology_name,
                 topology_index=r.topology_index,
                 status=r.status,
+                runtime_sec=r.runtime_sec,
             )
             for r in rec.rows
         ],
@@ -747,6 +771,8 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
                         paths_count_by_delay=topo.paths_count_by_delay,
                         total_states=topo.total_states,
                         total_state_actions=topo.total_state_actions,
+                        runtime_sec=topo.runtime_sec,
+                        rollout_runtime_ms=topo.rollout_runtime_ms,
                     )
                     for topo in item.topologies
                 ],
@@ -769,6 +795,8 @@ def get_batch_result(batch_run_id: str) -> BatchRunResultResponse:
                 paths_count_by_delay=topo.paths_count_by_delay,
                 total_states=topo.total_states,
                 total_state_actions=topo.total_state_actions,
+                runtime_sec=topo.runtime_sec,
+                rollout_runtime_ms=topo.rollout_runtime_ms,
             )
             for topo in row.topologies
         ],
@@ -795,11 +823,16 @@ def resume_batch(batch_run_id: str) -> MessageResponse:
 
 @router.post("/runs/batch/{batch_run_id}/retry-failed")
 def retry_failed_batch(batch_run_id: str) -> MessageResponse:
-    """Re-queue all failed runs in a completed (or stopped) batch."""
+    """Re-queue failed/stopped runs in a completed (or stopped) batch."""
     ok, msg, count = retry_failed_batch_job_service(batch_run_id)
     if not ok:
-        raise AppError(message=msg or "Failed.", status_code=400)
-    return MessageResponse(message=f"Re-queued {count} failed run(s).")
+        detail = {
+            "not_found": "Batch not found.",
+            "batch_active": "Batch still has running/queued jobs.",
+            "nothing_to_retry": "No failed or stopped runs to retry.",
+        }.get(msg, msg or "Failed.")
+        raise AppError(message=detail, status_code=400)
+    return MessageResponse(message=f"Re-queued {count} run(s).")
 
 
 @router.delete("/runs/batch/{batch_run_id}", response_model=MessageResponse)

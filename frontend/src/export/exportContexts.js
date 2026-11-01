@@ -148,6 +148,7 @@ const BATCH_PROGRESS_COLUMNS = [
   { key: "topology_index", label: "topology_index", group: "Progress", default: true },
   { key: "topology_name", label: "topology_name", group: "Progress", default: true },
   { key: "status", label: "status", group: "Progress", default: true },
+  { key: "runtime_sec", label: "runtime_sec", group: "Progress", default: true },
   { key: "run_id", label: "run_id", group: "Progress", default: false },
   { key: "topology_id", label: "topology_id", group: "Progress", default: false }
 ];
@@ -155,6 +156,7 @@ const BATCH_PROGRESS_COLUMNS = [
 const RUN_HISTORY_COLUMNS = [
   { key: "run_id", label: "run_id", group: "Run", default: false },
   { key: "status", label: "status", group: "Run", default: true },
+  { key: "runtime_sec", label: "runtime_sec", group: "Run", default: true },
   { key: "preset_name", label: "preset_name", group: "Run", default: true },
   { key: "created_at", label: "created_at", group: "Run", default: true },
   { key: "finished_delay", label: "finished_delay", group: "Metrics", default: true },
@@ -470,6 +472,7 @@ export function resolveExportContext(snapshot, surface = "main") {
               topology_index: row.topology_index ?? idx,
               topology_name: row.topology_name ?? "",
               status: row.status ?? "",
+              runtime_sec: Number.isFinite(Number(row.runtime_sec)) ? Number(row.runtime_sec) : "",
               run_id: row.run_id ?? "",
               topology_id: row.topology_id ?? ""
             };

@@ -35,6 +35,7 @@ def test_build_bundle_and_legacy_aliases(tmp_path: Path) -> None:
         gamma=0.8,
         completion_bonus_multiplier=1.0,
         coverage_reward_enabled=True,
+        completion_exp_bonus_enabled=True,
         lambda_param=0.0,
         trace_threshold=0.01,
         epsilon_end=0.01,

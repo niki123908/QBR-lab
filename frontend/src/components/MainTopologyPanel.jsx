@@ -17,6 +17,8 @@ import {
   computeTopologyFitScale,
   resolvePlaygroundLowerBound
 } from "../utils/playgroundNodeMetrics.js";
+import { colorForTimeslot as colorForTimeslotFromPalette } from "../utils/graphDisplaySettings.js";
+import { downloadTopologyGraphPng, downloadTopologyGraphSvg } from "../export/topologyGraphExport.js";
 import {
   ACTION_SPACE_CANDIDATE_COLOR,
   ACTION_SPACE_GROUP_COLOR,
@@ -102,9 +104,8 @@ const TIMESLOT_COLORS = [
   "#7B4173"
 ];
 
-function colorForTimeslot(timeslot) {
-  if (!Number.isFinite(timeslot) || timeslot <= 0) return "#9da5bf";
-  return TIMESLOT_COLORS[(timeslot - 1) % TIMESLOT_COLORS.length];
+function colorForTimeslot(timeslot, colors) {
+  return colorForTimeslotFromPalette(timeslot, colors?.length ? colors : TIMESLOT_COLORS);
 }
 
 function PlaygroundLowerBoundScale({ lowerBound }) {
@@ -1115,9 +1116,14 @@ function TopologyGraph({
   nodeStrokeById = {},
   nodeStrokeWidthById = {},
   nodeRadius = 1.35,
+  sourceNodeColor = "#ec5bb8",
+  sourceNodeRadius = null,
   labelSize = 2.4,
+  labelOffsetX = 0,
+  labelOffsetY = 0,
   edgeWidth = 0.45,
   edgeColor = "#d0d5ea",
+  edgeOpacity = 1,
   customEdges = null,
   directedEdges = false,
   onNodeHover = null,
@@ -1136,34 +1142,42 @@ function TopologyGraph({
   const rawNodes = graph.nodes || [];
   const nodes = useMemo(() => downsampleNodes(rawNodes, maxNodes), [rawNodes, maxNodes]);
   const edges = useMemo(() => {
-    if (customEdges) {
-      const nodeById = new Map(rawNodes.map((node) => [node.node_id, node]));
-      return customEdges
-        .map((edge) => {
-          const from = nodeById.get(edge.from);
-          const to = nodeById.get(edge.to);
-          if (!from || !to) return null;
-          return {
-            from,
-            to,
-            color: edge.color ?? edgeColor,
-            width: edge.width ?? edgeWidth,
-            directed: Boolean(edge.directed),
-            lbPath: Boolean(edge.lbPath),
-            key: edge.key
-          };
-        })
-        .filter(Boolean);
-    }
-    return renderEdges
-      ? buildEdges(nodes, graph.tx_range).map(([from, to]) => ({
+    const baseEdges = renderEdges
+      ? buildEdges(nodes, graph.tx_range).map(([from, to], idx) => ({
           from,
           to,
-          color: edgeColor,
+          color: "#d0d5ea",
           width: edgeWidth ?? (interactive ? 0.35 : 0.45),
-          directed: directedEdges
+          directed: false,
+          key: `topo-${from.node_id}-${to.node_id}-${idx}`
         }))
       : [];
+    if (!customEdges) {
+      return baseEdges.map((edge) => ({
+        ...edge,
+        color: edgeColor,
+        directed: directedEdges,
+        key: undefined
+      }));
+    }
+    const nodeById = new Map(rawNodes.map((node) => [node.node_id, node]));
+    const overlayEdges = customEdges
+      .map((edge) => {
+        const from = nodeById.get(edge.from);
+        const to = nodeById.get(edge.to);
+        if (!from || !to) return null;
+        return {
+          from,
+          to,
+          color: edge.color ?? edgeColor,
+          width: edge.width ?? edgeWidth,
+          directed: Boolean(edge.directed),
+          lbPath: Boolean(edge.lbPath),
+          key: edge.key
+        };
+      })
+      .filter(Boolean);
+    return [...baseEdges, ...overlayEdges];
   }, [customEdges, rawNodes, renderEdges, nodes, graph.tx_range, edgeColor, edgeWidth, interactive, directedEdges]);
   const width = graph.space_width || 100;
   const height = graph.space_height || 100;
@@ -1178,6 +1192,18 @@ function TopologyGraph({
     () => (clickableNodeIds instanceof Set ? clickableNodeIds : new Set(clickableNodeIds ?? [])),
     [clickableNodeIds]
   );
+  const resolvedSourceRadius = Number.isFinite(Number(sourceNodeRadius))
+    ? Number(sourceNodeRadius)
+    : nodeRadius + 0.25;
+  const paintNodes = useMemo(() => {
+    const others = [];
+    let source = null;
+    for (const node of nodes) {
+      if (node.node_id === 0) source = node;
+      else others.push(node);
+    }
+    return source ? [...others, source] : others;
+  }, [nodes]);
 
   useEffect(() => {
     const nextScale = autoFitToBounds ? computeTopologyFitScale(graph) : 1;
@@ -1291,18 +1317,26 @@ function TopologyGraph({
               y2={height - edge.to.y}
               stroke={edge.color ?? edgeColor}
               strokeWidth={edge.width ?? edgeWidth ?? (interactive ? 0.35 : 0.45)}
-              strokeOpacity={edge.lbPath ? 1 : undefined}
+              strokeOpacity={edge.lbPath ? 1 : edgeOpacity}
               className={edge.lbPath ? "topology-edge--lower-bound" : undefined}
               markerEnd={edge.directed ? "url(#topology-arrow)" : undefined}
             />
           ))}
-          {nodes.map((node) => (
+          {paintNodes.map((node) => {
+            const isSource = node.node_id === 0;
+            const radius = isSource ? resolvedSourceRadius : nodeRadius;
+            const fill = isSource
+              ? sourceNodeColor
+              : (nodeFillById[node.node_id] ?? "#9da5bf");
+            const labelX = node.x + Number(labelOffsetX);
+            const labelY = height - node.y + Number(labelOffsetY);
+            return (
             <g key={node.node_id}>
               <circle
                 cx={node.x}
                 cy={height - node.y}
-                r={node.node_id === 0 ? nodeRadius + 0.25 : nodeRadius}
-                fill={nodeFillById[node.node_id] ?? (node.node_id === 0 ? "#ec5bb8" : "#9da5bf")}
+                r={radius}
+                fill={fill}
                 stroke={nodeStrokeById[node.node_id] ?? "none"}
                 strokeWidth={nodeStrokeWidthById[node.node_id] ?? 0}
                 className={clickableIdSet.has(node.node_id) ? "topology-node--clickable" : ""}
@@ -1313,9 +1347,11 @@ function TopologyGraph({
               />
               {showLabels ? (
                 <text
-                  x={node.x + 1.4}
-                  y={height - node.y - 1.2}
+                  x={labelX}
+                  y={labelY}
                   className="node-label"
+                  textAnchor="middle"
+                  dominantBaseline="central"
                   style={{ fontSize: `${labelSize}px` }}
                   onMouseEnter={onNodeHover ? () => onNodeHover(node.node_id) : undefined}
                   onMouseLeave={onNodeLeave ?? undefined}
@@ -1323,7 +1359,7 @@ function TopologyGraph({
                 >
                   {node.node_id}
                   {showLatencyAhead && Number.isFinite(latencyAheadById?.[node.node_id]) ? (
-                    <tspan className="node-latency-ahead" x={node.x + 1.4} dy="1.05em">
+                    <tspan className="node-latency-ahead" x={labelX} dy="1.05em" textAnchor="middle">
                       {`LA:${latencyAheadById[node.node_id]}`}
                     </tspan>
                   ) : null}
@@ -1333,7 +1369,7 @@ function TopologyGraph({
                 <circle
                   cx={node.x}
                   cy={height - node.y}
-                  r={(node.node_id === 0 ? nodeRadius + 0.25 : nodeRadius) + 0.9}
+                  r={radius + 0.9}
                   fill="none"
                   stroke="#c22c2c"
                   strokeWidth={0.55}
@@ -1341,7 +1377,8 @@ function TopologyGraph({
                 />
               ) : null}
             </g>
-          ))}
+            );
+          })}
         </g>
       </svg>
     </div>
@@ -1354,30 +1391,64 @@ function TopologyCard({
   onSelect,
   graph,
   selectionControl = null,
-  previewMaxNodes = 80,
-  previewShowEdges = true
+  previewShowEdges = false,
+  sourceNodeColor = "#ec5bb8",
+  sourceNodeRadius = 1.6,
+  onNeedPreview = null
 }) {
   const skipGridVisual = topo.node_count >= 500;
+  const previewMaxNodes = Math.max(8, Number(topo?.node_count) || 0);
+  const thumbRef = useRef(null);
+  const [previewActive, setPreviewActive] = useState(false);
+
+  useEffect(() => {
+    if (skipGridVisual) return undefined;
+    const el = thumbRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      setPreviewActive(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          setPreviewActive(true);
+        }
+      },
+      { root: null, rootMargin: "160px 0px", threshold: 0.01 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [skipGridVisual, topo?.topology_id]);
+
+  useEffect(() => {
+    if (!previewActive || skipGridVisual || !topo?.topology_id || graph) return;
+    onNeedPreview?.(topo.topology_id);
+  }, [previewActive, skipGridVisual, topo?.topology_id, graph, onNeedPreview]);
+
   return (
     <button
       type="button"
       className={`topology-card ${selected ? "selected" : ""}`}
       onClick={() => onSelect(topo)}
     >
-      <div className="topology-thumb-wrap">
+      <div className="topology-thumb-wrap" ref={thumbRef}>
         {skipGridVisual ? (
           <div className="large-topo-placeholder">
             <span>Preview hidden for {topo.node_count} nodes</span>
             <small>Click to open detail view</small>
           </div>
-        ) : (
+        ) : previewActive && graph ? (
           <TopologyGraph
             graph={graph}
             className="thumb-graph"
             showLabels={false}
             renderEdges={previewShowEdges}
             maxNodes={previewMaxNodes}
+            sourceNodeColor={sourceNodeColor}
+            sourceNodeRadius={sourceNodeRadius}
           />
+        ) : (
+          <div className={`topology-thumb thumb-graph${previewActive ? " is-loading" : ""}`} />
         )}
       </div>
       <div className={`topology-meta ${selectionControl ? "with-selection-control" : ""}`}>
@@ -1415,28 +1486,46 @@ function BatchCard({ batch, onOpen, statusLabel, idSubtitle, actions = null }) {
   );
 }
 
-function BatchModal({ open, mode, value, setValue, onCancel, onConfirm }) {
+function BatchModal({
+  open,
+  mode,
+  value,
+  setValue,
+  onCancel,
+  onConfirm,
+  title = null,
+  placeholder = "Batch name",
+  hint = null,
+  confirming = false
+}) {
   if (!open) return null;
+  const heading = title ?? (mode === "create" ? "New batch" : "Edit batch");
   return (
     <div className="modal-overlay">
       <div className="modal-card">
-        <h3>{mode === "create" ? "New batch" : "Edit batch"}</h3>
+        <h3>{heading}</h3>
+        {hint ? <p className="modal-message">{hint}</p> : null}
         <input
           autoFocus
           className="modal-input"
           value={value}
+          disabled={confirming}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              onConfirm();
+              if (!confirming) onConfirm();
             }
           }}
-          placeholder="Batch name"
+          placeholder={placeholder}
         />
         <div className="modal-actions">
-          <button type="button" className="secondary-cta" onClick={onCancel}>Cancel</button>
-          <button type="button" className="primary-cta small" onClick={onConfirm}>OK</button>
+          <button type="button" className="secondary-cta" onClick={onCancel} disabled={confirming}>
+            Cancel
+          </button>
+          <button type="button" className="primary-cta small" onClick={onConfirm} disabled={confirming}>
+            {confirming ? "Saving…" : "OK"}
+          </button>
         </div>
       </div>
     </div>
@@ -1555,6 +1644,8 @@ export default function MainTopologyPanel({
   onBatchStop,
   onBatchResume,
   onBatchRetryFailed,
+  onDeployBatchFromQTable,
+  onDeployRunFromQTable,
   onDeleteBatchRunResult,
   onRenameBatchRunResult,
   graphByTopologyId,
@@ -1600,8 +1691,10 @@ export default function MainTopologyPanel({
   nodeOptions,
   onCreateBatch,
   onDeleteBatch,
-  previewMaxNodesPercent = 80,
-  previewShowEdges = true,
+  previewShowEdges = false,
+  sourceNodeColor = "#ec5bb8",
+  sourceNodeRadius = 1.6,
+  onNeedTopologyPreview = null,
   onRenameBatch,
   generateMode,
   setGenerateMode,
@@ -1626,7 +1719,8 @@ export default function MainTopologyPanel({
   onCompareExportChange,
   compareExport,
   mainExportContext,
-  onOpenExportModal
+  onOpenExportModal,
+  topologyImageExportRef = null
 }) {
   const RUN_TOPO_PRESET_STORAGE_KEY = "qbr_run_topo_presets_v1";
   const homeViewMode = activeMenu === "home";
@@ -1638,6 +1732,8 @@ export default function MainTopologyPanel({
   const compareViewMode = activeMenu === "compare";
   const [batchPickerOpen, setBatchPickerOpen] = useState(false);
   const [runPickerOpen, setRunPickerOpen] = useState(false);
+  const [showResultsTopologyEdges, setShowResultsTopologyEdges] = useState(false);
+  const [showResultsLowerBound, setShowResultsLowerBound] = useState(false);
   const [generateBatchModalOpen, setGenerateBatchModalOpen] = useState(false);
   const [customNodeCountDraft, setCustomNodeCountDraft] = useState("");
   const [generateBatchModalName, setGenerateBatchModalName] = useState("");
@@ -1662,6 +1758,17 @@ export default function MainTopologyPanel({
     [ucbTool?.qValues, ucbTool?.visitCounts, ucbTool?.globalT, ucbTool?.ucbC]
   );
   const focusedGraph = focusedTopologyId ? graphByTopologyId[focusedTopologyId] : null;
+  const timeslotColors = graphDisplaySettings?.timeslot_colors;
+  const graphStyleProps = {
+    nodeRadius: graphDisplaySettings?.node_size,
+    labelSize: graphDisplaySettings?.label_size,
+    edgeWidth: graphDisplaySettings?.edge_width,
+    labelOffsetX: graphDisplaySettings?.label_offset_x ?? 0,
+    labelOffsetY: graphDisplaySettings?.label_offset_y ?? 0,
+    edgeOpacity: Number.isFinite(Number(graphDisplaySettings?.edge_opacity))
+      ? Number(graphDisplaySettings.edge_opacity)
+      : 1
+  };
 
   const focusedTopo = focusedTopologyId
     ? topologies.find((item) => item.topology_id === focusedTopologyId) ?? selectedTopology
@@ -1842,6 +1949,40 @@ export default function MainTopologyPanel({
     () => buildReplayLayeredEdges(focusedGraph, currentTransmissionPayload?.timeslots ?? [], replaySlotClamped),
     [focusedGraph, currentTransmissionPayload?.timeslots, replaySlotClamped]
   );
+  const resultsLowerBoundPathEdges = useMemo(
+    () => (showResultsLowerBound && focusedGraph ? computeLowerBoundPathEdges(focusedGraph) : []),
+    [showResultsLowerBound, focusedGraph]
+  );
+  const resultsLowerBoundOverlayEdges = useMemo(
+    () =>
+      resultsLowerBoundPathEdges.map((edge, idx) => ({
+        from: edge.from,
+        to: edge.to,
+        color: LOWER_BOUND_PATH_COLOR,
+        width: Math.max(Number(graphDisplaySettings?.edge_width) || 0.45, 1.5),
+        directed: false,
+        lbPath: true,
+        key: `results-lb-${edge.from}-${edge.to}-${idx}`
+      })),
+    [resultsLowerBoundPathEdges, graphDisplaySettings?.edge_width]
+  );
+  const resultsCustomEdges = useMemo(() => {
+    const modeEdges =
+      resultsViewMode === "timeslot"
+        ? timeslotEdges
+        : resultsViewMode === "replay"
+          ? replayEdges
+          : null;
+    if (!showResultsLowerBound || resultsLowerBoundOverlayEdges.length === 0) return modeEdges;
+    if (!modeEdges) return resultsLowerBoundOverlayEdges;
+    return [...modeEdges, ...resultsLowerBoundOverlayEdges];
+  }, [
+    resultsViewMode,
+    timeslotEdges,
+    replayEdges,
+    showResultsLowerBound,
+    resultsLowerBoundOverlayEdges
+  ]);
   const playgroundLatestSlot = playgroundState?.timeslots?.length ?? 0;
   const playgroundViewSlot = Math.min(Math.max(0, Number(playgroundState?.viewSlot) || 0), playgroundLatestSlot);
   const playgroundHopDist = useMemo(
@@ -1947,7 +2088,7 @@ export default function MainTopologyPanel({
       );
       Object.entries(committedTimeslotMap).forEach(([nodeId, ts]) => {
         if (Number(nodeId) !== 0) {
-          fillById[nodeId] = colorForTimeslot(Number(ts));
+          fillById[nodeId] = colorForTimeslot(Number(ts), timeslotColors);
         }
       });
     }
@@ -1957,7 +2098,7 @@ export default function MainTopologyPanel({
       strokeWidthById[nodeId] = 0.7;
     });
     if (playgroundPreview) {
-      const previewColor = colorForTimeslot(playgroundViewSlot + 1);
+      const previewColor = colorForTimeslot(playgroundViewSlot + 1, timeslotColors);
       (playgroundPreview.transmitters ?? []).forEach((nodeId) => {
         strokeById[nodeId] = "#8f0f15";
         strokeWidthById[nodeId] = 0.85;
@@ -1980,7 +2121,8 @@ export default function MainTopologyPanel({
     playgroundPreview,
     playgroundState?.timeslots,
     playgroundViewSlot,
-    showPlaygroundLowerBound
+    showPlaygroundLowerBound,
+    timeslotColors
   ]);
 
   const replayVisual = useMemo(() => {
@@ -1996,12 +2138,94 @@ export default function MainTopologyPanel({
     }
     Object.entries(receiveTsByNode).forEach(([nodeId, ts]) => {
       if (Number(nodeId) !== 0) {
-        fillById[nodeId] = colorForTimeslot(Number(ts));
+        fillById[nodeId] = colorForTimeslot(Number(ts), timeslotColors);
       }
     });
 
     return { fillById };
-  }, [maxReplaySlot, replaySlotClamped, replayTimeslots]);
+  }, [maxReplaySlot, replaySlotClamped, replayTimeslots, timeslotColors]);
+
+  const resultsNodeFillById = useMemo(() => {
+    if (resultsViewMode === "timeslot") {
+      return Object.fromEntries(
+        Object.entries(coloredByTimeslot)
+          .filter(([nodeId]) => Number(nodeId) !== 0)
+          .map(([nodeId, ts]) => [nodeId, colorForTimeslot(Number(ts), timeslotColors)])
+      );
+    }
+    if (resultsViewMode === "replay") return replayVisual.fillById ?? {};
+    return {};
+  }, [resultsViewMode, coloredByTimeslot, timeslotColors, replayVisual.fillById]);
+
+  useEffect(() => {
+    if (!topologyImageExportRef) return undefined;
+    topologyImageExportRef.current = {
+      async exportImage(format = "svg") {
+        if (!focusedGraph?.nodes?.length) {
+          return { ok: false, message: "Select a topology to export." };
+        }
+        const filename =
+          focusedTopo?.topology_name || focusedGraph.topology_name || focusedGraph.topology_id || "topology";
+        const useResultsVisual = resultsView;
+        const timeslotFillById = Object.fromEntries(
+          Object.entries(coloredByTimeslot)
+            .filter(([nodeId]) => Number(nodeId) !== 0)
+            .map(([nodeId, ts]) => [nodeId, colorForTimeslot(Number(ts), timeslotColors)])
+        );
+        const exportFills =
+          useResultsVisual && Object.keys(timeslotFillById).length
+            ? timeslotFillById
+            : useResultsVisual
+              ? resultsNodeFillById
+              : {};
+        const exportTxEdges =
+          useResultsVisual && Array.isArray(timeslotEdges) && timeslotEdges.length
+            ? timeslotEdges
+            : useResultsVisual
+              ? resultsCustomEdges
+              : null;
+        const opts = {
+          filename,
+          pad: 5,
+          sourceNodeColor,
+          sourceNodeRadius,
+          nodeRadius: graphStyleProps.nodeRadius,
+          edgeWidth: graphStyleProps.edgeWidth,
+          edgeOpacity: graphStyleProps.edgeOpacity,
+          labelSize: graphStyleProps.labelSize,
+          labelOffsetX: graphStyleProps.labelOffsetX,
+          labelOffsetY: graphStyleProps.labelOffsetY,
+          showLabels: true,
+          renderBaseEdges: true,
+          baseEdgeColor: "#d0d5ea",
+          nodeFillById: exportFills,
+          customEdges: exportTxEdges
+        };
+        const ok =
+          format === "png"
+            ? await downloadTopologyGraphPng(focusedGraph, opts)
+            : downloadTopologyGraphSvg(focusedGraph, opts);
+        return ok ? { ok: true } : { ok: false, message: "Could not export topology image." };
+      }
+    };
+    return () => {
+      topologyImageExportRef.current = null;
+    };
+  }, [
+    topologyImageExportRef,
+    focusedGraph,
+    focusedTopo?.topology_name,
+    resultsView,
+    coloredByTimeslot,
+    timeslotColors,
+    timeslotEdges,
+    resultsNodeFillById,
+    resultsCustomEdges,
+    sourceNodeColor,
+    sourceNodeRadius,
+    graphStyleProps
+  ]);
+
   const qTableRows = useMemo(
     () => flattenQTableRows(selectedEpisodeQTable ?? qTablePayload),
     [selectedEpisodeQTable, qTablePayload]
@@ -2073,6 +2297,10 @@ export default function MainTopologyPanel({
   const [modalBatchName, setModalBatchName] = useState("");
   const [deleteBatchRunTarget, setDeleteBatchRunTarget] = useState(null);
   const [deletingBatchRun, setDeletingBatchRun] = useState(false);
+  const [resultLabelModal, setResultLabelModal] = useState(null);
+  const [savingResultLabel, setSavingResultLabel] = useState(false);
+  const [batchRenameModal, setBatchRenameModal] = useState(null);
+  const [savingBatchRename, setSavingBatchRename] = useState(false);
   const [qValueSortMode, setQValueSortMode] = useState("none");
   const [presetLabelMap, setPresetLabelMap] = useState({});
   const batchResultAliasMap = useMemo(() => {
@@ -2217,7 +2445,11 @@ export default function MainTopologyPanel({
       run.status === "failed" && Number.isFinite(Number(run.runtime_sec))
         ? ` (${Math.round(Number(run.runtime_sec))}s)`
         : "";
-    return `${presetLabel} || ${delay}${formatRunLearningStatsSuffix(run)}${runtimeTag}${statusTag}`;
+    const deployTag =
+      run.algorithm_id === "qbr_deploy" && Number.isFinite(Number(run.rollout_runtime_ms))
+        ? ` · deploy ${Number(run.rollout_runtime_ms).toFixed(1)}ms`
+        : "";
+    return `${presetLabel} || ${delay}${formatRunLearningStatsSuffix(run)}${deployTag}${runtimeTag}${statusTag}`;
   }
 
   async function handleModalConfirm() {
@@ -2244,6 +2476,31 @@ export default function MainTopologyPanel({
     } finally {
       setDeletingBatchRun(false);
       setDeleteBatchRunTarget(null);
+    }
+  }
+
+  async function handleConfirmResultLabelModal() {
+    if (!resultLabelModal?.batchRunId || savingResultLabel) return;
+    setSavingResultLabel(true);
+    try {
+      const trimmed = String(resultLabelModal.value ?? "").trim();
+      const ok = await onRenameBatchRunResult(resultLabelModal.batchRunId, trimmed || null);
+      if (ok !== false) setResultLabelModal(null);
+    } finally {
+      setSavingResultLabel(false);
+    }
+  }
+
+  async function handleConfirmBatchRenameModal() {
+    if (!batchRenameModal?.batchId || savingBatchRename) return;
+    const trimmed = String(batchRenameModal.value ?? "").trim();
+    if (!trimmed) return;
+    setSavingBatchRename(true);
+    try {
+      const ok = await onRenameBatch(batchRenameModal.batchId, trimmed);
+      if (ok !== false) setBatchRenameModal(null);
+    } finally {
+      setSavingBatchRename(false);
     }
   }
 
@@ -2767,9 +3024,14 @@ export default function MainTopologyPanel({
                 className="full-graph"
                 interactive
                 showLabels
-                nodeRadius={graphDisplaySettings.node_size}
-                labelSize={graphDisplaySettings.label_size}
-                edgeWidth={graphDisplaySettings.edge_width}
+                nodeRadius={graphStyleProps.nodeRadius}
+                labelSize={graphStyleProps.labelSize}
+                edgeWidth={graphStyleProps.edgeWidth}
+                labelOffsetX={graphStyleProps.labelOffsetX}
+                labelOffsetY={graphStyleProps.labelOffsetY}
+                edgeOpacity={graphStyleProps.edgeOpacity}
+                sourceNodeColor={sourceNodeColor}
+                sourceNodeRadius={sourceNodeRadius}
               />
             </FocusedTopologySection>
           ) : !runFocusedBatch ? (
@@ -2798,6 +3060,10 @@ export default function MainTopologyPanel({
                   selected={selectedTopology?.topology_id === topo.topology_id}
                   graph={graphByTopologyId[topo.topology_id]}
                   onSelect={onPickTopologyForRun}
+                  previewShowEdges={previewShowEdges}
+                  sourceNodeColor={sourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
+                  onNeedPreview={onNeedTopologyPreview}
                 />
               )}
             />
@@ -2832,9 +3098,14 @@ export default function MainTopologyPanel({
                   className="full-graph"
                   interactive
                   showLabels
-                  nodeRadius={graphDisplaySettings.node_size}
-                  labelSize={graphDisplaySettings.label_size}
-                  edgeWidth={graphDisplaySettings.edge_width}
+                  nodeRadius={graphStyleProps.nodeRadius}
+                  labelSize={graphStyleProps.labelSize}
+                  edgeWidth={graphStyleProps.edgeWidth}
+                  labelOffsetX={graphStyleProps.labelOffsetX}
+                  labelOffsetY={graphStyleProps.labelOffsetY}
+                  edgeOpacity={graphStyleProps.edgeOpacity}
+                  sourceNodeColor={sourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
                 />
               </FocusedTopologySection>
             ) : !runMultiForm.batch_id ? (
@@ -2879,6 +3150,10 @@ export default function MainTopologyPanel({
                         ? () => (onRepeatTopologyPick ? onRepeatTopologyPick(topo) : onPickTopologyForRun(topo))
                         : () => onPickTopologyForRun(topo)
                     }
+                    previewShowEdges={previewShowEdges}
+                    sourceNodeColor={sourceNodeColor}
+                    sourceNodeRadius={sourceNodeRadius}
+                    onNeedPreview={onNeedTopologyPreview}
                     selectionControl={
                       isRunMultiRepeatMode ? null : (
                         <label className="topology-card-checkbox" onClick={(event) => event.stopPropagation()}>
@@ -2940,6 +3215,20 @@ export default function MainTopologyPanel({
             <section className="generate-workspace">
               <div className="generate-form-wrap">
                 <h3>{focusedBatchRunResult.result_label}</h3>
+                {focusedBatchRunResult?.algorithm_id === "qbr" &&
+                (!batchRunProgress || batchRunProgress.batch_status === "completed") &&
+                typeof onDeployBatchFromQTable === "function" ? (
+                  <div className="batch-progress-actions" style={{ marginBottom: "0.75rem" }}>
+                    <button
+                      type="button"
+                      className="primary-cta small"
+                      title="Greedy rollout using each topology's trained Q-table"
+                      onClick={onDeployBatchFromQTable}
+                    >
+                      Deploy from Q-table
+                    </button>
+                  </div>
+                ) : null}
                 {batchRunProgress ? (
                   <div className="batch-progress-panel">
                     <div className="batch-progress-summary">
@@ -2966,11 +3255,11 @@ export default function MainTopologyPanel({
                           Resume
                         </button>
                       ) : null}
-                      {batchRunProgress.failed > 0 &&
+                      {(batchRunProgress.failed > 0 || batchRunProgress.stopped > 0) &&
                       batchRunProgress.batch_status !== "running" &&
                       batchRunProgress.batch_status !== "queued" ? (
                         <button type="button" className="primary-cta small" onClick={onBatchRetryFailed}>
-                          Retry failed
+                          Retry failed / stopped
                         </button>
                       ) : null}
                     </div>
@@ -2982,6 +3271,7 @@ export default function MainTopologyPanel({
                               <th>#</th>
                               <th>Topology</th>
                               <th>Run status</th>
+                              <th>Runtime</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -2991,6 +3281,11 @@ export default function MainTopologyPanel({
                                 <td>{r.topology_name}</td>
                                 <td>
                                   <code>{r.status}</code>
+                                </td>
+                                <td>
+                                  {Number.isFinite(Number(r.runtime_sec))
+                                    ? `${Math.round(Number(r.runtime_sec))}s`
+                                    : "-"}
                                 </td>
                               </tr>
                             ))}
@@ -3056,6 +3351,24 @@ export default function MainTopologyPanel({
                     </select>
                   </label>
                 ) : null}
+                {resultsViewMode === "timeslot" || resultsViewMode === "replay" ? (
+                  <label className="field-label inline-checkbox results-show-edges-check">
+                    <span>Show edges</span>
+                    <input
+                      type="checkbox"
+                      checked={showResultsTopologyEdges}
+                      onChange={(e) => setShowResultsTopologyEdges(e.target.checked)}
+                    />
+                  </label>
+                ) : null}
+                <label className="field-label inline-checkbox results-show-edges-check">
+                  <span>Show lower bound</span>
+                  <input
+                    type="checkbox"
+                    checked={showResultsLowerBound}
+                    onChange={(e) => setShowResultsLowerBound(e.target.checked)}
+                  />
+                </label>
                 <div className="run-dropdown">
                   <button
                     type="button"
@@ -3121,6 +3434,33 @@ export default function MainTopologyPanel({
                   ) : null}
                 </div>
               </div>
+              {selectedRun?.status === "done" &&
+              selectedRun?.algorithm_id === "qbr" &&
+              typeof onDeployRunFromQTable === "function" ? (
+                <div className="batch-progress-actions" style={{ marginBottom: "0.75rem" }}>
+                  <button
+                    type="button"
+                    className="primary-cta small"
+                    title="Greedy rollout using this run's Q-table"
+                    onClick={() => onDeployRunFromQTable(selectedRun.run_id)}
+                  >
+                    Deploy from Q-table
+                  </button>
+                  {Number.isFinite(Number(selectedRun.rollout_runtime_ms)) ? (
+                    <span className="muted">rollout {Number(selectedRun.rollout_runtime_ms).toFixed(1)} ms</span>
+                  ) : null}
+                </div>
+              ) : null}
+              {selectedRun?.status === "done" &&
+              selectedRun?.algorithm_id === "qbr_deploy" &&
+              Number.isFinite(Number(selectedRun.rollout_runtime_ms)) ? (
+                <p className="muted">
+                  Deploy rollout runtime: <strong>{Number(selectedRun.rollout_runtime_ms).toFixed(2)} ms</strong>
+                  {Number.isFinite(Number(selectedRun.finished_delay))
+                    ? ` · delay ${selectedRun.finished_delay}`
+                    : ""}
+                </p>
+              ) : null}
               {latestHistoryRun?.status === "failed" ? (
                 <p className="action-space-stale-hint run-failed-hint">
                   Run gần nhất <strong>thất bại</strong>
@@ -3147,33 +3487,23 @@ export default function MainTopologyPanel({
                   className="full-graph"
                   interactive
                   showLabels
-                  nodeRadius={graphDisplaySettings.node_size}
-                  labelSize={graphDisplaySettings.label_size}
-                  edgeWidth={graphDisplaySettings.edge_width}
+                  nodeRadius={graphStyleProps.nodeRadius}
+                  labelSize={graphStyleProps.labelSize}
+                  edgeWidth={graphStyleProps.edgeWidth}
+                  labelOffsetX={graphStyleProps.labelOffsetX}
+                  labelOffsetY={graphStyleProps.labelOffsetY}
+                  edgeOpacity={graphStyleProps.edgeOpacity}
+                  sourceNodeColor={sourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
+                  renderEdges={resultsViewMode === "normal" || showResultsTopologyEdges}
                   edgeColor={
                     resultsViewMode === "normal" || (resultsViewMode === "replay" && replaySlotClamped === 0)
                       ? "#d0d5ea"
                       : "#2b2f3a"
                   }
-                  customEdges={
-                    resultsViewMode === "timeslot"
-                      ? timeslotEdges
-                      : resultsViewMode === "replay"
-                        ? replayEdges
-                        : null
-                  }
+                  customEdges={resultsCustomEdges}
                   directedEdges={resultsViewMode === "timeslot"}
-                  nodeFillById={
-                    resultsViewMode === "timeslot"
-                      ? Object.fromEntries(
-                          Object.entries(coloredByTimeslot)
-                            .filter(([nodeId]) => Number(nodeId) !== 0)
-                            .map(([nodeId, ts]) => [nodeId, colorForTimeslot(Number(ts))])
-                        )
-                      : resultsViewMode === "replay"
-                        ? replayVisual.fillById
-                        : {}
-                  }
+                  nodeFillById={resultsNodeFillById}
                 />
               </div>
               {resultsViewMode === "replay" ? (
@@ -3371,6 +3701,10 @@ export default function MainTopologyPanel({
                       setSelectedTopology(topo);
                       setFocusedTopologyId(topo.topology_id);
                     }}
+                    previewShowEdges={previewShowEdges}
+                    sourceNodeColor={sourceNodeColor}
+                    sourceNodeRadius={sourceNodeRadius}
+                    onNeedPreview={onNeedTopologyPreview}
                   />
                 )}
               />
@@ -3386,13 +3720,11 @@ export default function MainTopologyPanel({
                         type="button"
                         className="batch-icon-btn"
                         title="Rename batch"
-                        onClick={async () => {
-                          const current = batch.batch_name ?? "";
-                          const next = window.prompt("Batch display name:", current);
-                          if (next === null) return;
-                          const trimmed = next.trim();
-                          if (!trimmed) return;
-                          await onRenameBatch(batch.batch_id, trimmed);
+                        onClick={() => {
+                          setBatchRenameModal({
+                            batchId: batch.batch_id,
+                            value: batch.batch_name ?? ""
+                          });
                         }}
                       >
                         ✎
@@ -3449,13 +3781,12 @@ export default function MainTopologyPanel({
                           type="button"
                           className="batch-icon-btn"
                           title="Edit result name"
-                          onClick={async () => {
-                            const current =
-                              typeof batch.custom_result_label === "string" ? batch.custom_result_label : "";
-                            const next = window.prompt("Result display name (leave empty to reset):", current);
-                            if (next === null) return;
-                            const trimmed = next.trim();
-                            await onRenameBatchRunResult(batch.batch_id, trimmed || null);
+                          onClick={() => {
+                            setResultLabelModal({
+                              batchRunId: batch.batch_id,
+                              value:
+                                typeof batch.custom_result_label === "string" ? batch.custom_result_label : ""
+                            });
                           }}
                         >
                           ✎
@@ -3577,6 +3908,8 @@ export default function MainTopologyPanel({
                     labelSize={PLAYGROUND_LABEL_SIZE}
                     edgeWidth={PLAYGROUND_EDGE_WIDTH}
                     edgeColor="#d0d5ea"
+                    sourceNodeColor={sourceNodeColor}
+                    sourceNodeRadius={sourceNodeRadius}
                     customEdges={playgroundEdges}
                     nodeFillById={playgroundVisual.fillById}
                     nodeStrokeById={playgroundVisual.strokeById}
@@ -3738,9 +4071,14 @@ export default function MainTopologyPanel({
                   className="full-graph"
                   interactive
                   showLabels
-                  nodeRadius={graphDisplaySettings.node_size}
-                  labelSize={graphDisplaySettings.label_size}
-                  edgeWidth={graphDisplaySettings.edge_width}
+                  nodeRadius={graphStyleProps.nodeRadius}
+                  labelSize={graphStyleProps.labelSize}
+                  edgeWidth={graphStyleProps.edgeWidth}
+                  labelOffsetX={graphStyleProps.labelOffsetX}
+                  labelOffsetY={graphStyleProps.labelOffsetY}
+                  edgeOpacity={graphStyleProps.edgeOpacity}
+                  sourceNodeColor={sourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
                 />
               )}
             </FocusedTopologySection>
@@ -3779,7 +4117,9 @@ export default function MainTopologyPanel({
                   graph={graphByTopologyId[topo.topology_id]}
                   onSelect={onOpenTopology}
                   previewShowEdges={previewShowEdges}
-                  previewMaxNodes={Math.max(8, Math.ceil((Number(topo?.node_count) || 0) * (Number(previewMaxNodesPercent) || 0) / 100))}
+                  sourceNodeColor={sourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
+                  onNeedPreview={onNeedTopologyPreview}
                 />
               )}
             />
@@ -3821,6 +4161,33 @@ export default function MainTopologyPanel({
         setValue={setGenerateBatchModalName}
         onCancel={() => setGenerateBatchModalOpen(false)}
         onConfirm={handleGenerateBatchModalConfirm}
+      />
+      <BatchModal
+        open={Boolean(resultLabelModal)}
+        mode="edit"
+        title="Edit result name"
+        placeholder="Result display name"
+        hint="Leave empty to reset to the default label."
+        value={resultLabelModal?.value ?? ""}
+        setValue={(next) => setResultLabelModal((prev) => (prev ? { ...prev, value: next } : prev))}
+        confirming={savingResultLabel}
+        onCancel={() => {
+          if (!savingResultLabel) setResultLabelModal(null);
+        }}
+        onConfirm={handleConfirmResultLabelModal}
+      />
+      <BatchModal
+        open={Boolean(batchRenameModal)}
+        mode="edit"
+        title="Rename batch"
+        placeholder="Batch display name"
+        value={batchRenameModal?.value ?? ""}
+        setValue={(next) => setBatchRenameModal((prev) => (prev ? { ...prev, value: next } : prev))}
+        confirming={savingBatchRename}
+        onCancel={() => {
+          if (!savingBatchRename) setBatchRenameModal(null);
+        }}
+        onConfirm={handleConfirmBatchRenameModal}
       />
       <ConfirmModal
         open={Boolean(deleteBatchRunTarget)}

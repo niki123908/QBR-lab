@@ -44,7 +44,35 @@ export function resolvePanelTitle(chart, idx) {
   return custom || defaultPanelTitle(chart, idx);
 }
 
+export function normalizeYAxisScale(value) {
+  return String(value || "").trim().toLowerCase() === "log" ? "log" : "linear";
+}
+
+const LOG_Y_DOMAIN_FLOOR = 1e-4;
+
+/** Positive-only domain for log axes; pads in log10 space. */
+export function resolveLogYAxisDomain(autoDomain, ui) {
+  const auto = Array.isArray(autoDomain) && autoDomain.length === 2 ? autoDomain : [LOG_Y_DOMAIN_FLOOR, 1];
+  let lo;
+  let hi;
+  if (ui?.yAxisManual) {
+    lo = Number(ui.yAxisMin);
+    hi = Number(ui.yAxisMax);
+    if (!(lo > 0)) lo = auto[0] > 0 ? auto[0] : LOG_Y_DOMAIN_FLOOR;
+    if (!(hi > lo)) hi = Math.max(lo * 10, auto[1] > lo ? auto[1] : lo * 10);
+    return [lo, hi];
+  }
+  lo = Number(auto[0]);
+  hi = Number(auto[1]);
+  if (!(lo > 0)) lo = LOG_Y_DOMAIN_FLOOR;
+  if (!(hi > lo)) hi = lo * 10;
+  return [lo, hi];
+}
+
 export function resolveYAxisDomain(autoDomain, ui) {
+  if (normalizeYAxisScale(ui?.yAxisScale) === "log") {
+    return resolveLogYAxisDomain(autoDomain, ui);
+  }
   const auto = Array.isArray(autoDomain) && autoDomain.length === 2 ? autoDomain : [0, 1];
   if (!ui?.yAxisManual) return auto;
   const lo = Number(ui.yAxisMin);
@@ -53,6 +81,42 @@ export function resolveYAxisDomain(autoDomain, ui) {
   if (Number.isFinite(lo) && !Number.isFinite(hi)) return [lo, auto[1]];
   if (!Number.isFinite(lo) && Number.isFinite(hi)) return [auto[0], hi];
   return auto;
+}
+
+/** Collect finite Y values from chart rows for domain calculation. */
+export function collectPlotValues(rows, defs) {
+  const values = [];
+  (defs ?? []).forEach((def) => {
+    (rows ?? []).forEach((row) => {
+      const n = Number(row?.[def.dataKey]);
+      if (Number.isFinite(n)) values.push(n);
+    });
+  });
+  return values;
+}
+
+export function autoYDomainFromValues(values, yPaddingPct = 8, { logScale = false } = {}) {
+  if (!values?.length) return logScale ? [LOG_Y_DOMAIN_FLOOR, 1] : [0, 1];
+  if (logScale) {
+    const positives = values.filter((v) => v > 0);
+    if (!positives.length) return [LOG_Y_DOMAIN_FLOOR, 1];
+    const min = Math.min(...positives);
+    const max = Math.max(...positives);
+    const logMin = Math.log10(min);
+    const logMax = Math.log10(Math.max(max, min * 1.0001));
+    const span = Math.max(0.25, logMax - logMin);
+    const pad = span * (Math.max(0, Number(yPaddingPct) || 0) / 100);
+    const lo = 10 ** (logMin - pad);
+    const hi = 10 ** (logMax + pad);
+    return [Math.max(LOG_Y_DOMAIN_FLOOR, lo), hi > lo ? hi : lo * 10];
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(1e-9, max - min);
+  const pad = span * (Math.max(0, Number(yPaddingPct) || 0) / 100);
+  const lo = 0;
+  const hi = Math.ceil(max + pad);
+  return [lo, hi > lo ? hi : lo + 1];
 }
 
 export function defaultYAxisLabelFromMetrics(metricKeys, catalogMap) {
@@ -71,7 +135,12 @@ export function defaultYAxisLabelFromMetrics(metricKeys, catalogMap) {
 }
 
 export function defaultChartAxisLabels(chartMode, metricKeys, catalogMap) {
-  const x = chartMode === "densityMean" ? "Density (nodes)" : "Topology index";
+  const x =
+    chartMode === "densityMean"
+      ? "Density (nodes)"
+      : chartMode === "episodes"
+        ? "Training episodes"
+        : "Topology index";
   const y =
     metricKeys?.length && catalogMap ? defaultYAxisLabelFromMetrics(metricKeys, catalogMap) : "Value";
   return { x, y };
@@ -110,6 +179,7 @@ export function buildAppearanceDraft(chart, defs, idx, axisContext = null) {
     yAxisMax: Number.isFinite(Number(ui.yAxisMax)) ? Number(ui.yAxisMax) : autoY[1],
     yAxisAutoMin: autoY[0],
     yAxisAutoMax: autoY[1],
+    yAxisScale: normalizeYAxisScale(ui.yAxisScale),
     showXAxisTicks: ui.showXAxisTicks !== false,
     showYAxisTicks: ui.showYAxisTicks !== false,
     showXAxisLabel: Boolean(ui.showXAxisLabel),
@@ -163,6 +233,7 @@ export function appearanceDraftToUi(draft, prevUi = {}) {
     yAxisManual: Boolean(draft.yAxisManual),
     yAxisMin: Number(draft.yAxisMin),
     yAxisMax: Number(draft.yAxisMax),
+    yAxisScale: normalizeYAxisScale(draft.yAxisScale),
     showXAxisTicks: Boolean(draft.showXAxisTicks),
     showYAxisTicks: Boolean(draft.showYAxisTicks),
     showXAxisLabel: Boolean(draft.showXAxisLabel),

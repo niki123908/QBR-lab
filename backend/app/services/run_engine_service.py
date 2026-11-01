@@ -29,7 +29,30 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _build_node_list(topology: Topology, rows: list[TopologyNode]) -> list[Node]:
+def _effective_tx_range(topology: Topology, config: dict[str, Any] | None = None) -> float:
+    """Local run override must be >= stored topology range (avoid disconnect)."""
+    base = float(topology.tx_range)
+    raw = (config or {}).get("tx_range_override")
+    if raw is None or raw == "":
+        return base
+    try:
+        override = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tx_range_override must be a positive number.") from exc
+    if override <= 0:
+        raise ValueError("tx_range_override must be > 0.")
+    if override + 1e-12 < base:
+        raise ValueError(
+            f"tx_range_override ({override}) must be >= topology tx_range ({base})."
+        )
+    return override
+
+
+def _build_node_list(
+    topology: Topology,
+    rows: list[TopologyNode],
+    tx_range: float | None = None,
+) -> list[Node]:
     if not rows:
         raise ValueError("Failed.")
     max_node_id = max(row.node_id for row in rows)
@@ -44,7 +67,12 @@ def _build_node_list(topology: Topology, rows: list[TopologyNode]) -> list[Node]
     for row in rows:
         nodes[row.node_id] = Node(ID=row.node_id, x=row.x, y=row.y, timeslot=1)
 
-    threshold_sq = topology.tx_range * topology.tx_range
+    effective = float(topology.tx_range) if tx_range is None else float(tx_range)
+    if effective + 1e-12 < float(topology.tx_range):
+        raise ValueError(
+            f"tx_range_override ({effective}) must be >= topology tx_range ({topology.tx_range})."
+        )
+    threshold_sq = effective * effective
     for i in range(len(nodes)):
         for j in range(i + 1, len(nodes)):
             dx = nodes[i].x - nodes[j].x
@@ -92,6 +120,7 @@ def _persist_run_success(run_id: str, topology_id: str, runtime_sec: float, resu
             total_states=result.total_states,
             total_state_actions=result.total_state_actions,
             decision_graph_edges=result.decision_graph_edges,
+            rollout_runtime_ms=result.rollout_runtime_ms,
         )
         session.add(metric)
 
@@ -161,16 +190,22 @@ def _execute_run(
             node_rows = session.scalars(
                 select(TopologyNode).where(TopologyNode.topology_id == topology_id).order_by(TopologyNode.node_id.asc())
             ).all()
-            _ = _build_node_list(topology=topology, rows=node_rows)
+            _ = _build_node_list(
+                topology=topology,
+                rows=node_rows,
+                tx_range=_effective_tx_range(topology, run_config),
+            )
             run.status = "running"
             run.started_at = _utcnow()
             topology.status = "running"
+            topology_tx_range = float(topology.tx_range)
+            topology_node_count = int(topology.node_count)
 
         resolved_config = resolve_and_validate_run_config(
             algorithm_id=algorithm_id,
             preset_id=preset_id,
             run_config=run_config,
-            topology_context={"node_count": topology.node_count},
+            topology_context={"node_count": topology_node_count, "tx_range": topology_tx_range},
         )
         run_seed = resolved_config.get("run_seed")
         if run_seed is not None:
@@ -179,6 +214,11 @@ def _execute_run(
 
         artifact_root = artifact_root_for_run(run_id)
         resolved_config_path = artifact_root / "resolved_run_config.json"
+        effective_tx_range = float(
+            resolved_config.get("tx_range_override")
+            if resolved_config.get("tx_range_override") is not None
+            else topology_tx_range
+        )
         _write_json(
             resolved_config_path,
             {
@@ -187,6 +227,8 @@ def _execute_run(
                 "preset_id": preset_id,
                 "preset_name": preset_name,
                 "draft_preset_id": draft_preset_id,
+                "topology_tx_range": topology_tx_range,
+                "effective_tx_range": effective_tx_range,
                 "resolved_run_config": resolved_config,
             },
         )
@@ -197,7 +239,11 @@ def _execute_run(
             ).all()
             if topology is None:
                 raise ValueError("Failed.")
-            nodes = _build_node_list(topology=topology, rows=node_rows)
+            nodes = _build_node_list(
+                topology=topology,
+                rows=node_rows,
+                tx_range=_effective_tx_range(topology, resolved_config),
+            )
             runner = get_algorithm_runner(algorithm_id=algorithm_id)
             context = RunnerContext(run_id=run_id, topology=topology, nodes=nodes, config=resolved_config)
             result = runner(context)
@@ -228,7 +274,11 @@ def run_single_topology(
         node_rows = session.scalars(
             select(TopologyNode).where(TopologyNode.topology_id == topology_id).order_by(TopologyNode.node_id.asc())
         ).all()
-        nodes = _build_node_list(topology=topology, rows=node_rows)
+        nodes = _build_node_list(
+            topology=topology,
+            rows=node_rows,
+            tx_range=_effective_tx_range(topology, run_config),
+        )
 
         if str(algorithm_id) == "milp":
             from app.services.runners.milp_runner import assert_milp_node_limit
@@ -391,15 +441,17 @@ def run_batch_topologies(
 ) -> str:
     if not topology_ids:
         raise ValueError("Failed.")
-    if str(algorithm_id) == "milp":
-        from app.services.runners.milp_runner import assert_milp_node_limit
+    init_db()
+    with db_session_scope() as session:
+        for topology_id in topology_ids:
+            topology = session.get(Topology, topology_id)
+            if topology is None or topology.is_deleted:
+                raise ValueError("Failed.")
+            # Validate local range override against every topology before enqueue.
+            _ = _effective_tx_range(topology, run_config)
+            if str(algorithm_id) == "milp":
+                from app.services.runners.milp_runner import assert_milp_node_limit
 
-        init_db()
-        with db_session_scope() as session:
-            for topology_id in topology_ids:
-                topology = session.get(Topology, topology_id)
-                if topology is None or topology.is_deleted:
-                    raise ValueError("Failed.")
                 assert_milp_node_limit(topology.node_count)
 
     batch_run_id = str(uuid4())
@@ -422,3 +474,87 @@ def run_batch_topologies(
         result_label=result_label,
     )
     return batch_run_id
+
+
+def _source_run_has_q_table(session, run_id: str) -> bool:
+    row = session.scalars(
+        select(Artifact).where(Artifact.run_id == run_id, Artifact.artifact_type == "q_table").limit(1)
+    ).first()
+    if row is not None and row.uri:
+        return Path(row.uri).exists()
+    from app.core.paths import artifact_root_for_run
+
+    return (artifact_root_for_run(run_id) / "q_table.json.gz").exists()
+
+
+def deploy_from_source_run(source_run_id: str, result_label: str | None = None) -> str:
+    """Enqueue a single qbr_deploy run using Q-table from source_run_id."""
+    init_db()
+    with db_session_scope() as session:
+        source = session.get(Run, source_run_id)
+        if source is None or source.status != "done" or str(source.algorithm_id) != "qbr":
+            raise ValueError("Failed.")
+        if not _source_run_has_q_table(session, source_run_id):
+            raise ValueError("Failed.")
+        topology_id = str(source.topology_id)
+
+    return run_single_topology(
+        topology_id=topology_id,
+        algorithm_id="qbr_deploy",
+        preset_id="deploy_v1",
+        preset_name="QBR Deploy",
+        run_config={"source_run_id": source_run_id},
+        draft_preset_id=None,
+    )
+
+
+def deploy_from_source_batch(source_batch_run_id: str, result_label: str | None = None) -> str:
+    """Enqueue a batch of qbr_deploy runs; each topo uses the matching QBR Q-table from the source batch."""
+    init_db()
+    with db_session_scope() as session:
+        source_runs = session.scalars(
+            select(Run).where(
+                Run.batch_run_group_id == source_batch_run_id,
+                Run.status == "done",
+                Run.algorithm_id == "qbr",
+            )
+        ).all()
+        topology_ids: list[str] = []
+        seen: set[str] = set()
+        for row in source_runs:
+            if not _source_run_has_q_table(session, row.id):
+                continue
+            if row.topology_id in seen:
+                continue
+            seen.add(row.topology_id)
+            topology_ids.append(row.topology_id)
+        if not topology_ids:
+            raise ValueError("Failed.")
+
+        source_group = session.get(BatchRunGroup, source_batch_run_id)
+        source_label = None
+        if source_group is not None and source_group.result_label:
+            source_label = str(source_group.result_label)
+        elif source_group is not None and source_group.payload_json:
+            try:
+                payload = json.loads(source_group.payload_json)
+                source_label = str(payload.get("preset_name") or "") or None
+            except (TypeError, json.JSONDecodeError):
+                source_label = None
+
+    label = (result_label or "").strip() or (
+        f"Deploy -- {source_label}" if source_label else f"Deploy -- {source_batch_run_id[:8]}"
+    )
+    batch_run_id = run_batch_topologies(
+        topology_ids=topology_ids,
+        algorithm_id="qbr_deploy",
+        preset_id="deploy_v1",
+        preset_name="QBR Deploy",
+        run_config={"source_batch_run_id": source_batch_run_id},
+        save_full_artifacts_for_selected_runs=False,
+        selected_artifact_topology_ids=[],
+        selected_artifact_types=[],
+        draft_preset_id=None,
+        result_label=label,
+    )
+    return batch_run_id, len(topology_ids)

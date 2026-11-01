@@ -1,6 +1,17 @@
-import { defaultPanelTitle, resolveYAxisDomain } from "./compareChartAppearance.js";
-import { materializeLowerBoundRows, findQbrSideForLowerBound } from "./compareChartLowerBound.js";
-import { buildDensityMeanRows, buildPerDensityChartRows } from "./compareChartTransforms.js";
+import {
+  autoYDomainFromValues,
+  collectPlotValues,
+  defaultPanelTitle,
+  normalizeYAxisScale,
+  resolveYAxisDomain
+} from "./compareChartAppearance.js";
+import { materializeLowerBoundRows, listQbrSidesForLowerBound } from "./compareChartLowerBound.js";
+import { chartModeUsesMeanMetrics } from "./compareChartSides.js";
+import {
+  buildDensityMeanRows,
+  buildEpisodeMeanRows,
+  buildPerDensityChartRows
+} from "./compareChartTransforms.js";
 
 const LATEX_AXIS_WIDTH = "0.86\\columnwidth";
 const LATEX_AXIS_HEIGHT = "0.688\\columnwidth";
@@ -13,6 +24,10 @@ const LATEX_EXPORT_SIDE_COLORS = {
   B: "377eb8",
   C: "4daf4a",
   D: "984ea3",
+  E: "ff7f00",
+  F: "a65628",
+  G: "f781bf",
+  H: "999999",
   LB: "ff7f00"
 };
 
@@ -21,6 +36,10 @@ const LATEX_EXPORT_SIDE_MARKS = {
   B: "square",
   C: "triangle",
   D: "diamond",
+  E: "pentagon",
+  F: "star",
+  G: "oplus",
+  H: "otimes",
   LB: "o"
 };
 
@@ -91,12 +110,12 @@ function formatCoordNum(value) {
 
 function filterPlotDefs(defs, chartMode) {
   const hasConvergenceMetric = defs.some((def) => def.metricKey === "convergence_count");
-  const shouldPlotConvergenceSeries = chartMode === "densityMean" && hasConvergenceMetric;
+  const shouldPlotConvergenceSeries = chartModeUsesMeanMetrics(chartMode) && hasConvergenceMetric;
   return shouldPlotConvergenceSeries ? defs : defs.filter((def) => def.metricKey !== "convergence_count");
 }
 
 function materializeRowsForDefs(rows, defs, compareChartInput) {
-  return materializeLowerBoundRows(rows, defs, findQbrSideForLowerBound(compareChartInput));
+  return materializeLowerBoundRows(rows, defs, listQbrSidesForLowerBound(compareChartInput));
 }
 
 function shouldUseLeadingZeroPad(rows, xKey, chartType, enabled) {
@@ -152,10 +171,14 @@ function axisDomainForBar(rows, defs, yPaddingPct = 8) {
 }
 
 function computeAutoYDomain({ rows, plotDefs, chartType, chartMode, ui }) {
+  const logScale = normalizeYAxisScale(ui?.yAxisScale) === "log";
   const convergenceOnly = plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
-  if (convergenceOnly) return [0, 100];
+  if (convergenceOnly) return logScale ? [1, 100] : [0, 100];
   const pathOnly = plotDefs.length > 0 && plotDefs.every((def) => PATH_COUNT_METRICS.has(def.metricKey));
-  if (pathOnly) return [0, 1000];
+  if (pathOnly) return logScale ? [1, 1000] : [0, 1000];
+  if (logScale) {
+    return autoYDomainFromValues(collectPlotValues(rows, plotDefs), ui?.yPaddingPct ?? 8, { logScale: true });
+  }
   return chartType === "bar"
     ? axisDomainForBar(rows, plotDefs, ui?.yPaddingPct ?? 8)
     : axisDomainForLine(rows, plotDefs, ui?.yPaddingPct ?? 8);
@@ -180,11 +203,13 @@ function pgfMark(marker) {
   return map[marker] || "o";
 }
 
-function buildCoordinates(rows, xKey, dataKey) {
+function buildCoordinates(rows, xKey, dataKey, { logY = false } = {}) {
   const parts = [];
   rows.forEach((row) => {
     const x = formatCoordNum(row[xKey]);
-    const y = formatCoordNum(row[dataKey]);
+    const yRaw = Number(row[dataKey]);
+    if (logY && !(yRaw > 0)) return;
+    const y = formatCoordNum(yRaw);
     if (x == null || y == null) return;
     parts.push(`(${x},${y})`);
   });
@@ -229,6 +254,7 @@ function legendColumnCount(seriesCount) {
 
 function buildAxisOptions(ui, yDomain, xTickBlock, plotDefs, drawRows, xKey) {
   const [ymin, ymax] = yDomain;
+  const isLogY = normalizeYAxisScale(ui?.yAxisScale) === "log";
   const lines = [
     `width=${LATEX_AXIS_WIDTH}`,
     `height=${LATEX_AXIS_HEIGHT}`,
@@ -241,6 +267,9 @@ function buildAxisOptions(ui, yDomain, xTickBlock, plotDefs, drawRows, xKey) {
     `ymin=${formatCoordNum(ymin)}`,
     `ymax=${formatCoordNum(ymax)}`
   ];
+  if (isLogY) {
+    lines.push("ymode=log");
+  }
 
   if (ui?.showLegend !== false && plotDefs.length) {
     const legendCols = legendColumnCount(plotDefs.length);
@@ -290,10 +319,10 @@ function buildLinePlotOpts(def) {
   return opts;
 }
 
-function buildLinePlots(plotDefs, drawRows, xKey) {
+function buildLinePlots(plotDefs, drawRows, xKey, { logY = false } = {}) {
   const lines = [];
   plotDefs.forEach((def) => {
-    const coords = buildCoordinates(drawRows, xKey, def.dataKey);
+    const coords = buildCoordinates(drawRows, xKey, def.dataKey, { logY });
     if (!coords) return;
     const plotOpts = buildLinePlotOpts(def);
     lines.push(
@@ -305,12 +334,12 @@ function buildLinePlots(plotDefs, drawRows, xKey) {
   return lines.join("\n");
 }
 
-function buildBarPlots(plotDefs, drawRows, xKey) {
+function buildBarPlots(plotDefs, drawRows, xKey, { logY = false } = {}) {
   const n = plotDefs.length;
   const barWidth = n > 1 ? Math.min(12, 28 / n) : 14;
   const lines = [];
   plotDefs.forEach((def, idx) => {
-    const coords = buildCoordinates(drawRows, xKey, def.dataKey);
+    const coords = buildCoordinates(drawRows, xKey, def.dataKey, { logY });
     if (!coords) return;
     const colorName = colorDefName(def.dataKey);
     const shift = n > 1 ? (idx - (n - 1) / 2) * barWidth : 0;
@@ -333,6 +362,7 @@ function buildTikzpictureBody(figure) {
 
   const autoY = computeAutoYDomain({ rows: drawRows, plotDefs, chartType, chartMode, ui });
   const yDomain = resolveYAxisDomain(autoY, ui);
+  const isLogY = normalizeYAxisScale(ui?.yAxisScale) === "log";
   const xTickBlock = ui?.showXAxisTicks !== false ? buildXTickBlock(drawRows, xKey, chartMode) : "";
   const axisOpts = buildAxisOptions(ui, yDomain, xTickBlock, plotDefs, drawRows, xKey);
 
@@ -342,8 +372,8 @@ function buildTikzpictureBody(figure) {
 
   const plotBody =
     chartType === "bar"
-      ? buildBarPlots(plotDefs, drawRows, xKey)
-      : buildLinePlots(plotDefs, drawRows, xKey);
+      ? buildBarPlots(plotDefs, drawRows, xKey, { logY: isLogY })
+      : buildLinePlots(plotDefs, drawRows, xKey, { logY: isLogY });
 
   const sectionTitle = String(figure.sectionTitle ?? "").trim();
   const lines = [`% ${latexEscape(title)}`];
@@ -428,6 +458,26 @@ export function buildChartFiguresForPanel({
         chartMode: chart.mode,
         compareChartInput
       });
+    });
+  } else if (chart.mode === "episodes") {
+    const topoKeys = chart.selectedMetricKeys.filter((key) => catalogMap?.get(key)?.scope === "topology");
+    const densityKeys = chart.selectedMetricKeys.filter((key) => catalogMap?.get(key)?.scope === "density");
+    const episodeRows = buildEpisodeMeanRows(
+      compareChartInput,
+      topoKeys,
+      densityKeys,
+      chart.selectedDensityLabels
+    );
+    figures.push({
+      title: defaultCardTitle || "Training episodes comparison",
+      sectionTitle: chartUi.cardTitle?.trim() || defaultCardTitle || "Training episodes comparison",
+      chartType: chart.chartType,
+      rows: episodeRows,
+      xKey: "x",
+      plotDefs,
+      ui: chartUi,
+      chartMode: chart.mode,
+      compareChartInput
     });
   } else {
     const topoKeys = chart.selectedMetricKeys.filter((key) => catalogMap?.get(key)?.scope === "topology");

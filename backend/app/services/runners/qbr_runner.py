@@ -203,6 +203,7 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
     spread_mode = str(config.get("spread_mode", "normal"))
     completion_bonus_multiplier = float(config.get("completion_bonus_multiplier", 1.0))
     coverage_reward_enabled = bool(config.get("coverage_reward_enabled", True))
+    completion_exp_bonus_enabled = bool(config.get("completion_exp_bonus_enabled", False))
     lambda_param = float(config.get("lambda_param", 0.0))
     trace_threshold = float(config.get("trace_threshold", 0.01))
     ucb_c = float(config.get("ucb_c", 1.414))
@@ -251,6 +252,7 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         export_q_table_all_epoch=False,
         completion_bonus_multiplier=completion_bonus_multiplier,
         coverage_reward_enabled=coverage_reward_enabled,
+        completion_exp_bonus_enabled=completion_exp_bonus_enabled,
         lambda_param=lambda_param,
         trace_threshold=trace_threshold,
         action_axis=action_axis,
@@ -321,6 +323,7 @@ def execute_qbr(context: RunnerContext) -> RunExecutionResult:
         gamma=gamma,
         completion_bonus_multiplier=completion_bonus_multiplier,
         coverage_reward_enabled=coverage_reward_enabled,
+        completion_exp_bonus_enabled=completion_exp_bonus_enabled,
         lambda_param=lambda_param,
         trace_threshold=trace_threshold,
         epsilon_end=epsilon_end if policy_type == "epsilon_greedy" else None,

@@ -330,6 +330,7 @@ def set_batch_locked(batch_id: str, locked: bool) -> bool:
 
 def delete_batch(batch_id: str) -> bool:
     init_db()
+    group_ids: set[str] = set()
     with db_session_scope() as session:
         batch = session.get(Batch, batch_id)
         if batch is None:
@@ -341,12 +342,21 @@ def delete_batch(batch_id: str) -> bool:
         for row in rows:
             run_rows = session.scalars(select(Run).where(Run.topology_id == row.id)).all()
             for run_row in run_rows:
+                if run_row.batch_run_group_id:
+                    group_ids.add(str(run_row.batch_run_group_id))
                 run_row.warning_topology_changed = True
             row.is_deleted = True
             row.batch_id = None
             row.updated_at = datetime.utcnow()
         session.delete(batch)
-        return True
+
+    # Drop Results entries for this batch after the batch row is gone.
+    if group_ids:
+        from app.repositories.run_repo import delete_batch_run
+
+        for batch_run_id in group_ids:
+            delete_batch_run(batch_run_id)
+    return True
 
 
 def get_topology_nodes(topology_id: str) -> list[NodeRecord] | None:

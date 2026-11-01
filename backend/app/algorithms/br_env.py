@@ -178,6 +178,7 @@ class Br_Env:
         first_pick,
         completion_bonus_multiplier=1.0,
         coverage_reward_enabled=True,
+        completion_exp_bonus_enabled=False,
         action_axis="broadcaster",
         spread_mode="normal",
     ):
@@ -186,13 +187,19 @@ class Br_Env:
             br_set, rcv_set = self._greedy_spread_receiver(first_pick, normalized_spread)
         else:
             br_set, rcv_set = self._greedy_spread_broadcaster(first_pick, normalized_spread)
-        completion_bonus = 0
+        completion_bonus = 0.0
         total_nodes_covered = len(set(self.V_s).union(rcv_set))
         total_nodes_in_topo = len(self.V_ids)
         if total_nodes_covered >= total_nodes_in_topo:
-            completion_bonus = (
-                float(completion_bonus_multiplier) * total_nodes_in_topo * math.exp(self.lowerbound - self.cur_time)
-            )
+            if bool(completion_exp_bonus_enabled):
+                completion_bonus = (
+                    float(completion_bonus_multiplier)
+                    * total_nodes_in_topo
+                    * math.exp(self.lowerbound - self.cur_time)
+                )
+            else:
+                # No e^(LB - delay): completion reward is multiplier × topology node count.
+                completion_bonus = float(completion_bonus_multiplier) * float(total_nodes_in_topo)
 
         covered_reward = len(rcv_set) if bool(coverage_reward_enabled) else 0.0
         reward = float(covered_reward) + completion_bonus

@@ -4,8 +4,11 @@ import {
   applySeriesStyles,
   appearanceDraftToUi,
   buildAppearanceDraft,
+  collectPlotValues,
+  autoYDomainFromValues,
   defaultChartAxisLabels,
   defaultYAxisLabelFromMetrics,
+  normalizeYAxisScale,
   resolveChartDisplayUi,
   normalizeSeriesStylesMap,
   resolvePanelTitle,
@@ -18,8 +21,10 @@ import {
 } from "../utils/compareChartLatexExport.js";
 import { buildCompareMetricCatalog } from "../utils/compareChartMetrics.js";
 import {
+  MAX_COMPARE_CHART_BATCHES,
   QUAD_COMPARE_SIDES,
   SIDE_COLORS,
+  chartModeUsesMeanMetrics,
   normalizeCompareChartInput,
   activeSideIds
 } from "../utils/compareChartSides.js";
@@ -36,13 +41,13 @@ import {
   writeCompareChartWorkspaceSession
 } from "../utils/compareChartWorkspaceStorage.js";
 import {
-  LOWER_BOUND_DATA_KEY,
-  LOWER_BOUND_SERIES_LABEL,
   filterMetricKeysWithLowerBound,
-  findQbrSideForLowerBound,
+  listQbrSidesForLowerBound,
+  lowerBoundDataKey,
+  lowerBoundSeriesLabel,
   materializeLowerBoundRows
 } from "../utils/compareChartLowerBound.js";
-import { buildDensityMeanRows, buildDensityPairs, buildPerDensityChartRows } from "../utils/compareChartTransforms.js";
+import { buildDensityMeanRows, buildDensityPairs, buildEpisodeMeanRows, buildPerDensityChartRows } from "../utils/compareChartTransforms.js";
 
 async function fetchBatchResultDetail(apiBase, batchRunId) {
   const response = await fetch(`${apiBase}/runs/batch/${batchRunId}/result`);
@@ -58,6 +63,7 @@ function emptyBatchIds(sideIds) {
 }
 const FIXED_GROUP_PATH = ["unique_path_count", "best_delay_unique_path_count"];
 const FIXED_GROUP_DELAY = ["best_delay", "last_delay", "lower_bound"];
+const FIXED_GROUP_RUNTIME = ["runtime_sec", "rollout_runtime_ms"];
 const PATH_COUNT_METRICS = new Set(FIXED_GROUP_PATH);
 const PATH_COUNT_Y_MAX = 1000;
 
@@ -74,10 +80,41 @@ function valueTick(value) {
   return n.toFixed(2);
 }
 
+function formatSeriesTableY(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Number.isInteger(n)) return String(n);
+  const rounded = Number(n.toFixed(4));
+  return String(rounded);
+}
+
+function buildChartSeriesTableRows(rows, xKey, plotDefs, xTickFormatter) {
+  return (plotDefs ?? []).map((def) => {
+    const points = [];
+    for (const row of rows ?? []) {
+      const yText = formatSeriesTableY(row?.[def.dataKey]);
+      if (yText == null) continue;
+      const rawX = row?.[xKey];
+      const xText =
+        typeof xTickFormatter === "function" ? String(xTickFormatter(rawX) ?? rawX ?? "") : String(rawX ?? "");
+      points.push(`(${xText},${yText})`);
+    }
+    return {
+      dataKey: def.dataKey,
+      name: String(def.name ?? def.dataKey ?? ""),
+      pointsText: points.join(" ")
+    };
+  });
+}
+
 function metricColor(metricKey, side) {
   const key = String(metricKey || "");
   const family = SIDE_COLORS[side] ?? SIDE_COLORS.A;
-  if (key === "lower_bound") return "#9333EA";
+  if (key === "lower_bound") {
+    // Keep LB visually tied to its batch, but darker than delay lines.
+    if (side === "LB") return "#9333EA";
+    return family.dark;
+  }
   if (key === "unique_path_count") return family.light;
   if (key === "best_delay_unique_path_count") return family.dark;
   if (key.includes("best")) return family.dark;
@@ -144,20 +181,24 @@ function MetricDot({ cx, cy, stroke, fill, shape = "circle", opacity = 1 }) {
 
 function seriesDefs(metricKeys, catalogMap, sideIds, sideLabelsById, compareChartInput) {
   const defs = [];
-  const qbrSideId = findQbrSideForLowerBound(compareChartInput);
+  const qbrSideIds = listQbrSidesForLowerBound(compareChartInput);
 
   metricKeys.forEach((key) => {
     const metric = catalogMap.get(key);
     if (!metric) return;
 
     if (key === "lower_bound") {
-      if (!qbrSideId) return;
-      defs.push({
-        dataKey: LOWER_BOUND_DATA_KEY,
-        metricKey: key,
-        side: "LB",
-        name: LOWER_BOUND_SERIES_LABEL,
-        color: metricColor(key, "LB")
+      if (!qbrSideIds.length) return;
+      qbrSideIds.forEach((sideId) => {
+        const sideLabel = sideLabelsById?.[sideId] || sideId;
+        defs.push({
+          dataKey: lowerBoundDataKey(sideId),
+          metricKey: key,
+          side: sideId,
+          name: lowerBoundSeriesLabel(sideLabel),
+          color: metricColor(key, sideId),
+          marker: "cross"
+        });
       });
       return;
     }
@@ -221,7 +262,7 @@ function axisDomainForLine(rows, defs, yPaddingPct = 8) {
 }
 
 function materializeRowsForDefs(rows, defs, compareChartInput) {
-  return materializeLowerBoundRows(rows, defs, findQbrSideForLowerBound(compareChartInput));
+  return materializeLowerBoundRows(rows, defs, listQbrSidesForLowerBound(compareChartInput));
 }
 
 function shouldUseLeadingZeroPad(rows, xKey, chartType, enabled) {
@@ -245,6 +286,7 @@ function defaultChartUi() {
     leadingZeroPad: true,
     seriesStyles: {},
     yAxisManual: false,
+    yAxisScale: "linear",
     showXAxisTicks: true,
     showYAxisTicks: true,
     showXAxisLabel: false,
@@ -270,7 +312,7 @@ function chartUiForDisplay(chart, catalogMap) {
 
 function filterPlotDefs(defs, chartMode) {
   const hasConvergenceMetric = defs.some((def) => def.metricKey === "convergence_count");
-  const shouldPlotConvergenceSeries = chartMode === "densityMean" && hasConvergenceMetric;
+  const shouldPlotConvergenceSeries = chartModeUsesMeanMetrics(chartMode) && hasConvergenceMetric;
   return shouldPlotConvergenceSeries ? defs : defs.filter((def) => def.metricKey !== "convergence_count");
 }
 
@@ -284,7 +326,9 @@ function computeChartAutoYDomain({
   compareChartInput,
   xKey = "x"
 }) {
-  if (!rows?.length || !plotDefs?.length) return [0, 1];
+  if (!rows?.length || !plotDefs?.length) {
+    return normalizeYAxisScale(ui?.yAxisScale) === "log" ? [1e-4, 1] : [0, 1];
+  }
   const normalizedRows = materializeRowsForDefs(rows, plotDefs, compareChartInput);
   const useZeroPad =
     chartType === "bar" && shouldUseLeadingZeroPad(normalizedRows, xKey, chartType, ui?.leadingZeroPad !== false);
@@ -292,8 +336,15 @@ function computeChartAutoYDomain({
   const isBar = chartType === "bar";
   const isPathOverlay = isBar && hasPathOverlayPair(plotDefs, sideIds);
   const convergenceSeriesOnly = plotDefs.length > 0 && plotDefs.every((def) => def.metricKey === "convergence_count");
-  if (convergenceSeriesOnly) return [0, 100];
-  if (isPathOverlay || isPathCountOnlyChart(plotDefs)) return [0, PATH_COUNT_Y_MAX];
+  const logScale = normalizeYAxisScale(ui?.yAxisScale) === "log";
+  if (convergenceSeriesOnly) return logScale ? [1, 100] : [0, 100];
+  if (isPathOverlay || isPathCountOnlyChart(plotDefs)) {
+    return logScale ? [1, PATH_COUNT_Y_MAX] : [0, PATH_COUNT_Y_MAX];
+  }
+  const values = collectPlotValues(drawRows, plotDefs);
+  if (logScale) {
+    return autoYDomainFromValues(values, ui?.yPaddingPct ?? 8, { logScale: true });
+  }
   return isBar
     ? axisDomainForBar(drawRows, plotDefs, ui?.yPaddingPct ?? 8)
     : axisDomainForLine(drawRows, plotDefs, ui?.yPaddingPct ?? 8);
@@ -421,7 +472,7 @@ function ChartCard({
   const isBar = chartType === "bar";
   const isPathOverlay = isBar && hasPathOverlayPair(defs, sideIds);
   const hasConvergenceMetric = defs.some((def) => def.metricKey === "convergence_count");
-  const shouldPlotConvergenceSeries = chartMode === "densityMean" && hasConvergenceMetric;
+  const shouldPlotConvergenceSeries = chartModeUsesMeanMetrics(chartMode) && hasConvergenceMetric;
   const hasConvergenceOverlay = hasConvergenceMetric && !shouldPlotConvergenceSeries && sideIds.length === 2;
   const plotDefs = filterPlotDefs(defs, chartMode);
   if (!plotDefs.length) {
@@ -433,6 +484,18 @@ function ChartCard({
   const showLineValues =
     uiSafe.showLineValues === true || (uiSafe.showLineValues !== false && convergenceSeriesOnly);
   const yTickFormatter = convergenceSeriesOnly ? (value) => `${Math.round(Number(value) || 0)}%` : valueTick;
+  const yAxisScale = normalizeYAxisScale(uiSafe.yAxisScale);
+  const isLogY = yAxisScale === "log";
+  const logSafeRows = isLogY
+    ? drawRows.map((row) => {
+        const next = { ...row };
+        plotDefs.forEach((def) => {
+          const n = Number(next[def.dataKey]);
+          if (Number.isFinite(n) && n <= 0) next[def.dataKey] = null;
+        });
+        return next;
+      })
+    : drawRows;
 
   function linePointValueLabel(def, plotIdx, seriesCount) {
     return ({ x, y, value }) => {
@@ -504,6 +567,7 @@ function ChartCard({
     left: uiSafe.showYAxisLabel ? 28 : 20,
     bottom: (uiSafe.showXAxisLabel ? 22 : 8) + legendBottomPad
   };
+  const seriesTableRows = buildChartSeriesTableRows(normalizedRows, xKey, plotDefs, xTickFormatter);
 
   return (
     <div className="compare-chart-card">
@@ -514,7 +578,7 @@ function ChartCard({
         <ResponsiveContainer width="100%" height="100%">
           {isBar ? (
             <BarChart
-              data={drawRows}
+              data={logSafeRows}
               margin={chartMargin}
               barCategoryGap={isPathOverlay ? "22%" : "34%"}
               barGap={isPathOverlay ? 0 : -5}
@@ -533,6 +597,8 @@ function ChartCard({
                 hide={uiSafe.showYAxisTicks === false}
                 tickFormatter={yTickFormatter}
                 domain={yDomain}
+                scale={isLogY ? "log" : "auto"}
+                allowDataOverflow={isLogY}
                 label={yAxisLabelProps}
               />
               {hasConvergenceOverlay ? <YAxis yAxisId="bg" hide domain={[0, 1]} /> : null}
@@ -602,7 +668,7 @@ function ChartCard({
               )}
             </BarChart>
           ) : (
-            <ComposedChart data={drawRows} margin={chartMargin}>
+            <ComposedChart data={logSafeRows} margin={chartMargin}>
               {uiSafe.showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
               <XAxis
                 dataKey={xKey}
@@ -618,6 +684,8 @@ function ChartCard({
                 hide={uiSafe.showYAxisTicks === false}
                 tickFormatter={yTickFormatter}
                 domain={yDomain}
+                scale={isLogY ? "log" : "auto"}
+                allowDataOverflow={isLogY}
                 label={yAxisLabelProps}
               />
               {hasConvergenceOverlay ? <YAxis yAxisId="bg" hide domain={[0, 1]} /> : null}
@@ -677,12 +745,34 @@ function ChartCard({
           )}
         </ResponsiveContainer>
       </div>
+      {seriesTableRows.length > 0 ? (
+        <div className="compare-chart-data-table-wrap">
+          <table className="compare-chart-data-table">
+            <thead>
+              <tr>
+                <th scope="col">Data</th>
+                <th scope="col">Points</th>
+              </tr>
+            </thead>
+            <tbody>
+              {seriesTableRows.map((row) => (
+                <tr key={row.dataKey}>
+                  <td>{row.name}</td>
+                  <td className="compare-chart-data-table__points">{row.pointsText}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
     </div>
   );
 }
 
 function metricGroupsForModal(mode, catalog) {
-  const allowed = mode === "densityMean" ? [...catalog.topologyMetrics, ...catalog.densityMetrics] : catalog.topologyMetrics;
+  const allowed = chartModeUsesMeanMetrics(mode)
+    ? [...catalog.topologyMetrics, ...catalog.densityMetrics]
+    : catalog.topologyMetrics;
   const map = new Map(allowed.map((metric) => [metric.key, metric]));
 
   const fixed = [];
@@ -690,8 +780,10 @@ function metricGroupsForModal(mode, catalog) {
   if (firstRow.length) fixed.push({ title: "Path count metrics", items: firstRow });
   const secondRow = FIXED_GROUP_DELAY.map((key) => map.get(key)).filter(Boolean);
   if (secondRow.length) fixed.push({ title: "Delay metrics", items: secondRow });
+  const runtimeRow = FIXED_GROUP_RUNTIME.map((key) => map.get(key)).filter(Boolean);
+  if (runtimeRow.length) fixed.push({ title: "Runtime metrics", items: runtimeRow });
 
-  const taken = new Set([...FIXED_GROUP_PATH, ...FIXED_GROUP_DELAY]);
+  const taken = new Set([...FIXED_GROUP_PATH, ...FIXED_GROUP_DELAY, ...FIXED_GROUP_RUNTIME]);
   const autoGrouped = new Map();
   allowed.forEach((metric) => {
     if (taken.has(metric.key)) return;
@@ -802,7 +894,12 @@ function ChartConfigModal({
   };
 
   const switchMode = (nextMode) => {
-    const allowed = new Set((nextMode === "densityMean" ? [...catalog.topologyMetrics, ...catalog.densityMetrics] : catalog.topologyMetrics).map((m) => m.key));
+    const allowed = new Set(
+      (chartModeUsesMeanMetrics(nextMode)
+        ? [...catalog.topologyMetrics, ...catalog.densityMetrics]
+        : catalog.topologyMetrics
+      ).map((m) => m.key)
+    );
     onDraftChange({
       ...draft,
       mode: nextMode,
@@ -865,7 +962,19 @@ function ChartConfigModal({
             >
               Density mean
             </button>
+            <button
+              type="button"
+              className={`segment-btn ${draft.mode === "episodes" ? "active" : ""}`}
+              onClick={() => switchMode("episodes")}
+            >
+              Episodes
+            </button>
           </div>
+          {draft.mode === "episodes" ? (
+            <p className="muted compare-chart-preset-hint">
+              X-axis = training episode count from each batch. Y-axis = mean of selected metrics over selected densities.
+            </p>
+          ) : null}
         </section>
 
         <section className="compare-chart-modal-section">
@@ -1143,6 +1252,30 @@ function ChartAppearanceModal({ open, draft, chartType, onClose, onDraftChange, 
         <section className="compare-chart-modal-section">
           <h5>Axes</h5>
           <div className="compare-chart-appearance-axis-block">
+            <div className="compare-chart-appearance-global">
+              <span className="field-label-span">Y scale</span>
+              <div className="segmented-toggle segmented-toggle--dense">
+                <button
+                  type="button"
+                  className={`segment-btn ${draft.yAxisScale !== "log" ? "active" : ""}`}
+                  onClick={() => onDraftChange({ ...draft, yAxisScale: "linear" })}
+                >
+                  Linear
+                </button>
+                <button
+                  type="button"
+                  className={`segment-btn ${draft.yAxisScale === "log" ? "active" : ""}`}
+                  onClick={() => onDraftChange({ ...draft, yAxisScale: "log" })}
+                >
+                  Log
+                </button>
+              </div>
+            </div>
+            {draft.yAxisScale === "log" ? (
+              <p className="muted compare-chart-axis-hint">
+                Log scale: values ≤ 0 are omitted so small runtimes stay visible next to large ones.
+              </p>
+            ) : null}
             <label className="compare-chart-check">
               <input
                 type="checkbox"
@@ -1318,7 +1451,13 @@ function batchOptionLabel(item) {
   return `${item.result_label || item.batch_name} (${item.successful}/${item.total_topologies})`;
 }
 
-const MAX_CHART_SLOTS = 4;
+const MAX_CHART_SLOTS = MAX_COMPARE_CHART_BATCHES;
+
+function defaultCardTitleForMode(mode) {
+  if (mode === "densityMean") return "Density mean comparison";
+  if (mode === "episodes") return "Training episodes comparison";
+  return "";
+}
 
 function hydrateBatchIds(stored) {
   const base = emptyBatchIds(QUAD_COMPARE_SIDES);
@@ -1524,6 +1663,9 @@ export default function CompareChartWorkspace({
           chart.selectedDensityLabels.includes(row.densityLabel)
         );
       }
+      if (chart.mode === "episodes") {
+        return buildEpisodeMeanRows(compareChartInput, topoKeys, densityKeys, chart.selectedDensityLabels);
+      }
       const selectedPairMap = new Map(
         densityPairs
           .filter((pair) => chart.selectedDensityLabels.includes(pair.densityLabel))
@@ -1611,6 +1753,14 @@ export default function CompareChartWorkspace({
       window.alert("Y max must be greater than Y min.");
       return;
     }
+    if (
+      normalizeYAxisScale(appearanceDraft.yAxisScale) === "log" &&
+      appearanceDraft.yAxisManual &&
+      (!(Number(appearanceDraft.yAxisMin) > 0) || !(Number(appearanceDraft.yAxisMax) > 0))
+    ) {
+      window.alert("Log Y range requires Y min and Y max greater than 0.");
+      return;
+    }
     setChartConfigs((prev) =>
       prev.map((chart) =>
         chart.id === appearanceChartId
@@ -1647,7 +1797,7 @@ export default function CompareChartWorkspace({
       chartUi.seriesStyles,
       metricKeys
     );
-    const defaultCardTitle = chart.mode === "densityMean" ? "Density mean comparison" : "";
+    const defaultCardTitle = defaultCardTitleForMode(chart.mode);
     const figures = buildChartFiguresForPanel({
       chart,
       chartUi,
@@ -1680,7 +1830,7 @@ export default function CompareChartWorkspace({
       <div className="compare-chart-slot-toolbar">
         <span className="compare-chart-slot-label">Batches to compare</span>
         <div className="generate-mode-toggle compare-kind-toggle compare-chart-slot-toggle">
-          {[1, 2, 3, 4].map((count) => (
+          {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
             <button
               key={count}
               type="button"
@@ -1749,7 +1899,7 @@ export default function CompareChartWorkspace({
           const defs = applySeriesStyles(baseDefs, chartUi.seriesStyles, metricKeys);
           const titleMetrics = metricSummary(metricKeys, catalogMap);
           const panelTitle = resolvePanelTitle(chart, idx);
-          const defaultCardTitle = chart.mode === "densityMean" ? "Density mean comparison" : "";
+          const defaultCardTitle = defaultCardTitleForMode(chart.mode);
           const selectedPairMap = new Map(
             densityPairs
               .filter((pair) => chart.selectedDensityLabels.includes(pair.densityLabel))
@@ -1758,9 +1908,16 @@ export default function CompareChartWorkspace({
 
           const topoKeys = chart.selectedMetricKeys.filter((key) => catalogMap.get(key)?.scope === "topology");
           const densityKeys = chart.selectedMetricKeys.filter((key) => catalogMap.get(key)?.scope === "density");
-          const meanRows = buildDensityMeanRows(compareChartInput, topoKeys, densityKeys).filter((row) =>
-            chart.selectedDensityLabels.includes(row.densityLabel)
-          );
+          const meanRows =
+            chart.mode === "densityMean"
+              ? buildDensityMeanRows(compareChartInput, topoKeys, densityKeys).filter((row) =>
+                  chart.selectedDensityLabels.includes(row.densityLabel)
+                )
+              : [];
+          const episodeRows =
+            chart.mode === "episodes"
+              ? buildEpisodeMeanRows(compareChartInput, topoKeys, densityKeys, chart.selectedDensityLabels)
+              : [];
 
           return (
             <div
@@ -1824,6 +1981,20 @@ export default function CompareChartWorkspace({
                     />
                   );
                 })
+              ) : chart.mode === "episodes" ? (
+                <ChartCard
+                  title={chartUi.cardTitle?.trim() || defaultCardTitle || "Training episodes comparison"}
+                  rows={episodeRows}
+                  xKey="x"
+                  xTickFormatter={(value) => (Number(value) === 0 ? "0*" : String(value))}
+                  chartType={chart.chartType}
+                  defs={defs}
+                  ui={chartUi}
+                  chartMode={chart.mode}
+                  sideIds={sideIds}
+                  sideLabelsById={sideLabelsById}
+                  compareChartInput={compareChartInput}
+                />
               ) : (
                 <ChartCard
                   title={chartUi.cardTitle?.trim() || defaultCardTitle || "Density mean comparison"}

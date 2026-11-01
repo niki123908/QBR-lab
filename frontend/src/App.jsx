@@ -17,6 +17,17 @@ import {
 import { createExportSnapshot } from "./export/exportSnapshot.js";
 import { resolveExportContext } from "./export/exportContexts.js";
 import { getInitialDecisionTreeLayout, saveDecisionTreeLayoutAsDefault, refreshInitialDecisionTreeLayoutCache } from "./utils/decisionTreeLayoutStorage.js";
+import {
+  INITIAL_GRAPH_DISPLAY_SETTINGS,
+  readBestDelayOverlayOpacity,
+  readGraphDisplaySettings,
+  writeBestDelayOverlayOpacity,
+  writeGraphDisplaySettings
+} from "./utils/graphDisplaySettings.js";
+import {
+  readSourceNodeAppearance,
+  writeSourceNodeAppearance
+} from "./utils/sourceNodeAppearanceStorage.js";
 import { hydrateLegacyRunArtifactState } from "./utils/runArtifactHydration.js";
 import { buildPolicyTraceFromConfig } from "./utils/policyTrace.js";
 import { derivePlaygroundCandidates, simulateGreedySpread } from "./utils/greedySpread.js";
@@ -75,10 +86,9 @@ function readStoredPanelLayout() {
   }
 }
 const NODE_OPTIONS = [
-  50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750,
+  10, 20, 30, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750,
   800, 850, 900, 950, 1000
 ];
-const GRID_PREVIEW_FETCH_LIMIT = 12;
 const LARGE_TOPO_THRESHOLD = 500;
 const LIST_CACHE_TTL_MS = 10_000;
 const LARGE_TOPO_CONFIRM_MESSAGE =
@@ -88,6 +98,7 @@ function resolveBackboneId(algorithmId) {
   if (algorithmId === "qbr") return "qbr";
   if (algorithmId === "greedy") return "greedy";
   if (algorithmId === "cf_cas") return "cf_cas";
+  if (algorithmId === "milp") return "milp";
   return String(algorithmId || "");
 }
 
@@ -138,6 +149,17 @@ const INITIAL_RUN_MULTI_FORM = {
 
 function buildRunConfigPayload(configForm, runForm) {
   const base = { ...(configForm ?? {}) };
+  const rawOverride = base.tx_range_override;
+  if (rawOverride === "" || rawOverride == null) {
+    delete base.tx_range_override;
+  } else {
+    const override = Number(rawOverride);
+    if (!Number.isFinite(override) || override <= 0) {
+      delete base.tx_range_override;
+    } else {
+      base.tx_range_override = override;
+    }
+  }
   if (runForm?.use_run_seed) {
     const seed = Math.trunc(Number(runForm.run_seed));
     if (!Number.isFinite(seed) || seed < 0) {
@@ -147,11 +169,6 @@ function buildRunConfigPayload(configForm, runForm) {
   }
   return { ...base, run_seed: null };
 }
-const INITIAL_GRAPH_DISPLAY_SETTINGS = {
-  node_size: 2,
-  label_size: 2.4,
-  edge_width: 0.45
-};
 const INITIAL_PLAYGROUND_STATE = {
   mode: "broadcaster",
   spreadMode: "normal",
@@ -341,10 +358,30 @@ export default function App() {
   const [resultsEpochMode, setResultsEpochMode] = useState("last");
   const [selectedEpisode, setSelectedEpisode] = useState("");
   const [replaySlot, setReplaySlot] = useState(0);
-  const [graphDisplaySettings, setGraphDisplaySettings] = useState(INITIAL_GRAPH_DISPLAY_SETTINGS);
-  const [bestDelayOverlayOpacity, setBestDelayOverlayOpacity] = useState(1);
-  const [previewMaxNodesPercent, setPreviewMaxNodesPercent] = useState(80);
-  const [previewShowEdges, setPreviewShowEdges] = useState(true);
+  const [graphDisplaySettings, setGraphDisplaySettingsRaw] = useState(() => readGraphDisplaySettings());
+  const setGraphDisplaySettings = useCallback((updater) => {
+    setGraphDisplaySettingsRaw((prev) => {
+      const nextInput = typeof updater === "function" ? updater(prev) : updater;
+      return writeGraphDisplaySettings(nextInput);
+    });
+  }, []);
+  const [bestDelayOverlayOpacity, setBestDelayOverlayOpacityRaw] = useState(() => readBestDelayOverlayOpacity());
+  const setBestDelayOverlayOpacity = useCallback((value) => {
+    setBestDelayOverlayOpacityRaw(writeBestDelayOverlayOpacity(value));
+  }, []);
+  const [previewShowEdges, setPreviewShowEdges] = useState(false);
+  const [sourceNodeAppearance, setSourceNodeAppearance] = useState(() => readSourceNodeAppearance());
+  const sourceNodeColor = sourceNodeAppearance.color;
+  const sourceNodeRadius = sourceNodeAppearance.radius;
+
+  function setSourceNodeColor(color) {
+    setSourceNodeAppearance((prev) => writeSourceNodeAppearance({ ...prev, color }));
+  }
+
+  function setSourceNodeRadius(radius) {
+    setSourceNodeAppearance((prev) => writeSourceNodeAppearance({ ...prev, radius }));
+  }
+
   const [playgroundState, setPlaygroundState] = useState(INITIAL_PLAYGROUND_STATE);
   const [playgroundTree, setPlaygroundTree] = useState(null);
   const [playgroundTreeLoading, setPlaygroundTreeLoading] = useState(false);
@@ -408,9 +445,11 @@ export default function App() {
   const batchDetailRefreshKeyRef = useRef("");
   /** If user returns to Run multi while this batch is still running/completing, snap to Results when it finishes. */
   const pendingNavigateFromRunMultiBatchIdRef = useRef(null);
+  const topologyImageExportRef = useRef(null);
 
   function resetGraphDisplaySettings() {
     setGraphDisplaySettings(INITIAL_GRAPH_DISPLAY_SETTINGS);
+    setBestDelayOverlayOpacity(1);
   }
 
   function resetPlaygroundState() {
@@ -570,6 +609,10 @@ export default function App() {
   const batchListCacheRef = useRef(new Map());
   const graphCacheRef = useRef(new Map());
   const graphInFlightRef = useRef(new Map());
+  const graphFetchEpochRef = useRef(new Map());
+  const graphPreviewQueueRef = useRef([]);
+  const graphPreviewActiveRef = useRef(0);
+  const GRAPH_PREVIEW_CONCURRENCY = 3;
   const pendingNodePatchPromisesRef = useRef(new Set());
   const selectedBatch = useMemo(
     () =>
@@ -1262,16 +1305,6 @@ export default function App() {
   }, [resultsEpochMode, selectedEpisode, selectedTopology?.topology_id]);
 
   useEffect(() => {
-    if (topologies.length === 0) return;
-    topologies.slice(0, GRID_PREVIEW_FETCH_LIMIT).forEach((topo) => {
-      if (topo.node_count < LARGE_TOPO_THRESHOLD && !graphByTopologyId[topo.topology_id]) {
-        fetchTopologyGraph(topo.topology_id);
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [topologies]);
-
-  useEffect(() => {
     if (!focusedTopologyId) return;
     const focusedTopo =
       (selectedTopology?.topology_id === focusedTopologyId ? selectedTopology : null) ??
@@ -1548,15 +1581,29 @@ export default function App() {
     }
   }
 
-  async function fetchTopologyGraph(topologyId) {
-    if (graphByTopologyId[topologyId]) return;
-    const cached = graphCacheRef.current.get(topologyId);
-    if (cached) {
-      setGraphByTopologyId((prev) => ({
-        ...prev,
-        [topologyId]: cached
-      }));
-      return;
+  async function fetchTopologyGraph(topologyId, { force = false } = {}) {
+    if (!topologyId) return;
+    if (force) {
+      const nextEpoch = (graphFetchEpochRef.current.get(topologyId) ?? 0) + 1;
+      graphFetchEpochRef.current.set(topologyId, nextEpoch);
+      graphCacheRef.current.delete(topologyId);
+      graphInFlightRef.current.delete(topologyId);
+      setGraphByTopologyId((prev) => {
+        if (!prev[topologyId]) return prev;
+        const next = { ...prev };
+        delete next[topologyId];
+        return next;
+      });
+    } else {
+      if (graphByTopologyId[topologyId]) return;
+      const cached = graphCacheRef.current.get(topologyId);
+      if (cached) {
+        setGraphByTopologyId((prev) => ({
+          ...prev,
+          [topologyId]: cached
+        }));
+        return;
+      }
     }
     const inFlight = graphInFlightRef.current.get(topologyId);
     if (inFlight) {
@@ -1564,11 +1611,15 @@ export default function App() {
       return;
     }
 
+    const requestEpoch = graphFetchEpochRef.current.get(topologyId) ?? 0;
     const request = (async () => {
       try {
         const response = await fetch(`${API_BASE}/topologies/${topologyId}/graph`);
         const data = await response.json();
         if (!response.ok) {
+          return;
+        }
+        if ((graphFetchEpochRef.current.get(topologyId) ?? 0) !== requestEpoch) {
           return;
         }
         graphCacheRef.current.set(topologyId, data);
@@ -1579,12 +1630,50 @@ export default function App() {
       } catch {
         // Keep silent for card preview fetch failures.
       } finally {
-        graphInFlightRef.current.delete(topologyId);
+        if (graphInFlightRef.current.get(topologyId) === request) {
+          graphInFlightRef.current.delete(topologyId);
+        }
       }
     })();
     graphInFlightRef.current.set(topologyId, request);
     await request;
   }
+
+  const fetchTopologyGraphRef = useRef(fetchTopologyGraph);
+  fetchTopologyGraphRef.current = fetchTopologyGraph;
+
+  const pumpTopologyPreviewQueue = useCallback(() => {
+    while (
+      graphPreviewActiveRef.current < GRAPH_PREVIEW_CONCURRENCY &&
+      graphPreviewQueueRef.current.length > 0
+    ) {
+      const topologyId = graphPreviewQueueRef.current.shift();
+      if (!topologyId) continue;
+      if (graphCacheRef.current.has(topologyId) || graphInFlightRef.current.has(topologyId)) {
+        void fetchTopologyGraphRef.current(topologyId);
+        continue;
+      }
+      graphPreviewActiveRef.current += 1;
+      Promise.resolve(fetchTopologyGraphRef.current(topologyId)).finally(() => {
+        graphPreviewActiveRef.current = Math.max(0, graphPreviewActiveRef.current - 1);
+        pumpTopologyPreviewQueue();
+      });
+    }
+  }, []);
+
+  const requestTopologyGraphPreview = useCallback(
+    (topologyId) => {
+      if (!topologyId) return;
+      if (graphCacheRef.current.has(topologyId) || graphInFlightRef.current.has(topologyId)) {
+        void fetchTopologyGraphRef.current(topologyId);
+        return;
+      }
+      if (graphPreviewQueueRef.current.includes(topologyId)) return;
+      graphPreviewQueueRef.current.push(topologyId);
+      pumpTopologyPreviewQueue();
+    },
+    [pumpTopologyPreviewQueue]
+  );
 
   function setPlaygroundMode(mode) {
     setPlaygroundState((prev) => ({
@@ -1846,6 +1935,19 @@ export default function App() {
             : node
         )
       );
+      const topologyId = selectedTopology.topology_id;
+      setGraphByTopologyId((prev) => {
+        const graph = prev[topologyId];
+        if (!graph?.nodes) return prev;
+        const nextGraph = {
+          ...graph,
+          nodes: graph.nodes.map((node) =>
+            node.node_id === nodeId ? { ...node, x: data.x, y: data.y } : node
+          )
+        };
+        graphCacheRef.current.set(topologyId, nextGraph);
+        return { ...prev, [topologyId]: nextGraph };
+      });
       return true;
     } catch {
       setMessage("Failed.");
@@ -1901,14 +2003,7 @@ export default function App() {
       await fetchSidebarBatches();
       await fetchTopologyNodes(selectedTopology.topology_id);
       await fetchTopologyDetail(selectedTopology.topology_id);
-      graphCacheRef.current.delete(selectedTopology.topology_id);
-      graphInFlightRef.current.delete(selectedTopology.topology_id);
-      setGraphByTopologyId((prev) => {
-        const next = { ...prev };
-        delete next[selectedTopology.topology_id];
-        return next;
-      });
-      await fetchTopologyGraph(selectedTopology.topology_id);
+      await fetchTopologyGraph(selectedTopology.topology_id, { force: true });
     } catch {
       setMessage("Failed.");
     } finally {
@@ -1972,6 +2067,10 @@ export default function App() {
       });
       graphCacheRef.current.delete(topo.topology_id);
       graphInFlightRef.current.delete(topo.topology_id);
+      graphFetchEpochRef.current.set(
+        topo.topology_id,
+        (graphFetchEpochRef.current.get(topo.topology_id) ?? 0) + 1
+      );
       if (selectedTopology?.topology_id === topo.topology_id) {
         setSelectedTopology(null);
       }
@@ -2269,7 +2368,7 @@ export default function App() {
         return;
       }
       batchDetailRefreshKeyRef.current = "";
-      setMessage(data?.message || "Re-queued failed runs.");
+      setMessage(data?.message || "Re-queued failed/stopped runs.");
       try {
         const progressResponse = await fetch(`${API_BASE}/runs/batch/${focusedBatchRunId}/progress`);
         const progressData = await progressResponse.json();
@@ -2278,6 +2377,57 @@ export default function App() {
         }
       } catch {
         // progress poll will catch up
+      }
+    } catch {
+      setMessage("Failed.");
+    }
+  }
+
+  async function handleDeployBatchFromQTable() {
+    if (!focusedBatchRunId) return;
+    const ok = window.confirm(
+      "Deploy from Q-table for every topology in this batch (greedy rollout, no training)?"
+    );
+    if (!ok) return;
+    try {
+      const response = await fetch(`${API_BASE}/runs/batch/${focusedBatchRunId}/deploy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Deploy failed."));
+        return;
+      }
+      setMessage(`Deploy batch accepted: ${data.batch_run_id} (${data.total_topologies} topologies)`);
+      pendingNavigateFromRunMultiBatchIdRef.current = data.batch_run_id;
+      setFocusedBatchRunId(data.batch_run_id);
+      fetchBatchRunResults();
+    } catch {
+      setMessage("Failed.");
+    }
+  }
+
+  async function handleDeployRunFromQTable(sourceRunId) {
+    if (!sourceRunId) return;
+    try {
+      const response = await fetch(`${API_BASE}/runs/${sourceRunId}/deploy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(parseApiError(data, "Deploy failed."));
+        return;
+      }
+      setMessage(`Deploy queued: ${data.run_id}`);
+      if (data.run_id) {
+        setSelectedRunId(data.run_id);
+      }
+      if (selectedTopology?.topology_id) {
+        await fetchRunHistory(selectedTopology.topology_id);
       }
     } catch {
       setMessage("Failed.");
@@ -2426,6 +2576,9 @@ export default function App() {
       setGraphByTopologyId({});
       graphCacheRef.current.clear();
       graphInFlightRef.current.clear();
+      graphFetchEpochRef.current.clear();
+      graphPreviewQueueRef.current = [];
+      graphPreviewActiveRef.current = 0;
       clearListCaches();
       await fetchBatches();
       await fetchSidebarBatches();
@@ -2687,9 +2840,12 @@ export default function App() {
         onBatchStop={handleBatchStop}
         onBatchResume={handleBatchResume}
         onBatchRetryFailed={handleBatchRetryFailed}
+        onDeployBatchFromQTable={handleDeployBatchFromQTable}
+        onDeployRunFromQTable={handleDeployRunFromQTable}
         onDeleteBatchRunResult={handleDeleteBatchRunResult}
         onRenameBatchRunResult={handleRenameBatchRunResult}
         graphByTopologyId={graphByTopologyId}
+        onNeedTopologyPreview={requestTopologyGraphPreview}
         playgroundState={playgroundState}
         playgroundNextStateCount={
           focusedTopologyId && graphByTopologyId[focusedTopologyId]
@@ -2752,8 +2908,9 @@ export default function App() {
         nodeOptions={NODE_OPTIONS}
         onCreateBatch={handleCreateBatch}
         onDeleteBatch={handleDeleteBatch}
-        previewMaxNodesPercent={previewMaxNodesPercent}
         previewShowEdges={previewShowEdges}
+        sourceNodeColor={sourceNodeColor}
+        sourceNodeRadius={sourceNodeRadius}
         onRenameBatch={async (batchId, name) => {
           const cleanName = name.trim();
           if (!cleanName) return false;
@@ -2786,7 +2943,8 @@ export default function App() {
         compareExport={compareExport}
         mainExportContext={mainExportContext}
         onOpenExportModal={() => openExportModal("main")}
-        />
+        topologyImageExportRef={topologyImageExportRef}
+      />
       </div>
 
       {!hideRightPanel ? (
@@ -2861,10 +3019,12 @@ export default function App() {
           resetGraphDisplaySettings={resetGraphDisplaySettings}
           bestDelayOverlayOpacity={bestDelayOverlayOpacity}
           setBestDelayOverlayOpacity={setBestDelayOverlayOpacity}
-          previewMaxNodesPercent={previewMaxNodesPercent}
-          setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
           previewShowEdges={previewShowEdges}
           setPreviewShowEdges={setPreviewShowEdges}
+          sourceNodeColor={sourceNodeColor}
+          setSourceNodeColor={setSourceNodeColor}
+          sourceNodeRadius={sourceNodeRadius}
+          setSourceNodeRadius={setSourceNodeRadius}
           isLoadingNodes={isLoadingNodes}
           topologyNodes={topologyNodes}
           handleNodeBlur={handleNodeBlur}
@@ -2906,6 +3066,7 @@ export default function App() {
           onSaveDecisionTreeLayoutDefaults={handleSaveDecisionTreeLayoutDefaults}
           rightExportContext={rightExportContext}
           onOpenExportModal={() => openExportModal("right")}
+          topologyImageExportRef={topologyImageExportRef}
         />
           </div>
         </>

@@ -37,6 +37,7 @@ class RunHistoryRecord:
     total_states: int | None = None
     total_state_actions: int | None = None
     decision_graph_edges: int | None = None
+    rollout_runtime_ms: float | None = None
 
 
 @dataclass
@@ -71,6 +72,7 @@ class RunDetailRecord:
     total_states: int | None = None
     total_state_actions: int | None = None
     decision_graph_edges: int | None = None
+    rollout_runtime_ms: float | None = None
 
 
 @dataclass
@@ -87,6 +89,9 @@ class BatchRunListRecord:
     failed: int
     created_at: datetime
     batch_status: str
+    unique_topology_count: int = 0
+    repeat_topology_id: str | None = None
+    repeat_topology_name: str | None = None
 
 
 @dataclass
@@ -96,6 +101,7 @@ class BatchRunProgressRow:
     topology_name: str
     topology_index: int
     status: str
+    runtime_sec: float | None = None
 
 
 @dataclass
@@ -158,6 +164,8 @@ class BatchRunTopologyPointRecord:
     paths_count_by_delay: dict[int, int]
     total_states: int | None
     total_state_actions: int | None
+    runtime_sec: float | None = None
+    rollout_runtime_ms: float | None = None
 
 
 @dataclass
@@ -610,22 +618,23 @@ def try_resume_batch(batch_run_id: str) -> tuple[bool, str]:
 
 
 def try_retry_failed_batch(batch_run_id: str) -> tuple[bool, str, int]:
-    """Re-queue failed runs in a batch so workers can execute them again."""
+    """Re-queue failed/stopped runs in a batch so workers can execute them again."""
     init_db()
     with db_session_scope() as session:
         g = session.get(BatchRunGroup, batch_run_id)
         if g is None:
             return False, "not_found", 0
-        if g.status in ("running", "queued"):
+
+        run_rows = session.scalars(select(Run).where(Run.batch_run_group_id == batch_run_id)).all()
+        active_statuses = {"running", "queued", "pending"}
+        if any(row.status in active_statuses for row in run_rows):
             return False, "batch_active", 0
 
-        failed_rows = session.scalars(
-            select(Run).where(Run.batch_run_group_id == batch_run_id, Run.status == "failed")
-        ).all()
-        if not failed_rows:
+        retry_rows = [row for row in run_rows if row.status in ("failed", "stopped")]
+        if not retry_rows:
             return False, "nothing_to_retry", 0
 
-        for row in failed_rows:
+        for row in retry_rows:
             metric = session.get(RunMetric, row.id)
             if metric is not None:
                 session.delete(metric)
@@ -646,7 +655,7 @@ def try_retry_failed_batch(batch_run_id: str) -> tuple[bool, str, int]:
         g.stop_requested = False
         g.status = "queued"
         g.ended_at = None
-        return True, "ok", len(failed_rows)
+        return True, "ok", len(retry_rows)
 
 
 def reconcile_batch_run_group(batch_run_id: str) -> str | None:
@@ -740,6 +749,7 @@ def get_batch_run_progress(batch_run_id: str) -> BatchRunProgressRecord | None:
                     topology_name=topology_name,
                     topology_index=idx,
                     status=r.status,
+                    runtime_sec=float(r.runtime_sec) if r.runtime_sec is not None else None,
                 )
             )
         return BatchRunProgressRecord(
@@ -958,6 +968,9 @@ def list_run_history(topology_id: str) -> list[RunHistoryRecord]:
                     total_states=metric.total_states if metric else None,
                     total_state_actions=metric.total_state_actions if metric else None,
                     decision_graph_edges=metric.decision_graph_edges if metric else None,
+                    rollout_runtime_ms=float(metric.rollout_runtime_ms)
+                    if metric and metric.rollout_runtime_ms is not None
+                    else None,
                 )
             )
         return result
@@ -1072,6 +1085,9 @@ def get_run_detail(run_id: str) -> RunDetailRecord | None:
             total_states=metric.total_states if metric else None,
             total_state_actions=metric.total_state_actions if metric else None,
             decision_graph_edges=metric.decision_graph_edges if metric else None,
+            rollout_runtime_ms=float(metric.rollout_runtime_ms)
+            if metric and metric.rollout_runtime_ms is not None
+            else None,
             artifacts=[
                 ArtifactRefRecord(
                     artifact_type=item.artifact_type,
@@ -1111,7 +1127,14 @@ def list_batch_runs() -> list[BatchRunListRecord]:
         for batch_run_id, run_items in grouped.items():
             run_items_sorted = sorted(run_items, key=lambda x: (x.created_at, x.id))
             sample = run_items_sorted[0]
-            linked_topologies = [topology_by_id[item.topology_id] for item in run_items_sorted if item.topology_id in topology_by_id]
+            linked_topologies = [
+                topology_by_id[item.topology_id] for item in run_items_sorted if item.topology_id in topology_by_id
+            ]
+            # Hide results whose topologies were soft-deleted with their batch.
+            if linked_topologies and all(topo.is_deleted for topo in linked_topologies):
+                continue
+            if not linked_topologies:
+                continue
             batch_name = _resolve_batch_name(linked_topologies, batch_by_id=batch_by_id)
             total = len(run_items_sorted)
             successful = sum(1 for item in run_items_sorted if item.status == "done")
@@ -1125,6 +1148,13 @@ def list_batch_runs() -> list[BatchRunListRecord]:
                 batch_name=batch_name,
                 preset_name=preset_name,
             )
+            unique_topo_ids = list(dict.fromkeys(item.topology_id for item in run_items_sorted))
+            unique_topology_count = len(unique_topo_ids)
+            repeat_topology_id = unique_topo_ids[0] if unique_topology_count == 1 else None
+            repeat_topology_name = None
+            if repeat_topology_id is not None:
+                topo = topology_by_id.get(repeat_topology_id)
+                repeat_topology_name = topo.name if topo is not None else repeat_topology_id
             result.append(
                 BatchRunListRecord(
                     batch_run_id=batch_run_id,
@@ -1139,6 +1169,9 @@ def list_batch_runs() -> list[BatchRunListRecord]:
                     failed=failed,
                     created_at=sample.created_at,
                     batch_status=batch_status,
+                    unique_topology_count=unique_topology_count,
+                    repeat_topology_id=repeat_topology_id,
+                    repeat_topology_name=repeat_topology_name,
                 )
             )
         return sorted(result, key=lambda x: x.created_at, reverse=True)
@@ -1155,6 +1188,46 @@ def update_batch_run_result_label(batch_run_id: str, result_label: str | None) -
             return False
         row.result_label = clean
         return True
+
+
+def merge_batch_run_into(source_batch_run_id: str, target_batch_run_id: str) -> tuple[bool, str, int]:
+    """
+    Move all runs from source batch group into target, then delete the empty source group.
+    Returns (ok, message, moved_run_count).
+    """
+    if not source_batch_run_id or not target_batch_run_id:
+        return False, "missing ids", 0
+    if source_batch_run_id == target_batch_run_id:
+        return False, "source and target are the same", 0
+
+    init_db()
+    with db_session_scope() as session:
+        source = session.get(BatchRunGroup, source_batch_run_id)
+        target = session.get(BatchRunGroup, target_batch_run_id)
+        if source is None:
+            return False, "source batch result not found", 0
+        if target is None:
+            return False, "target batch result not found", 0
+
+        source_rows = session.scalars(select(Run).where(Run.batch_run_group_id == source_batch_run_id)).all()
+        if not source_rows:
+            session.delete(source)
+            return True, "source had no runs; deleted empty group", 0
+
+        for row in source_rows:
+            row.batch_run_group_id = target_batch_run_id
+
+        target_rows = session.scalars(select(Run).where(Run.batch_run_group_id == target_batch_run_id)).all()
+        target.total_topologies = len(target_rows)
+
+        if target.result_label is None and source.result_label is not None:
+            target.result_label = source.result_label
+
+        # Prefer keeping target completed if both done; otherwise reconcile below.
+        session.delete(source)
+
+    reconcile_batch_run_group(target_batch_run_id)
+    return True, "ok", len(source_rows)
 
 
 def get_queue_snapshot() -> QueueSnapshotRecord:
@@ -1302,6 +1375,10 @@ def get_batch_run_result(batch_run_id: str) -> BatchRunResultRecord | None:
                     paths_count_by_delay=paths_by_delay,
                     total_states=metric.total_states if metric else None,
                     total_state_actions=metric.total_state_actions if metric else None,
+                    runtime_sec=float(run_item.runtime_sec) if run_item.runtime_sec is not None else None,
+                    rollout_runtime_ms=float(metric.rollout_runtime_ms)
+                    if metric and metric.rollout_runtime_ms is not None
+                    else None,
                 )
             )
 

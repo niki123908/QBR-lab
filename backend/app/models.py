@@ -164,6 +164,7 @@ class RunMetric(Base):
     total_states: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_state_actions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     decision_graph_edges: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rollout_runtime_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )

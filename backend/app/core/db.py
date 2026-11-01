@@ -96,6 +96,7 @@ def _ensure_run_metrics_columns() -> None:
         "total_states": "ALTER TABLE run_metrics ADD COLUMN total_states INTEGER",
         "total_state_actions": "ALTER TABLE run_metrics ADD COLUMN total_state_actions INTEGER",
         "decision_graph_edges": "ALTER TABLE run_metrics ADD COLUMN decision_graph_edges INTEGER",
+        "rollout_runtime_ms": "ALTER TABLE run_metrics ADD COLUMN rollout_runtime_ms DOUBLE PRECISION",
     }
     with engine.begin() as connection:
         for column_name, ddl in ddl_by_column.items():

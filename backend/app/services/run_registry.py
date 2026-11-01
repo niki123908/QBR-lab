@@ -7,6 +7,7 @@ from app.services.runners.base import AlgorithmRunner
 from app.services.runners.cf_cas_runner import execute_cf_cas
 from app.services.runners.greedy_runner import execute_greedy
 from app.services.runners.milp_runner import MILP_MAX_NODE_COUNT_EXCLUSIVE, execute_milp
+from app.services.runners.qbr_deploy_runner import execute_qbr_deploy
 from app.services.runners.qbr_runner import execute_qbr
 
 
@@ -38,6 +39,7 @@ _QBR_DEFAULT_CONFIG: dict[str, Any] = {
     "spread_mode": "normal",
     "completion_bonus_multiplier": 1.0,
     "coverage_reward_enabled": True,
+    "completion_exp_bonus_enabled": False,
     "lambda_param": 0.0,
     "trace_threshold": 0.01,
     "action_aggregation_mode": "off",
@@ -68,12 +70,19 @@ _QBR_CONFIG_SCHEMA: dict[str, Any] = {
         "ucb_c": {"type": "number", "exclusiveMinimum": 0.0, "default": 1.414},
         "completion_bonus_multiplier": {"type": "number", "minimum": 0.0, "default": 1.0},
         "coverage_reward_enabled": {"type": "boolean", "default": True},
+        "completion_exp_bonus_enabled": {"type": "boolean", "default": False},
         "lambda_param": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
         "trace_threshold": {"type": "number", "minimum": 0.0, "default": 0.01},
         "action_aggregation_mode": {
             "type": "string",
             "enum": ["off", "exact_next_state", "incremental_merge"],
             "default": "off",
+        },
+        "tx_range_override": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": None,
+            "description": "Optional local TX range for this run only; must be >= each topology's stored tx_range.",
         },
     },
     "required": [],
@@ -99,11 +108,17 @@ _GREEDY_CONFIG_SCHEMA: dict[str, Any] = {
     "properties": {
         "action_axis": {"type": "string", "enum": ["broadcaster", "receiver"], "default": "broadcaster"},
         "spread_mode": {"type": "string", "enum": ["normal", "la"], "default": "normal"},
+        "tx_range_override": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": None,
+            "description": "Optional local TX range for this run only; must be >= each topology's stored tx_range.",
+        },
     },
     "required": [],
 }
 
-_RUN_CONFIG_META_KEYS = frozenset({"run_seed"})
+_RUN_CONFIG_META_KEYS = frozenset({"run_seed", "tx_range_override"})
 
 
 def _pick_allowed_config(merged: dict[str, Any], allowed_keys: set[str]) -> dict[str, Any]:
@@ -127,6 +142,39 @@ def _resolve_run_seed_value(merged: dict[str, Any]) -> int:
     return seed
 
 
+def _resolve_tx_range_override_value(
+    merged: dict[str, Any], topology_context: dict[str, Any] | None = None
+) -> float | None:
+    raw = merged.get("tx_range_override")
+    if raw is None or raw == "":
+        return None
+    try:
+        override = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tx_range_override must be a positive number.") from exc
+    if override <= 0:
+        raise ValueError("tx_range_override must be > 0.")
+    if isinstance(topology_context, dict) and topology_context.get("tx_range") is not None:
+        try:
+            base = float(topology_context["tx_range"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Failed.") from exc
+        if override + 1e-12 < base:
+            raise ValueError(
+                f"tx_range_override ({override}) must be >= topology tx_range ({base})."
+            )
+    return override
+
+
+def _with_tx_range_override(
+    out: dict[str, Any], merged: dict[str, Any], topology_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    override = _resolve_tx_range_override_value(merged, topology_context)
+    if override is not None:
+        out["tx_range_override"] = override
+    return out
+
+
 _GREEDY_CAPABILITIES: dict[str, bool] = {
     "has_q_table": False,
     "has_policy_trace": False,
@@ -141,11 +189,42 @@ _CF_CAS_DEFAULT_CONFIG: dict[str, Any] = {}
 
 _CF_CAS_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "tx_range_override": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": None,
+            "description": "Optional local TX range for this run only; must be >= each topology's stored tx_range.",
+        },
+    },
     "required": [],
 }
 
 _CF_CAS_CAPABILITIES: dict[str, bool] = dict(_GREEDY_CAPABILITIES)
+
+_QBR_DEPLOY_DEFAULT_CONFIG: dict[str, Any] = {
+    "source_run_id": None,
+    "source_batch_run_id": None,
+}
+
+_QBR_DEPLOY_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_run_id": {"type": ["string", "null"]},
+        "source_batch_run_id": {"type": ["string", "null"]},
+    },
+    "required": [],
+}
+
+_QBR_DEPLOY_CAPABILITIES: dict[str, bool] = {
+    "has_q_table": False,
+    "has_policy_trace": False,
+    "has_state_action_trace": True,
+    "has_transmission_trace": True,
+    "has_episode_series": False,
+    "has_epoch_compare": False,
+    "has_path_signatures": False,
+}
 
 
 def _resolve_qbr_config(
@@ -179,6 +258,7 @@ def _resolve_qbr_config(
         spread_mode = str(merged["spread_mode"])
         completion_bonus_multiplier = float(merged["completion_bonus_multiplier"])
         raw_coverage_reward_enabled = merged["coverage_reward_enabled"]
+        raw_completion_exp_bonus_enabled = merged["completion_exp_bonus_enabled"]
         lambda_param = float(merged["lambda_param"])
         trace_threshold = float(merged["trace_threshold"])
         ucb_c = float(merged["ucb_c"])
@@ -220,6 +300,18 @@ def _resolve_qbr_config(
             raise ValueError("Failed.")
     else:
         coverage_reward_enabled = bool(raw_coverage_reward_enabled)
+    if isinstance(raw_completion_exp_bonus_enabled, bool):
+        completion_exp_bonus_enabled = raw_completion_exp_bonus_enabled
+    elif isinstance(raw_completion_exp_bonus_enabled, str):
+        lowered_exp = raw_completion_exp_bonus_enabled.strip().lower()
+        if lowered_exp in {"1", "true", "yes", "on"}:
+            completion_exp_bonus_enabled = True
+        elif lowered_exp in {"0", "false", "no", "off"}:
+            completion_exp_bonus_enabled = False
+        else:
+            raise ValueError("Failed.")
+    else:
+        completion_exp_bonus_enabled = bool(raw_completion_exp_bonus_enabled)
     if not (0.0 <= lambda_param <= 1.0):
         raise ValueError("Failed.")
     if trace_threshold < 0.0:
@@ -266,36 +358,40 @@ def _resolve_qbr_config(
 
     run_seed = _resolve_run_seed_value(merged)
 
-    return {
-        "episodes": episodes,
-        "alpha": alpha,
-        "gamma": gamma,
-        "policy_type": policy_type,
-        "epsilon_start": epsilon_start,
-        "epsilon_end": epsilon_end,
-        "epsilon_decay": epsilon_decay,
-        "temperature_start": temperature_start,
-        "temperature_start_mode": temperature_start_mode,
-        "temperature_start_multiplier": temperature_start_multiplier,
-        "temperature_end": temperature_end,
-        "temperature_decay": temperature_decay,
-        "temperature_decay_mode": temperature_decay_mode,
-        "ucb_c": ucb_c,
-        "action_axis": action_axis,
-        "spread_mode": spread_mode,
-        "completion_bonus_multiplier": completion_bonus_multiplier,
-        "coverage_reward_enabled": coverage_reward_enabled,
-        "lambda_param": lambda_param,
-        "trace_threshold": trace_threshold,
-        "action_aggregation_mode": action_aggregation_mode,
-        "run_seed": run_seed,
-    }
+    return _with_tx_range_override(
+        {
+            "episodes": episodes,
+            "alpha": alpha,
+            "gamma": gamma,
+            "policy_type": policy_type,
+            "epsilon_start": epsilon_start,
+            "epsilon_end": epsilon_end,
+            "epsilon_decay": epsilon_decay,
+            "temperature_start": temperature_start,
+            "temperature_start_mode": temperature_start_mode,
+            "temperature_start_multiplier": temperature_start_multiplier,
+            "temperature_end": temperature_end,
+            "temperature_decay": temperature_decay,
+            "temperature_decay_mode": temperature_decay_mode,
+            "ucb_c": ucb_c,
+            "action_axis": action_axis,
+            "spread_mode": spread_mode,
+            "completion_bonus_multiplier": completion_bonus_multiplier,
+            "coverage_reward_enabled": coverage_reward_enabled,
+            "completion_exp_bonus_enabled": completion_exp_bonus_enabled,
+            "lambda_param": lambda_param,
+            "trace_threshold": trace_threshold,
+            "action_aggregation_mode": action_aggregation_mode,
+            "run_seed": run_seed,
+        },
+        merged,
+        topology_context,
+    )
 
 
 def _resolve_greedy_config(
     run_config: dict[str, Any], preset_id: str, topology_context: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    _ = topology_context
     preset: dict[str, Any] = {}
     if preset_id == "default_v1":
         preset = {}
@@ -310,17 +406,20 @@ def _resolve_greedy_config(
     if spread_mode not in {"normal", "la"}:
         raise ValueError("Failed.")
     run_seed = _resolve_run_seed_value(picked)
-    return {
-        "action_axis": action_axis,
-        "spread_mode": spread_mode,
-        "run_seed": run_seed,
-    }
+    return _with_tx_range_override(
+        {
+            "action_axis": action_axis,
+            "spread_mode": spread_mode,
+            "run_seed": run_seed,
+        },
+        picked,
+        topology_context,
+    )
 
 
 def _resolve_cf_cas_config(
     run_config: dict[str, Any], preset_id: str, topology_context: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    _ = topology_context
     preset: dict[str, Any] = {}
     if preset_id == "default_v1":
         preset = {}
@@ -329,17 +428,53 @@ def _resolve_cf_cas_config(
     allowed_keys = set(_CF_CAS_DEFAULT_CONFIG.keys()) | _RUN_CONFIG_META_KEYS
     picked = _pick_allowed_config(merged, allowed_keys)
     run_seed = _resolve_run_seed_value(picked)
-    return {"run_seed": run_seed}
+    return _with_tx_range_override({"run_seed": run_seed}, picked, topology_context)
+
+
+def _resolve_qbr_deploy_config(
+    run_config: dict[str, Any], preset_id: str, topology_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    _ = preset_id
+    merged = {**(run_config or {})}
+    allowed_keys = {"source_run_id", "source_batch_run_id"} | _RUN_CONFIG_META_KEYS
+    unknown_keys = [key for key in merged.keys() if key not in allowed_keys]
+    if unknown_keys:
+        raise ValueError(f"Unsupported qbr_deploy config keys: {unknown_keys}")
+    source_run_id = merged.get("source_run_id")
+    source_batch_run_id = merged.get("source_batch_run_id")
+    source_run_id_s = str(source_run_id).strip() if source_run_id is not None else ""
+    source_batch_run_id_s = str(source_batch_run_id).strip() if source_batch_run_id is not None else ""
+    if not source_run_id_s and not source_batch_run_id_s:
+        raise ValueError("qbr_deploy requires source_run_id or source_batch_run_id.")
+    run_seed = _resolve_run_seed_value(merged)
+    out: dict[str, Any] = {"run_seed": run_seed}
+    if source_run_id_s:
+        out["source_run_id"] = source_run_id_s
+    if source_batch_run_id_s:
+        out["source_batch_run_id"] = source_batch_run_id_s
+    return _with_tx_range_override(out, merged, topology_context)
 
 
 _MILP_DEFAULT_CONFIG: dict[str, Any] = {
     "solver_timeout_sec": 60,
+    "conflict_mode": "allow",
 }
 
 _MILP_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "solver_timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
+        "conflict_mode": {
+            "type": "string",
+            "enum": ["allow", "forbid"],
+            "default": "allow",
+        },
+        "tx_range_override": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": None,
+            "description": "Optional local TX range for this run only; must be >= each topology's stored tx_range.",
+        },
     },
     "required": [],
 }
@@ -375,8 +510,19 @@ def _resolve_milp_config(
     timeout = int(picked.get("solver_timeout_sec", 60))
     if timeout < 1 or timeout > 600:
         raise ValueError("Failed.")
+    conflict_raw = str(picked.get("conflict_mode", "allow")).strip().lower()
+    if conflict_raw in ("forbid", "conflict_free", "cf", "no_conflict"):
+        conflict_mode = "forbid"
+    elif conflict_raw in ("allow", "receiver_conflict", ""):
+        conflict_mode = "allow"
+    else:
+        raise ValueError("Failed.")
     run_seed = _resolve_run_seed_value(picked)
-    return {"solver_timeout_sec": timeout, "run_seed": run_seed}
+    return _with_tx_range_override(
+        {"solver_timeout_sec": timeout, "conflict_mode": conflict_mode, "run_seed": run_seed},
+        picked,
+        topology_context,
+    )
 
 
 _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
@@ -395,6 +541,10 @@ _ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
     "milp": AlgorithmSpec(
         runner=execute_milp,
         resolve_and_validate_config=_resolve_milp_config,
+    ),
+    "qbr_deploy": AlgorithmSpec(
+        runner=execute_qbr_deploy,
+        resolve_and_validate_config=_resolve_qbr_deploy_config,
     ),
 }
 
@@ -433,13 +583,21 @@ _ALGORITHMS_METADATA: list[dict[str, Any]] = [
         "capabilities": _MILP_CAPABILITIES,
         "limits": {"max_node_count_exclusive": MILP_MAX_NODE_COUNT_EXCLUSIVE},
     },
+    {
+        "algorithm_id": "qbr_deploy",
+        "display_name": "QBR Deploy",
+        "version": "v1",
+        "default_config": _QBR_DEPLOY_DEFAULT_CONFIG,
+        "config_schema": _QBR_DEPLOY_CONFIG_SCHEMA,
+        "capabilities": _QBR_DEPLOY_CAPABILITIES,
+    },
 ]
 
 
 def get_algorithm_runner(algorithm_id: str) -> AlgorithmRunner:
     spec = _ALGORITHM_SPECS.get(algorithm_id)
     if spec is None:
-        raise ValueError("Failed.")
+        raise ValueError(f"Unknown algorithm_id: {algorithm_id}")
     return spec.runner
 
 
@@ -451,7 +609,7 @@ def resolve_and_validate_run_config(
 ) -> dict[str, Any]:
     spec = _ALGORITHM_SPECS.get(algorithm_id)
     if spec is None:
-        raise ValueError("Failed.")
+        raise ValueError(f"Unknown algorithm_id: {algorithm_id}")
     return spec.resolve_and_validate_config(run_config, preset_id, topology_context)
 
 

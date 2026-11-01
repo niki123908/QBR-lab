@@ -183,6 +183,9 @@ class BatchRunListItem(BaseModel):
     failed: int
     created_at: str
     batch_status: str = "completed"
+    unique_topology_count: int = 0
+    repeat_topology_id: str | None = None
+    repeat_topology_name: str | None = None
 
 
 class BatchRunTopologyPoint(BaseModel):
@@ -200,6 +203,8 @@ class BatchRunTopologyPoint(BaseModel):
     paths_count_by_delay: dict[int, int] = Field(default_factory=dict)
     total_states: int | None = None
     total_state_actions: int | None = None
+    runtime_sec: float | None = None
+    rollout_runtime_ms: float | None = None
 
 
 class BatchRunDensityGroup(BaseModel):
@@ -213,6 +218,7 @@ class BatchRunProgressRow(BaseModel):
     topology_name: str
     topology_index: int
     status: str
+    runtime_sec: float | None = None
 
 
 class BatchRunProgressResponse(BaseModel):
@@ -354,6 +360,7 @@ class RunHistoryItem(BaseModel):
     total_states: int | None = None
     total_state_actions: int | None = None
     decision_graph_edges: int | None = None
+    rollout_runtime_ms: float | None = None
 
 
 class RunArtifactPayloadResponse(BaseModel):
@@ -391,7 +398,16 @@ class RunDetailResponse(BaseModel):
     total_states: int | None = None
     total_state_actions: int | None = None
     decision_graph_edges: int | None = None
+    rollout_runtime_ms: float | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+
+
+class DeployFromRunRequest(BaseModel):
+    result_label: str | None = None
+
+
+class DeployFromBatchRequest(BaseModel):
+    result_label: str | None = None
 
 
 class AlgorithmSummary(BaseModel):

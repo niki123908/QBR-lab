@@ -176,6 +176,68 @@ export function downloadBatchPathMetricsCsv(result) {
   downloadCsv(csv, `path_metrics_${label}.csv`);
 }
 
+export function batchHasDelayPerEpisodeData(result) {
+  return iterBatchTopologyRows(result).some(
+    ({ topo }) => Array.isArray(topo.delay_per_episode) && topo.delay_per_episode.length > 0
+  );
+}
+
+/** Options for delay_per_episode picker, keyed by displayed topology_index. */
+export function listDelayPerEpisodeDownloadOptions(result) {
+  return iterBatchTopologyRows(result)
+    .filter(({ topo }) => Array.isArray(topo.delay_per_episode) && topo.delay_per_episode.length > 0)
+    .map(({ densityNodeCount, topo, fallbackIndex }) => {
+      const topology_index = topologyIndexForRow(topo, fallbackIndex);
+      return {
+        topology_index,
+        topology_id: topo.topology_id ?? "",
+        topology_name: topo.topology_name ?? "",
+        density_node_count: densityNodeCount,
+        episode_count: topo.delay_per_episode.length
+      };
+    })
+    .sort((a, b) => Number(a.topology_index) - Number(b.topology_index));
+}
+
+export function buildBatchDelayPerEpisodeCsv(result, selectedTopologyIndexes) {
+  const selected = new Set(
+    (selectedTopologyIndexes ?? []).map((v) => Number(v)).filter((v) => Number.isFinite(v))
+  );
+  const columns = [
+    { key: "density_node_count", label: "density_node_count" },
+    { key: "topology_index", label: "topology_index" },
+    { key: "topology_id", label: "topology_id" },
+    { key: "topology_name", label: "topology_name" },
+    { key: "episode", label: "episode" },
+    { key: "delay", label: "delay" }
+  ];
+  const rows = [];
+  iterBatchTopologyRows(result).forEach(({ densityNodeCount, topo, fallbackIndex }) => {
+    const idx = topologyIndexForRow(topo, fallbackIndex);
+    if (selected.size > 0 && !selected.has(Number(idx))) return;
+    const episodes = topo.delay_per_episode ?? [];
+    if (!Array.isArray(episodes) || !episodes.length) return;
+    episodes.forEach((delay, epIdx) => {
+      rows.push({
+        density_node_count: densityNodeCount,
+        topology_index: idx,
+        topology_id: topo.topology_id ?? "",
+        topology_name: topo.topology_name ?? "",
+        episode: epIdx + 1,
+        delay: delay ?? ""
+      });
+    });
+  });
+  return buildCsv(columns, rows);
+}
+
+export function downloadBatchDelayPerEpisodeCsv(result, selectedTopologyIndexes) {
+  const csv = buildBatchDelayPerEpisodeCsv(result, selectedTopologyIndexes);
+  const label = safeFilename(result?.result_label ?? result?.batch_name ?? "batch");
+  const n = (selectedTopologyIndexes ?? []).length;
+  downloadCsv(csv, `delay_per_episode_${label}_${n}topo.csv`);
+}
+
 export function downloadCsvText(csvText, filename) {
   downloadCsv(csvText, filename);
 }

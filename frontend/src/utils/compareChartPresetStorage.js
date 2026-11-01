@@ -1,3 +1,5 @@
+import { normalizeCompareChartMode } from "./compareChartSides.js";
+
 const PRESET_STORAGE_KEY = "qbr.compare-chart-presets";
 const MAX_PRESETS = 40;
 
@@ -12,7 +14,7 @@ function sanitizeChartUi(raw) {
 
 function sanitizePresetConfig(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const mode = raw.mode === "densityMean" ? "densityMean" : "density";
+  const mode = normalizeCompareChartMode(raw.mode);
   const chartType = raw.chartType === "bar" ? "bar" : "line";
   const selectedMetricKeys = Array.isArray(raw.selectedMetricKeys)
     ? [...new Set(raw.selectedMetricKeys.filter((k) => typeof k === "string" && k))]
@@ -103,8 +105,9 @@ export function applyChartPresetToDraft(presetConfig, densityLabels, catalog) {
 
   const labels = Array.isArray(densityLabels) ? densityLabels.map(String) : [];
   const labelSet = new Set(labels);
+  const usesMeanMetrics = config.mode === "densityMean" || config.mode === "episodes";
   const allowedMetrics = new Set(
-    (config.mode === "densityMean"
+    (usesMeanMetrics
       ? [...(catalog?.topologyMetrics ?? []), ...(catalog?.densityMetrics ?? [])]
       : catalog?.topologyMetrics ?? []
     ).map((m) => m.key)
@@ -130,7 +133,12 @@ export function applyChartPresetToDraft(presetConfig, densityLabels, catalog) {
 
 export function presetSummaryLabel(preset) {
   if (!preset?.config) return preset?.name ?? "";
-  const mode = preset.config.mode === "densityMean" ? "Density mean" : "Density";
+  const mode =
+    preset.config.mode === "densityMean"
+      ? "Density mean"
+      : preset.config.mode === "episodes"
+        ? "Episodes"
+        : "Density";
   const kind = preset.config.chartType === "bar" ? "bar" : "line";
   const metrics = preset.config.selectedMetricKeys.length;
   const densities = preset.config.selectedDensityLabels.length;

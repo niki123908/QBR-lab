@@ -10,6 +10,7 @@ import RunConfigVisibilityTable from "./RunConfigVisibilityTable.jsx";
 import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
 
 import { API_BASE } from "../apiBase.js";
+import { downloadTopologyGraphPng, downloadTopologyGraphSvg } from "../export/topologyGraphExport.js";
 import {
   isAlgorithmDisabledForNodeCount,
   milpDisabledReason
@@ -37,11 +38,15 @@ function formatConfigLabel(fieldName) {
   if (fieldName === "action_aggregation_mode") return "Action aggregation";
   if (fieldName === "completion_bonus_multiplier") return "Completion bonus multiplier";
   if (fieldName === "coverage_reward_enabled") return "Enable coverage reward (nodes covered / timeslot)";
+  if (fieldName === "completion_exp_bonus_enabled") return "Enable completion factor e^(LB − delay)";
+  if (fieldName === "tx_range_override") return "TX range override (local)";
   if (fieldName === "temperature_decay_mode") return "Temperature decay mode";
   if (fieldName === "epsilon_start") return "Epsilon start";
   if (fieldName === "epsilon_end") return "Epsilon end";
   if (fieldName === "epsilon_decay") return "Epsilon decay";
   if (fieldName === "ucb_c") return "UCB exploration constant (c)";
+  if (fieldName === "solver_timeout_sec") return "Solver timeout (sec)";
+  if (fieldName === "conflict_mode") return "MILP conflict mode";
   return fieldName;
 }
 
@@ -55,10 +60,16 @@ function formatEnumOptionLabel(fieldName, option) {
     if (option === "la") return "Latency ahead";
   }
   if (fieldName === "policy_type" && option === "ucb") return "UCB";
+  if (fieldName === "policy_type" && option === "epsilon_greedy") return "ε-greedy";
+  if (fieldName === "policy_type" && option === "softmax") return "Softmax";
   if (fieldName === "action_aggregation_mode") {
     if (option === "off") return "Off";
     if (option === "exact_next_state") return "Exact next state";
     if (option === "incremental_merge") return "Incremental merge";
+  }
+  if (fieldName === "conflict_mode") {
+    if (option === "allow") return "Allow conflict";
+    if (option === "forbid") return "Forbid conflict";
   }
   return option;
 }
@@ -83,17 +94,7 @@ const BACKBONE_OPTIONS = [
 
 function presetOptionLabel(p) {
   if (!p || typeof p !== "object") return "";
-  const tag =
-    p.backbone === "qbr"
-      ? "QBR"
-      : p.backbone === "greedy"
-        ? "GREEDY"
-        : p.backbone === "cf_cas"
-          ? "CF-CAS"
-          : p.backbone === "milp"
-            ? "MILP"
-            : String(p.backbone || "");
-  return `${p.label} · ${tag}`;
+  return String(p.label ?? "");
 }
 
 function BackboneToggle({
@@ -183,8 +184,9 @@ const CONFIG_FIELD_BLOCKS = [
   {
     id: "reward",
     title: "Reward & trace",
-    fields: ["coverage_reward_enabled", "completion_bonus_multiplier", "lambda_param", "trace_threshold"]
+    fields: ["coverage_reward_enabled", "completion_exp_bonus_enabled", "completion_bonus_multiplier", "lambda_param", "trace_threshold"]
   },
+  { id: "topology", title: "Topology override", fields: ["tx_range_override"] },
   { id: "artifacts", title: "Artifacts", fields: ["export_q_table_all_epoch"] }
 ];
 
@@ -205,14 +207,23 @@ function groupConfigFieldNames(fieldNames) {
   return blocks;
 }
 
-function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigForm) {
+function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigForm, fieldOptions = {}) {
   const rawType = fieldSchema?.type;
   const resolvedType = Array.isArray(rawType) ? rawType.find((t) => t !== "null") || "string" : rawType || "string";
   const currentValue = runConfigForm?.[fieldName];
+  const minAllowedTxOverride =
+    Number.isFinite(Number(fieldOptions?.minAllowedTxOverride)) && Number(fieldOptions.minAllowedTxOverride) > 0
+      ? Number(fieldOptions.minAllowedTxOverride)
+      : null;
 
   if (resolvedType === "boolean") {
-    const isCoverageRewardToggle = fieldName === "coverage_reward_enabled";
-    const checkedValue = isCoverageRewardToggle ? currentValue !== false : Boolean(currentValue);
+    // coverage reward defaults on when unset; completion exp factor defaults off
+    const checkedValue =
+      fieldName === "coverage_reward_enabled"
+        ? currentValue !== false
+        : fieldName === "completion_exp_bonus_enabled"
+          ? currentValue === true
+          : Boolean(currentValue);
     return (
       <label className="field-label inline-checkbox" key={fieldName}>
         <span>{formatConfigLabel(fieldName)}</span>
@@ -233,24 +244,46 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
   const enumOptions = Array.isArray(fieldSchema?.enum) ? fieldSchema.enum : null;
   if (resolvedType === "string" && enumOptions && enumOptions.length > 0) {
     const currentEnumValue = String(currentValue ?? enumOptions[0]);
-    if (enumOptions.length === 2) {
+    const useSegmentedToggle =
+      enumOptions.length === 2 ||
+      fieldName === "policy_type" ||
+      fieldName === "action_axis" ||
+      fieldName === "spread_mode" ||
+      fieldName === "action_aggregation_mode";
+    if (useSegmentedToggle) {
       return (
         <label className="field-label" key={fieldName}>
           {formatConfigLabel(fieldName)}
           <div className="segmented-toggle segmented-toggle--dense">
             {enumOptions.map((option) => {
               const optionValue = String(option);
+              const optionDisabled =
+                (fieldName === "spread_mode" && optionValue === "la") ||
+                (fieldName === "action_aggregation_mode" && optionValue === "exact_next_state") ||
+                (fieldName === "policy_type" &&
+                  (optionValue === "softmax" || optionValue === "ucb"));
               return (
                 <button
                   key={optionValue}
                   type="button"
                   className={`segment-btn ${currentEnumValue === optionValue ? "active" : ""}`}
-                  onClick={() =>
+                  disabled={optionDisabled}
+                  title={
+                    optionDisabled
+                      ? fieldName === "spread_mode"
+                        ? "Latency ahead is temporarily disabled"
+                        : fieldName === "action_aggregation_mode"
+                          ? "Exact next state is temporarily disabled"
+                          : "This policy is temporarily disabled"
+                      : undefined
+                  }
+                  onClick={() => {
+                    if (optionDisabled) return;
                     setRunConfigForm((prev) => ({
                       ...prev,
                       [fieldName]: option
-                    }))
-                  }
+                    }));
+                  }}
                 >
                   {formatEnumOptionLabel(fieldName, option)}
                 </button>
@@ -283,6 +316,33 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
   }
 
   const inputType = resolvedType === "integer" || resolvedType === "number" ? "number" : "text";
+  if (fieldName === "tx_range_override") {
+    const minAttr = minAllowedTxOverride != null ? minAllowedTxOverride : undefined;
+    return (
+      <label className="field-label" key={fieldName}>
+        {formatConfigLabel(fieldName)}
+        <input
+          type="number"
+          min={minAttr}
+          step="any"
+          placeholder={minAttr != null ? `≥ ${minAttr} (topo range)` : "Leave empty = use topo range"}
+          value={currentValue ?? ""}
+          onChange={(e) => {
+            const raw = e.target.value;
+            setRunConfigForm((prev) => ({
+              ...prev,
+              [fieldName]: raw === "" ? null : normalizeFieldValue(raw, "number")
+            }));
+          }}
+        />
+        <span className="muted" style={{ fontSize: 11 }}>
+          {minAttr != null
+            ? `Local only for this run. Must be ≥ ${minAttr} (max TX range of selected topologies). Empty = original.`
+            : "Local only for this run. Must be ≥ each topology's TX range. Empty = original."}
+        </span>
+      </label>
+    );
+  }
   return (
     <label className="field-label" key={fieldName}>
       {formatConfigLabel(fieldName)}
@@ -328,9 +388,48 @@ function filterEntriesByPolicy(schemaEntries, policyType) {
   });
 }
 
-function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm }) {
+function minAllowedTxOverrideFromTopologies(topoList) {
+  const ranges = (topoList ?? [])
+    .map((topo) => Number(topo?.tx_range))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!ranges.length) return null;
+  return Math.max(...ranges);
+}
+
+function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm, minAllowedTxOverride = null }) {
   if (!schemaEntries.length) return null;
+  const fieldOptions = { minAllowedTxOverride };
   const selectedPolicyType = String(runConfigForm?.policy_type ?? "epsilon_greedy");
+
+  useEffect(() => {
+    if (selectedPolicyType === "softmax" || selectedPolicyType === "ucb") {
+      setRunConfigForm((prev) => ({
+        ...prev,
+        policy_type: "epsilon_greedy"
+      }));
+    }
+  }, [selectedPolicyType, setRunConfigForm]);
+
+  const selectedSpreadMode = String(runConfigForm?.spread_mode ?? "normal");
+  useEffect(() => {
+    if (selectedSpreadMode === "la") {
+      setRunConfigForm((prev) => ({
+        ...prev,
+        spread_mode: "normal"
+      }));
+    }
+  }, [selectedSpreadMode, setRunConfigForm]);
+
+  const selectedActionAggregation = String(runConfigForm?.action_aggregation_mode ?? "off");
+  useEffect(() => {
+    if (selectedActionAggregation === "exact_next_state") {
+      setRunConfigForm((prev) => ({
+        ...prev,
+        action_aggregation_mode: "off"
+      }));
+    }
+  }, [selectedActionAggregation, setRunConfigForm]);
+
   const temperatureStartMode = String(runConfigForm?.temperature_start_mode ?? "manual");
   const visibleEntries = schemaEntries.filter(([fieldName]) => {
     if (fieldName === "temperature_start_mode" || fieldName === "temperature_start_multiplier") return false;
@@ -400,7 +499,7 @@ function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm }) {
           <h5 className="config-field-block__title">{block.title}</h5>
           <div className="config-field-block__fields">
             {block.fields.map((fieldName) =>
-              renderConfigField(fieldName, schemaByName[fieldName], runConfigForm, setRunConfigForm)
+              renderConfigField(fieldName, schemaByName[fieldName], runConfigForm, setRunConfigForm, fieldOptions)
             )}
             {block.id === "temperature" ? softmaxExtras : null}
           </div>
@@ -470,12 +569,18 @@ function RunTopologyPanel({
 }) {
   const currentBackbone = runBackbone;
   const topologyNodeCount = Number(selectedTopology?.node_count);
+  const minAllowedTxOverride = useMemo(
+    () => minAllowedTxOverrideFromTopologies(selectedTopology ? [selectedTopology] : []),
+    [selectedTopology]
+  );
   const sortedRunPresets = useMemo(() => sortPresetsAlphabetically(runPresets), [runPresets]);
   const selectedPreset = useMemo(
     () => sortedRunPresets.find((p) => p.id === form.preset_id) ?? null,
     [sortedRunPresets, form.preset_id]
   );
   const phase = presetWizard.phase;
+  const [draftPresetName, setDraftPresetName] = useState("");
+  const [renameDraft, setRenameDraft] = useState(null);
 
   useEffect(() => {
     const milpMeta = (algorithmOptions ?? []).find((item) => item.algorithm_id === "milp") ?? null;
@@ -508,6 +613,7 @@ function RunTopologyPanel({
 
   function applyOfficialPreset(preset) {
     if (!preset) return;
+    setRenameDraft(null);
     setPresetWizard(IDLE_PRESET_WIZARD);
     setForm((prev) => ({
       ...prev,
@@ -522,6 +628,7 @@ function RunTopologyPanel({
     const algorithm_id = backboneId;
     const list = sortedRunPresets.filter((p) => p.backbone === backboneId);
     const pick = list[0] ?? null;
+    setRenameDraft(null);
     setForm((prev) => ({
       ...prev,
       algorithm_id,
@@ -536,6 +643,8 @@ function RunTopologyPanel({
   }
 
   function startWizard() {
+    setRenameDraft(null);
+    setDraftPresetName("");
     setPresetWizard({
       phase: "add_backbone",
       draftClientId: `draft:${Date.now()}`,
@@ -555,6 +664,7 @@ function RunTopologyPanel({
     if (snap && snap.backbone !== undefined && snap.backbone !== null) {
       setSharedRunConfigForBackbone(snap.backbone, { ...(snap.runConfig ?? {}) });
     }
+    setDraftPresetName("");
     setPresetWizard(IDLE_PRESET_WIZARD);
   }
 
@@ -576,9 +686,11 @@ function RunTopologyPanel({
   }
 
   async function saveCurrentPresetToLibrary() {
-    const name = window.prompt("Tên preset (lưu vào thư viện):");
-    const clean = name?.trim();
-    if (!clean) return;
+    const clean = draftPresetName.trim();
+    if (!clean) {
+      setMessage("Nhập tên preset trước khi lưu.");
+      return;
+    }
     const snapshot = { ...(runConfigForm ?? {}) };
     try {
       const res = await fetch(`${API_BASE}/presets`, {
@@ -596,6 +708,7 @@ function RunTopologyPanel({
         setMessage(parseApiError(data, "Failed."));
         return;
       }
+      setDraftPresetName("");
       setPresetWizard(IDLE_PRESET_WIZARD);
       await loadRunPresets();
       if (data && data.id) {
@@ -633,9 +746,15 @@ function RunTopologyPanel({
 
   async function renameOfficialPreset() {
     if (!selectedPreset) return;
-    const name = window.prompt("Đổi tên preset:", selectedPreset.label);
-    const clean = name?.trim();
-    if (!clean) return;
+    if (renameDraft === null) {
+      setRenameDraft(selectedPreset.label);
+      return;
+    }
+    const clean = String(renameDraft).trim();
+    if (!clean) {
+      setMessage("Nhập tên preset.");
+      return;
+    }
     try {
       const res = await fetch(`${API_BASE}/presets/${selectedPreset.id}`, {
         method: "PATCH",
@@ -648,6 +767,7 @@ function RunTopologyPanel({
         return;
       }
       setForm((prev) => ({ ...prev, preset_name: clean }));
+      setRenameDraft(null);
       void data;
       await loadRunPresets();
     } catch {
@@ -722,6 +842,7 @@ function RunTopologyPanel({
                   schemaEntries={policyEntries}
                   runConfigForm={runConfigForm}
                   setRunConfigForm={setRunConfigForm}
+                  minAllowedTxOverride={minAllowedTxOverride}
                 />
                 <div className="preset-actions">
                   <button type="button" className="secondary-cta" onClick={() => setPresetWizard((w) => ({ ...w, phase: "add_params" }))}>
@@ -732,8 +853,23 @@ function RunTopologyPanel({
             ) : null}
             {showWizardParams ? (
               <>
+                <label className="field-label">
+                  Tên preset
+                  <input
+                    type="text"
+                    value={draftPresetName}
+                    onChange={(e) => setDraftPresetName(e.target.value)}
+                    placeholder="vd. greedy-default"
+                    autoComplete="off"
+                  />
+                </label>
                 {hyperEntries.length > 0 ? (
-                  <DynamicConfigGrid schemaEntries={hyperEntries} runConfigForm={runConfigForm} setRunConfigForm={setRunConfigForm} />
+                  <DynamicConfigGrid
+                    schemaEntries={hyperEntries}
+                    runConfigForm={runConfigForm}
+                    setRunConfigForm={setRunConfigForm}
+                    minAllowedTxOverride={minAllowedTxOverride}
+                  />
                 ) : (
                   <p className="muted">Không có tham số cấu hình cho backbone này.</p>
                 )}
@@ -778,6 +914,27 @@ function RunTopologyPanel({
                 ))}
               </select>
       </label>
+            {renameDraft !== null ? (
+              <>
+                <label className="field-label">
+                  Tên mới
+                  <input
+                    type="text"
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    autoComplete="off"
+                  />
+                </label>
+                <div className="preset-actions">
+                  <button type="button" className="secondary-cta" onClick={renameOfficialPreset}>
+                    Lưu tên
+                  </button>
+                  <button type="button" className="secondary-cta" onClick={() => setRenameDraft(null)}>
+                    Huỷ
+                  </button>
+                </div>
+              </>
+            ) : (
             <div className="preset-actions">
               <button type="button" className="secondary-cta" onClick={startWizard}>
                 Thêm
@@ -792,6 +949,7 @@ function RunTopologyPanel({
                 Xóa
               </button>
             </div>
+            )}
             <label className="field-label">
               Backbone
               <BackboneToggle
@@ -807,7 +965,12 @@ function RunTopologyPanel({
 
       {showIdleFullConfig ? (
         idleConfigEntries.length > 0 ? (
-          <DynamicConfigGrid schemaEntries={idleConfigEntries} runConfigForm={runConfigForm} setRunConfigForm={setRunConfigForm} />
+          <DynamicConfigGrid
+            schemaEntries={idleConfigEntries}
+            runConfigForm={runConfigForm}
+            setRunConfigForm={setRunConfigForm}
+            minAllowedTxOverride={minAllowedTxOverride}
+          />
         ) : (
           <p className="muted">No config schema for this algorithm.</p>
         )
@@ -864,12 +1027,22 @@ function RunMultiPanel({
     });
     return maxN || Number.NaN;
   }, [runMultiSubMode, selectedTopology?.node_count, form.selected_topology_ids, topologies]);
+  const minAllowedTxOverride = useMemo(() => {
+    if (runMultiSubMode === "repeat") {
+      return minAllowedTxOverrideFromTopologies(selectedTopology ? [selectedTopology] : []);
+    }
+    const ids = new Set(form.selected_topology_ids ?? []);
+    const selected = (topologies ?? []).filter((topo) => ids.has(topo.topology_id));
+    return minAllowedTxOverrideFromTopologies(selected);
+  }, [runMultiSubMode, selectedTopology, form.selected_topology_ids, topologies]);
   const sortedRunPresets = useMemo(() => sortPresetsAlphabetically(runPresets), [runPresets]);
   const selectedPreset = useMemo(
     () => sortedRunPresets.find((p) => p.id === form.preset_id) ?? null,
     [sortedRunPresets, form.preset_id]
   );
   const phase = presetWizard.phase;
+  const [draftPresetName, setDraftPresetName] = useState("");
+  const [renameDraft, setRenameDraft] = useState(null);
 
   useEffect(() => {
     const milpMeta = (algorithmOptions ?? []).find((item) => item.algorithm_id === "milp") ?? null;
@@ -902,6 +1075,7 @@ function RunMultiPanel({
 
   function applyOfficialPreset(preset) {
     if (!preset) return;
+    setRenameDraft(null);
     setPresetWizard(IDLE_PRESET_WIZARD);
     setForm((prev) => ({
       ...prev,
@@ -916,6 +1090,7 @@ function RunMultiPanel({
     const algorithm_id = backboneId;
     const list = sortedRunPresets.filter((p) => p.backbone === backboneId);
     const pick = list[0] ?? null;
+    setRenameDraft(null);
     setForm((prev) => ({
       ...prev,
       algorithm_id,
@@ -930,6 +1105,8 @@ function RunMultiPanel({
   }
 
   function startWizard() {
+    setRenameDraft(null);
+    setDraftPresetName("");
     setPresetWizard({
       phase: "add_backbone",
       draftClientId: `draft:${Date.now()}`,
@@ -949,6 +1126,7 @@ function RunMultiPanel({
     if (snap && snap.backbone !== undefined && snap.backbone !== null) {
       setSharedRunConfigForBackbone(snap.backbone, { ...(snap.runConfig ?? {}) });
     }
+    setDraftPresetName("");
     setPresetWizard(IDLE_PRESET_WIZARD);
   }
 
@@ -970,9 +1148,11 @@ function RunMultiPanel({
   }
 
   async function saveCurrentPresetToLibrary() {
-    const name = window.prompt("Tên preset (lưu vào thư viện):");
-    const clean = name?.trim();
-    if (!clean) return;
+    const clean = draftPresetName.trim();
+    if (!clean) {
+      setMessage("Nhập tên preset trước khi lưu.");
+      return;
+    }
     const snapshot = { ...(runConfigForm ?? {}) };
     try {
       const res = await fetch(`${API_BASE}/presets`, {
@@ -990,6 +1170,7 @@ function RunMultiPanel({
         setMessage(parseApiError(data, "Failed."));
         return;
       }
+      setDraftPresetName("");
       setPresetWizard(IDLE_PRESET_WIZARD);
       await loadRunPresets();
       if (data && data.id) {
@@ -1027,9 +1208,15 @@ function RunMultiPanel({
 
   async function renameOfficialPreset() {
     if (!selectedPreset) return;
-    const name = window.prompt("Đổi tên preset:", selectedPreset.label);
-    const clean = name?.trim();
-    if (!clean) return;
+    if (renameDraft === null) {
+      setRenameDraft(selectedPreset.label);
+      return;
+    }
+    const clean = String(renameDraft).trim();
+    if (!clean) {
+      setMessage("Nhập tên preset.");
+      return;
+    }
     try {
       const res = await fetch(`${API_BASE}/presets/${selectedPreset.id}`, {
         method: "PATCH",
@@ -1042,6 +1229,7 @@ function RunMultiPanel({
         return;
       }
       setForm((prev) => ({ ...prev, preset_name: clean }));
+      setRenameDraft(null);
       void data;
       await loadRunPresets();
     } catch {
@@ -1152,6 +1340,7 @@ function RunMultiPanel({
                   schemaEntries={policyEntries}
                   runConfigForm={runConfigForm}
                   setRunConfigForm={setRunConfigForm}
+                  minAllowedTxOverride={minAllowedTxOverride}
                 />
                 <div className="preset-actions">
                   <button type="button" className="secondary-cta" onClick={() => setPresetWizard((w) => ({ ...w, phase: "add_params" }))}>
@@ -1162,8 +1351,23 @@ function RunMultiPanel({
             ) : null}
             {showWizardParams ? (
               <>
+                <label className="field-label">
+                  Tên preset
+                  <input
+                    type="text"
+                    value={draftPresetName}
+                    onChange={(e) => setDraftPresetName(e.target.value)}
+                    placeholder="vd. greedy-default"
+                    autoComplete="off"
+                  />
+                </label>
                 {hyperEntries.length > 0 ? (
-                  <DynamicConfigGrid schemaEntries={hyperEntries} runConfigForm={runConfigForm} setRunConfigForm={setRunConfigForm} />
+                  <DynamicConfigGrid
+                    schemaEntries={hyperEntries}
+                    runConfigForm={runConfigForm}
+                    setRunConfigForm={setRunConfigForm}
+                    minAllowedTxOverride={minAllowedTxOverride}
+                  />
                 ) : (
                   <p className="muted">Không có tham số cấu hình cho backbone này.</p>
                 )}
@@ -1208,6 +1412,27 @@ function RunMultiPanel({
                 ))}
               </select>
             </label>
+            {renameDraft !== null ? (
+              <>
+                <label className="field-label">
+                  Tên mới
+                  <input
+                    type="text"
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    autoComplete="off"
+                  />
+                </label>
+                <div className="preset-actions">
+                  <button type="button" className="secondary-cta" onClick={renameOfficialPreset}>
+                    Lưu tên
+                  </button>
+                  <button type="button" className="secondary-cta" onClick={() => setRenameDraft(null)}>
+                    Huỷ
+                  </button>
+                </div>
+              </>
+            ) : (
             <div className="preset-actions">
               <button type="button" className="secondary-cta" onClick={startWizard}>
                 Thêm
@@ -1222,6 +1447,7 @@ function RunMultiPanel({
                 Xóa
               </button>
             </div>
+            )}
             <label className="field-label">
               Backbone
               <BackboneToggle
@@ -1237,7 +1463,12 @@ function RunMultiPanel({
 
       {showIdleFullConfig ? (
         idleConfigEntries.length > 0 ? (
-          <DynamicConfigGrid schemaEntries={idleConfigEntries} runConfigForm={runConfigForm} setRunConfigForm={setRunConfigForm} />
+          <DynamicConfigGrid
+            schemaEntries={idleConfigEntries}
+            runConfigForm={runConfigForm}
+            setRunConfigForm={setRunConfigForm}
+            minAllowedTxOverride={minAllowedTxOverride}
+          />
         ) : (
           <p className="muted">No config schema for this algorithm.</p>
         )
@@ -1648,6 +1879,12 @@ function ResultsPanel({
         <dl>
           <dt>Status</dt>
           <dd>{latestHistory.status}</dd>
+          <dt>Runtime</dt>
+          <dd>
+            {Number.isFinite(Number(latestHistory.runtime_sec))
+              ? `${Math.round(Number(latestHistory.runtime_sec))}s`
+              : "-"}
+          </dd>
           <dt>Preset</dt>
           <dd>{latestHistory.preset_name ?? latestHistory.preset_id ?? "-"}</dd>
           <dt>Created at</dt>
@@ -1721,41 +1958,104 @@ function BatchDetailPanel({ batch }) {
   );
 }
 
-function DetailPanel({ detail, isLoading }) {
+function DetailPanel({
+  detail,
+  isLoading,
+  selectedTopology = null,
+  setMessage = null,
+  sourceNodeColor = "#ec5bb8",
+  sourceNodeRadius = 1.6
+}) {
+  const [isExportingGraph, setIsExportingGraph] = useState(false);
+  const topologyId = selectedTopology?.topology_id ?? detail?.topology_id ?? null;
+  const topologyName = selectedTopology?.topology_name ?? detail?.topology_name ?? "topology";
+
+  async function handleExportGraphImage(format = "png") {
+    if (!topologyId || isExportingGraph) return;
+    setIsExportingGraph(true);
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/graph`);
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage?.(typeof data?.message === "string" ? data.message : "Could not load topology graph.");
+        return;
+      }
+      const exportOpts = {
+        filename: topologyName,
+        sourceNodeColor,
+        sourceNodeRadius
+      };
+      const ok =
+        format === "svg"
+          ? downloadTopologyGraphSvg(data, exportOpts)
+          : await downloadTopologyGraphPng(data, exportOpts);
+      if (!ok) {
+        setMessage?.("Could not export topology image.");
+      }
+    } catch {
+      setMessage?.("Could not export topology image.");
+    } finally {
+      setIsExportingGraph(false);
+    }
+  }
+
   return (
     <div className="results-panel detail-panel">
       <h4>Topology detail</h4>
       {isLoading ? (
         <p className="muted">Loading...</p>
       ) : detail ? (
-        <dl>
-          <dt>Created at</dt>
-          <dd>{detail.created_at}</dd>
-          <dt>Status</dt>
-          <dd>{detail.status}</dd>
-          <dt>Node count</dt>
-          <dd>{detail.node_count}</dd>
-          <dt>Space</dt>
-          <dd>
-            {detail.space_width} x {detail.space_height}
-          </dd>
-          <dt>Sink mode</dt>
-          <dd>{detail.sink_mode}</dd>
-          <dt>Sink position</dt>
-          <dd>
-            ({detail.sink_x}, {detail.sink_y})
-          </dd>
-          <dt>Tx range</dt>
-          <dd>{detail.tx_range}</dd>
-          <dt>Seed</dt>
-          <dd>{detail.seed ?? "-"}</dd>
-          <dt>Finished delay</dt>
-          <dd>{detail.finished_delay ?? "-"}</dd>
-          <dt>Lower bound</dt>
-          <dd>{detail.lower_bound ?? "-"}</dd>
-          <dt>Best delay explored</dt>
-          <dd>{detail.best_delay_explored ?? "-"}</dd>
-        </dl>
+        <>
+          <dl>
+            <dt>Created at</dt>
+            <dd>{detail.created_at}</dd>
+            <dt>Status</dt>
+            <dd>{detail.status}</dd>
+            <dt>Node count</dt>
+            <dd>{detail.node_count}</dd>
+            <dt>Space</dt>
+            <dd>
+              {detail.space_width} x {detail.space_height}
+            </dd>
+            <dt>Sink mode</dt>
+            <dd>{detail.sink_mode}</dd>
+            <dt>Sink position</dt>
+            <dd>
+              ({detail.sink_x}, {detail.sink_y})
+            </dd>
+            <dt>Tx range</dt>
+            <dd>{detail.tx_range}</dd>
+            <dt>Seed</dt>
+            <dd>{detail.seed ?? "-"}</dd>
+            <dt>Finished delay</dt>
+            <dd>{detail.finished_delay ?? "-"}</dd>
+            <dt>Lower bound</dt>
+            <dd>{detail.lower_bound ?? "-"}</dd>
+            <dt>Best delay explored</dt>
+            <dd>{detail.best_delay_explored ?? "-"}</dd>
+          </dl>
+          <div className="detail-panel-actions">
+            <div className="detail-panel-export-row">
+              <button
+                type="button"
+                className="secondary-cta"
+                disabled={!topologyId || isExportingGraph}
+                onClick={() => handleExportGraphImage("png")}
+              >
+                {isExportingGraph ? "Exporting..." : "Xuất PNG"}
+              </button>
+              <button
+                type="button"
+                className="secondary-cta"
+                disabled={!topologyId || isExportingGraph}
+                onClick={() => handleExportGraphImage("svg")}
+              >
+                Xuất SVG
+              </button>
+            </div>
+            <p className="muted detail-panel-export-hint">Không hiển thị số node · đệm 5 đơn vị mỗi cạnh.</p>
+          </div>
+        </>
       ) : (
         <p className="muted">No selected topology.</p>
       )}
@@ -2182,30 +2482,259 @@ function DisplaySettingsPanel({ settings, setSettings, bestDelayOverlayOpacity, 
   );
 }
 
-function TopologyGridPreviewSettingsPanel({
-  previewMaxNodesPercent,
-  setPreviewMaxNodesPercent,
-  previewShowEdges,
-  setPreviewShowEdges
+function TopoStyleExportPanel({
+  settings,
+  setSettings,
+  sourceNodeColor,
+  setSourceNodeColor,
+  sourceNodeRadius,
+  setSourceNodeRadius,
+  bestDelayOverlayOpacity,
+  setBestDelayOverlayOpacity,
+  onReset,
+  selectedTopology,
+  setMessage,
+  topologyImageExportRef = null
 }) {
-  const safePercent = Math.max(10, Math.min(100, Number(previewMaxNodesPercent) || 80));
+  const [isExporting, setIsExporting] = useState(false);
+  const topologyId = selectedTopology?.topology_id ?? null;
+  const topologyName = selectedTopology?.topology_name ?? "topology";
+  const timeslotColors = Array.isArray(settings?.timeslot_colors) ? settings.timeslot_colors : [];
+
+  function updateField(field, value) {
+    setSettings((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function updateTimeslotColor(index, color) {
+    setSettings((prev) => {
+      const next = [...(prev.timeslot_colors ?? [])];
+      next[index] = color;
+      return { ...prev, timeslot_colors: next };
+    });
+  }
+
+  async function handleExport(format) {
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const registered = topologyImageExportRef?.current?.exportImage;
+      if (typeof registered === "function") {
+        const result = await registered(format);
+        if (!result?.ok) {
+          setMessage?.(result?.message || "Could not export topology image.");
+        }
+        return;
+      }
+      if (!topologyId) {
+        setMessage?.("Select a topology to export.");
+        return;
+      }
+      const response = await fetch(`${API_BASE}/topologies/${topologyId}/graph`);
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage?.(typeof data?.message === "string" ? data.message : "Could not load topology graph.");
+        return;
+      }
+      const exportOpts = {
+        filename: topologyName,
+        sourceNodeColor,
+        sourceNodeRadius,
+        nodeRadius: settings.node_size,
+        edgeWidth: settings.edge_width,
+        edgeOpacity: settings.edge_opacity,
+        showLabels: true,
+        labelSize: settings.label_size,
+        labelOffsetX: settings.label_offset_x,
+        labelOffsetY: settings.label_offset_y,
+        renderBaseEdges: true
+      };
+      const ok =
+        format === "svg"
+          ? downloadTopologyGraphSvg(data, exportOpts)
+          : await downloadTopologyGraphPng(data, exportOpts);
+      if (!ok) setMessage?.("Could not export topology image.");
+    } catch {
+      setMessage?.("Could not export topology image.");
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  const edgeOpacity = Number.isFinite(Number(settings.edge_opacity)) ? Number(settings.edge_opacity) : 1;
+  const bestOpacity = Number.isFinite(Number(bestDelayOverlayOpacity)) ? Number(bestDelayOverlayOpacity) : 1;
+
+  return (
+    <div className="edit-panel topo-style-export-panel">
+      <div className="edit-panel-header">
+        <h4>Topo style &amp; SVG</h4>
+        <button type="button" className="secondary-cta" onClick={onReset}>
+          Reset
+        </button>
+      </div>
+      <p className="muted">
+        Adjust drawing style. Export keeps node colors, node ids, and transmission edges from the current Results view.
+      </p>
+
+      <div className="display-settings-grid">
+        <label className="field-label">
+          Node size
+          <input
+            type="number"
+            step="0.1"
+            min="0.5"
+            max="8"
+            value={settings.node_size}
+            onChange={(e) => updateField("node_size", Number(e.target.value))}
+          />
+        </label>
+        <label className="field-label">
+          Source node size
+          <input
+            type="number"
+            step="0.05"
+            min="0.6"
+            max="5"
+            value={sourceNodeRadius}
+            onChange={(e) => setSourceNodeRadius(Number(e.target.value))}
+          />
+        </label>
+        <label className="field-label">
+          Label size
+          <input
+            type="number"
+            step="0.1"
+            min="0.5"
+            max="12"
+            value={settings.label_size}
+            onChange={(e) => updateField("label_size", Number(e.target.value))}
+          />
+        </label>
+        <label className="field-label">
+          Source color
+          <input
+            type="color"
+            className="source-node-color-input"
+            value={sourceNodeColor}
+            onChange={(e) => setSourceNodeColor(e.target.value)}
+          />
+        </label>
+        <label className="field-label">
+          Node id offset X
+          <input
+            type="number"
+            step="0.1"
+            min="-20"
+            max="20"
+            value={settings.label_offset_x}
+            onChange={(e) => updateField("label_offset_x", Number(e.target.value))}
+          />
+          <small className="muted">0 = center on node</small>
+        </label>
+        <label className="field-label">
+          Node id offset Y
+          <input
+            type="number"
+            step="0.1"
+            min="-20"
+            max="20"
+            value={settings.label_offset_y}
+            onChange={(e) => updateField("label_offset_y", Number(e.target.value))}
+          />
+          <small className="muted">0 = center on node</small>
+        </label>
+        <label className="field-label">
+          Edge width
+          <input
+            type="number"
+            step="0.05"
+            min="0.05"
+            max="5"
+            value={settings.edge_width}
+            onChange={(e) => updateField("edge_width", Number(e.target.value))}
+          />
+        </label>
+        <label className="field-label">
+          Link opacity
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={edgeOpacity}
+            onChange={(e) => updateField("edge_opacity", Number(e.target.value))}
+          />
+          <small className="muted">{edgeOpacity.toFixed(2)}</small>
+        </label>
+        <label className="field-label">
+          Best delay opacity
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={bestOpacity}
+            onChange={(e) => setBestDelayOverlayOpacity(Number(e.target.value))}
+          />
+          <small className="muted">{bestOpacity.toFixed(2)}</small>
+        </label>
+      </div>
+
+      <div className="topo-style-timeslot-block">
+        <h5 className="topo-style-subtitle">Timeslot colors</h5>
+        <p className="muted">Used when Results display is Color by timeslot / Replay.</p>
+        <div className="topo-style-timeslot-swatches">
+          {timeslotColors.map((color, idx) => (
+            <label key={`ts-color-${idx}`} className="topo-style-swatch" title={`Timeslot ${idx + 1}`}>
+              <span className="muted">{idx + 1}</span>
+              <input
+                type="color"
+                value={color}
+                onChange={(e) => updateTimeslotColor(idx, e.target.value)}
+              />
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="detail-panel-export-row topo-style-export-row">
+        <button
+          type="button"
+          className="primary-cta small"
+          disabled={isExporting || (!topologyId && !topologyImageExportRef?.current)}
+          onClick={() => handleExport("svg")}
+        >
+          {isExporting ? "Exporting…" : "Export SVG"}
+        </button>
+        <button
+          type="button"
+          className="secondary-cta"
+          disabled={isExporting || (!topologyId && !topologyImageExportRef?.current)}
+          onClick={() => handleExport("png")}
+        >
+          Export PNG
+        </button>
+      </div>
+      {!topologyId ? <p className="muted">Select a topology to export.</p> : null}
+    </div>
+  );
+}
+
+function TopologyGridPreviewSettingsPanel({
+  previewShowEdges,
+  setPreviewShowEdges,
+  sourceNodeColor,
+  setSourceNodeColor,
+  sourceNodeRadius,
+  setSourceNodeRadius
+}) {
   return (
     <div className="edit-panel preview-settings-panel">
       <div className="edit-panel-header">
         <h4>Grid preview</h4>
       </div>
-      <label className="field-label">
-        Max nodes (%)
-        <input
-          type="range"
-          min="10"
-          max="100"
-          step="5"
-          value={safePercent}
-          onChange={(e) => setPreviewMaxNodesPercent(Number(e.target.value))}
-        />
-        <small className="muted">{safePercent}%</small>
-      </label>
+      <p className="muted preview-settings-note">
+        Preview shows all nodes. Edges are off by default to keep the grid smooth — turn on if needed.
+      </p>
       <label className="field-label inline-checkbox">
         <span>Show edges in preview</span>
         <input
@@ -2214,6 +2743,38 @@ function TopologyGridPreviewSettingsPanel({
           onChange={(e) => setPreviewShowEdges(e.target.checked)}
         />
       </label>
+      <label className="field-label">
+        Source node color
+        <input
+          type="color"
+          className="source-node-color-input"
+          value={sourceNodeColor}
+          onChange={(e) => setSourceNodeColor(e.target.value)}
+        />
+      </label>
+      <label className="field-label">
+        Source node size
+        <div className="source-node-size-row">
+          <input
+            type="range"
+            min={0.6}
+            max={5}
+            step={0.05}
+            value={sourceNodeRadius}
+            onChange={(e) => setSourceNodeRadius(Number(e.target.value))}
+          />
+          <input
+            type="number"
+            min={0.6}
+            max={5}
+            step={0.05}
+            className="source-node-size-input"
+            value={sourceNodeRadius}
+            onChange={(e) => setSourceNodeRadius(Number(e.target.value))}
+          />
+        </div>
+      </label>
+      <p className="muted preview-settings-note">Source node stays on top. Changes save automatically.</p>
     </div>
   );
 }
@@ -2399,10 +2960,12 @@ export default function RightControlPanel({
   resetGraphDisplaySettings,
   bestDelayOverlayOpacity,
   setBestDelayOverlayOpacity,
-  previewMaxNodesPercent,
-  setPreviewMaxNodesPercent,
   previewShowEdges,
   setPreviewShowEdges,
+  sourceNodeColor,
+  setSourceNodeColor,
+  sourceNodeRadius,
+  setSourceNodeRadius,
   runMultiSubMode,
   repeatTopologyId,
   repeatRunCount,
@@ -2438,7 +3001,8 @@ export default function RightControlPanel({
   setDecisionTreeEdgeOpacity,
   onSaveDecisionTreeLayoutDefaults,
   rightExportContext,
-  onOpenExportModal
+  onOpenExportModal,
+  topologyImageExportRef = null
 }) {
   const isTopologiesMode = activeMenu === "topologies";
   const isRunTopoMode = activeMenu === "run_topo";
@@ -2448,7 +3012,9 @@ export default function RightControlPanel({
     () => (algorithmOptions ?? []).find((item) => item.algorithm_id === runMultiForm?.algorithm_id) ?? null,
     [algorithmOptions, runMultiForm?.algorithm_id]
   );
-  const topologiesTab = ["detail", "edit_topo", "playground"].includes(activePanel2Tab) ? activePanel2Tab : "detail";
+  const topologiesTab = ["detail", "edit_topo", "playground", "style"].includes(activePanel2Tab)
+    ? activePanel2Tab
+    : "detail";
 
   const hasBatchOnly = Boolean(focusedBatchId) && !Boolean(focusedTopologyId);
   const isBatchGridView = !focusedBatchId && !focusedTopologyId;
@@ -2484,6 +3050,13 @@ export default function RightControlPanel({
               >
                 Playground
               </button>
+              <button
+                type="button"
+                className={`tab-pill ${topologiesTab === "style" ? "active" : ""}`}
+                onClick={() => setActivePanel2Tab("style")}
+              >
+                Style / SVG
+              </button>
             </>
           ) : isRunTopoMode ? (
             <>
@@ -2515,6 +3088,13 @@ export default function RightControlPanel({
           >
             Detail
           </button>
+              <button
+                type="button"
+                className={`tab-pill ${activePanel2Tab === "style" ? "active" : ""}`}
+                onClick={() => setActivePanel2Tab("style")}
+              >
+                Style / SVG
+              </button>
             </>
           ) : isRunMultiMode ? (
             <>
@@ -2548,6 +3128,13 @@ export default function RightControlPanel({
                 onClick={() => setActivePanel2Tab("detail")}
               >
                 Detail
+              </button>
+              <button
+                type="button"
+                className={`tab-pill ${activePanel2Tab === "style" ? "active" : ""}`}
+                onClick={() => setActivePanel2Tab("style")}
+              >
+                Style / SVG
               </button>
             </>
           ) : (
@@ -2585,20 +3172,24 @@ export default function RightControlPanel({
                   <p className="muted">Chọn một topology trong batch để chỉnh sửa tọa độ.</p>
                 </div>
                 <TopologyGridPreviewSettingsPanel
-                  previewMaxNodesPercent={previewMaxNodesPercent}
-                  setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
                   previewShowEdges={previewShowEdges}
                   setPreviewShowEdges={setPreviewShowEdges}
+                  sourceNodeColor={sourceNodeColor}
+                  setSourceNodeColor={setSourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
+                  setSourceNodeRadius={setSourceNodeRadius}
                 />
               </>
             ) : (
               <>
                 <BatchDetailPanel batch={focusedBatch} />
                 <TopologyGridPreviewSettingsPanel
-                  previewMaxNodesPercent={previewMaxNodesPercent}
-                  setPreviewMaxNodesPercent={setPreviewMaxNodesPercent}
                   previewShowEdges={previewShowEdges}
                   setPreviewShowEdges={setPreviewShowEdges}
+                  sourceNodeColor={sourceNodeColor}
+                  setSourceNodeColor={setSourceNodeColor}
+                  sourceNodeRadius={sourceNodeRadius}
+                  setSourceNodeRadius={setSourceNodeRadius}
                 />
               </>
             )
@@ -2633,11 +3224,48 @@ export default function RightControlPanel({
               setDecisionTreeEdgeOpacity={setDecisionTreeEdgeOpacity}
               onSaveDecisionTreeLayoutDefaults={onSaveDecisionTreeLayoutDefaults}
             />
+          ) : topologiesTab === "style" ? (
+            <TopoStyleExportPanel
+              settings={graphDisplaySettings}
+              setSettings={setGraphDisplaySettings}
+              sourceNodeColor={sourceNodeColor}
+              setSourceNodeColor={setSourceNodeColor}
+              sourceNodeRadius={sourceNodeRadius}
+              setSourceNodeRadius={setSourceNodeRadius}
+              bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+              setBestDelayOverlayOpacity={setBestDelayOverlayOpacity}
+              onReset={resetGraphDisplaySettings}
+              selectedTopology={selectedTopology}
+              setMessage={setMessage}
+              topologyImageExportRef={topologyImageExportRef}
+            />
           ) : (
-            <DetailPanel detail={topologyDetail} isLoading={isLoadingDetail} />
+            <DetailPanel
+              detail={topologyDetail}
+              isLoading={isLoadingDetail}
+              selectedTopology={selectedTopology}
+              setMessage={setMessage}
+              sourceNodeColor={sourceNodeColor}
+              sourceNodeRadius={sourceNodeRadius}
+            />
           )
         ) : isRunTopoMode || isRunMultiMode || isResultsMode ? (
-          needsRunTopoSelection ? (
+          activePanel2Tab === "style" ? (
+            <TopoStyleExportPanel
+              settings={graphDisplaySettings}
+              setSettings={setGraphDisplaySettings}
+              sourceNodeColor={sourceNodeColor}
+              setSourceNodeColor={setSourceNodeColor}
+              sourceNodeRadius={sourceNodeRadius}
+              setSourceNodeRadius={setSourceNodeRadius}
+              bestDelayOverlayOpacity={bestDelayOverlayOpacity}
+              setBestDelayOverlayOpacity={setBestDelayOverlayOpacity}
+              onReset={resetGraphDisplaySettings}
+              selectedTopology={selectedTopology}
+              setMessage={setMessage}
+              topologyImageExportRef={topologyImageExportRef}
+            />
+          ) : needsRunTopoSelection ? (
             <ContextPlaceholderPanel message="Chọn một topology để xem run, detail hoặc result tương ứng." />
           ) : isBatchResultsContext ? (
             <BatchRunResultSummaryPanel result={focusedBatchRunResult} />
@@ -2717,7 +3345,14 @@ export default function RightControlPanel({
             />
         ) : activePanel2Tab === "detail" ? (
             <>
-              <DetailPanel detail={topologyDetail} isLoading={isLoadingDetail} />
+              <DetailPanel
+                detail={topologyDetail}
+                isLoading={isLoadingDetail}
+                selectedTopology={selectedTopology}
+                setMessage={setMessage}
+                sourceNodeColor={sourceNodeColor}
+                sourceNodeRadius={sourceNodeRadius}
+              />
               {isResultsMode ? (
                 <DisplaySettingsPanel
                   settings={graphDisplaySettings}

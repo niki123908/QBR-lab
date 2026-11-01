@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from app.algorithms.br_env import Br_Env
@@ -73,6 +73,7 @@ class TrainingResult:
     best_delay: float
     best_episode_index: int
     qtable_snapshots_by_episode: dict[int, dict[str, dict[int, float]]]
+    episode_wall_ms: list[float] = field(default_factory=list)
 
 
 def train_with_template(
@@ -89,6 +90,7 @@ def train_with_template(
     export_q_table_all_epoch: bool = False,
     completion_bonus_multiplier: float = 1.0,
     coverage_reward_enabled: bool = True,
+    completion_exp_bonus_enabled: bool = False,
     lambda_param: float = 0.0,
     trace_threshold: float = 0.01,
     action_axis: str = "broadcaster",
@@ -112,11 +114,13 @@ def train_with_template(
     exact_registry = StateActionRegistry() if use_exact_aggregation else None
     incremental_registry = IncrementalActionRegistry() if use_incremental_aggregation else None
     started = time.monotonic()
+    episode_wall_ms: list[float] = []
     for episode_idx in range(episodes):
         episode = episode_idx + 1
         if (time.monotonic() - started) > timeout_sec:
             raise TimeoutError(f"Training exceeded {timeout_sec}s wall-clock limit.")
 
+        episode_t0 = time.perf_counter()
         done = env.reset()
         env.cur_time = 0
         eligibility_traces.clear()
@@ -176,6 +180,7 @@ def train_with_template(
                     spread_mode=spread_mode,
                     completion_bonus_multiplier=completion_bonus_multiplier,
                     coverage_reward_enabled=coverage_reward_enabled,
+                    completion_exp_bonus_enabled=completion_exp_bonus_enabled,
                 )
                 action, env_action = action_policy.select_group(env, qtable, state_hash, groups_at_step, episode)
                 selected_group = exact_registry.group_by_id(state_hash, action)
@@ -193,6 +198,7 @@ def train_with_template(
                 env_action,
                 completion_bonus_multiplier=completion_bonus_multiplier,
                 coverage_reward_enabled=coverage_reward_enabled,
+                completion_exp_bonus_enabled=completion_exp_bonus_enabled,
                 action_axis=action_axis,
                 spread_mode=spread_mode,
             )
@@ -326,6 +332,8 @@ def train_with_template(
                 "steps": step_rows,
             }
         )
+        # Wall time of the episode proper (exclude optional Q-table snapshot/export below).
+        episode_wall_ms.append((time.perf_counter() - episode_t0) * 1000.0)
 
         if env.cur_time < best_delay:
             best_delay = env.cur_time
@@ -344,4 +352,5 @@ def train_with_template(
         best_delay=best_delay,
         best_episode_index=best_episode_index,
         qtable_snapshots_by_episode=qtable_snapshots_by_episode,
+        episode_wall_ms=episode_wall_ms,
     )

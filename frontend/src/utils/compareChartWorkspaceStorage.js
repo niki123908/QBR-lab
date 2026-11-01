@@ -1,6 +1,12 @@
+import {
+  COMPARE_SIDE_IDS,
+  MAX_COMPARE_CHART_BATCHES,
+  normalizeCompareChartMode
+} from "./compareChartSides.js";
+
 const STORAGE_KEY = "qbr.compare-chart-workspace";
-const MAX_CHART_SLOTS = 4;
-const SIDE_IDS = ["A", "B", "C", "D"];
+const MAX_CHART_SLOTS = MAX_COMPARE_CHART_BATCHES;
+const SIDE_IDS = COMPARE_SIDE_IDS;
 
 function clampSlotCount(value) {
   const n = Number(value);
@@ -31,7 +37,7 @@ function sanitizeChartConfigs(raw) {
   return raw
     .map((chart, idx) => {
       if (!chart || typeof chart !== "object") return null;
-      const mode = chart.mode === "densityMean" ? "densityMean" : "density";
+      const mode = normalizeCompareChartMode(chart.mode);
       const chartType = chart.chartType === "bar" ? "bar" : "line";
       const selectedMetricKeys = Array.isArray(chart.selectedMetricKeys)
         ? [...new Set(chart.selectedMetricKeys.filter((k) => typeof k === "string" && k))]

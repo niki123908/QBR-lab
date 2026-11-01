@@ -20,17 +20,12 @@ export const CONFIG_FIELD_BLOCKS = [
   {
     id: "reward",
     title: "Reward & trace",
-    fields: ["coverage_reward_enabled", "completion_bonus_multiplier", "lambda_param", "trace_threshold", "action_aggregation_mode"]
+    fields: ["coverage_reward_enabled", "completion_exp_bonus_enabled", "completion_bonus_multiplier", "lambda_param", "trace_threshold", "action_aggregation_mode"]
   },
   { id: "artifacts", title: "Artifacts", fields: ["export_q_table_all_epoch"] },
+  { id: "topology", title: "Topology override", fields: ["tx_range_override"] },
   { id: "runtime", title: "Runtime", fields: ["run_seed"] }
 ];
-
-const POLICY_BLOCK_BY_TYPE = {
-  epsilon_greedy: "epsilon",
-  softmax: "temperature",
-  ucb: "ucb"
-};
 
 export function formatConfigLabel(fieldName) {
   if (fieldName === "core_parameters") return "Core parameters";
@@ -41,6 +36,7 @@ export function formatConfigLabel(fieldName) {
   if (fieldName === "lambda_param") return "Lambda (λ)";
   if (fieldName === "trace_threshold") return "Trace threshold";
   if (fieldName === "coverage_reward_enabled") return "Enable coverage reward (nodes covered / timeslot)";
+  if (fieldName === "completion_exp_bonus_enabled") return "Enable completion factor e^(LB − delay)";
   if (fieldName === "completion_bonus_multiplier") return "Completion bonus multiplier";
   if (fieldName === "temperature_decay_mode") return "Temperature decay mode";
   if (fieldName === "epsilon_start") return "Epsilon start";
@@ -49,6 +45,7 @@ export function formatConfigLabel(fieldName) {
   if (fieldName === "ucb_c") return "UCB exploration constant (c)";
   if (fieldName === "run_seed") return "Run seed";
   if (fieldName === "action_aggregation_mode") return "Action aggregation";
+  if (fieldName === "tx_range_override") return "TX range override (local)";
   if (fieldName === "preset_name") return "Preset";
   if (fieldName === "algorithm_id") return "Algorithm";
   if (fieldName === "batch_name") return "Batch";
@@ -132,6 +129,9 @@ export function mergeDisplayConfig(result) {
   if (merged.action_aggregation_mode == null || merged.action_aggregation_mode === "") {
     merged.action_aggregation_mode = "off";
   }
+  if (merged.completion_exp_bonus_enabled == null || merged.completion_exp_bonus_enabled === "") {
+    merged.completion_exp_bonus_enabled = false;
+  }
   return { merged, runConfig, resolved };
 }
 
@@ -147,21 +147,6 @@ export function buildRunConfigResultFromResolved(resolvedPayload, meta = null) {
     run_config: {},
     resolved_run_config: wrapper
   };
-}
-
-/** Fields visible by default: preset label + policy identity + active policy hyperparameters only. */
-export function inferDefaultVisibleKeys(config) {
-  const policyType = String(config?.policy_type ?? "epsilon_greedy");
-  const keys = new Set(["action_axis", "spread_mode", "action_aggregation_mode"]);
-  const activeBlockId = POLICY_BLOCK_BY_TYPE[policyType];
-  if (activeBlockId) {
-    const block = CONFIG_FIELD_BLOCKS.find((b) => b.id === activeBlockId);
-    block?.fields.forEach((f) => keys.add(f));
-    if (policyType === "softmax") {
-      keys.add("temperature_decay_mode");
-    }
-  }
-  return keys;
 }
 
 export function isPolicyRelevantField(fieldName, policyType) {

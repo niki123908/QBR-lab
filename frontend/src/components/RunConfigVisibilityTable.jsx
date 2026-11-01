@@ -1,10 +1,9 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useMemo } from "react";
 import {
   buildConfigRowGroups,
   formatConfigLabel,
   formatConfigValue,
   formatEnumOptionLabel,
-  inferDefaultVisibleKeys,
   mergeDisplayConfig
 } from "../utils/runConfigDisplay.js";
 
@@ -26,48 +25,12 @@ export default function RunConfigVisibilityTable({ result }) {
   );
 
   const allFieldKeys = useMemo(() => blocks.flatMap((block) => block.fields), [blocks]);
-
-  const [visibleKeys, setVisibleKeys] = useState(() => new Set(inferDefaultVisibleKeys(merged)));
-  const [selectedHiddenKey, setSelectedHiddenKey] = useState("");
-
-  useEffect(() => {
-    setVisibleKeys(new Set(inferDefaultVisibleKeys(merged)));
-    setSelectedHiddenKey("");
-  }, [result?.batch_run_id, result?.run_id, policyType]);
+  const { runConfig, resolved } = mergeDisplayConfig(result);
+  const hasResolved = resolved && typeof resolved === "object" && Object.keys(resolved).length > 0;
 
   if (!allFieldKeys.length && !result?.algorithm_id) {
     return <p className="muted">No run config stored for this batch.</p>;
   }
-
-  const setFieldVisible = (fieldName, visible) => {
-    setVisibleKeys((prev) => {
-      const next = new Set(prev);
-      if (visible) next.add(fieldName);
-      else next.delete(fieldName);
-      return next;
-    });
-  };
-
-  const setBlockVisible = (block, visible) => {
-    setVisibleKeys((prev) => {
-      const next = new Set(prev);
-      block.fields.forEach((fieldName) => {
-        if (visible) next.add(fieldName);
-        else next.delete(fieldName);
-      });
-      return next;
-    });
-  };
-
-  const applyDefaults = () => setVisibleKeys(new Set(inferDefaultVisibleKeys(merged)));
-  const showAll = () => setVisibleKeys(new Set(allFieldKeys));
-  const hideAll = () => setVisibleKeys(new Set());
-
-  const visibleCount = allFieldKeys.filter((key) => visibleKeys.has(key)).length;
-  const hiddenFieldKeys = allFieldKeys.filter((key) => !visibleKeys.has(key));
-  const hiddenFieldOptions = hiddenFieldKeys.map((key) => ({ key, label: formatConfigLabel(key) }));
-  const { runConfig, resolved } = mergeDisplayConfig(result);
-  const hasResolved = resolved && typeof resolved === "object" && Object.keys(resolved).length > 0;
 
   return (
     <div className="run-config-visibility-panel">
@@ -82,59 +45,14 @@ export default function RunConfigVisibilityTable({ result }) {
             {aggregationLabel}
           </span>
         </div>
-        <div className="run-config-visibility-actions">
-          <button type="button" className="secondary-cta small" onClick={applyDefaults}>
-            Policy only
-          </button>
-          <button type="button" className="secondary-cta small" onClick={showAll}>
-            Show all
-          </button>
-          <button type="button" className="secondary-cta small" onClick={hideAll}>
-            Hide all
-          </button>
-        </div>
       </div>
 
-      <p className="muted run-config-visibility-hint">
-        {visibleCount} / {allFieldKeys.length} parameters visible
-        {hasResolved ? " · values from resolved config" : ""}
-      </p>
-      {hiddenFieldOptions.length ? (
-        <div className="run-config-restore-row">
-          <select
-            value={selectedHiddenKey}
-            onChange={(e) => setSelectedHiddenKey(e.target.value)}
-            className="run-config-restore-select"
-          >
-            <option value="">Add hidden parameter…</option>
-            {hiddenFieldOptions.map((item) => (
-              <option key={item.key} value={item.key}>
-                {item.label}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="secondary-cta small"
-            disabled={!selectedHiddenKey}
-            onClick={() => {
-              if (!selectedHiddenKey) return;
-              setFieldVisible(selectedHiddenKey, true);
-              setSelectedHiddenKey("");
-            }}
-          >
-            Add
-          </button>
-        </div>
-      ) : null}
+      {hasResolved ? <p className="muted run-config-visibility-hint">Values from resolved config</p> : null}
 
       <div className="run-config-visibility-table-wrap">
         <table className="run-config-visibility-table">
           <thead>
             <tr>
-              <th className="run-config-col-show" scope="col">
-                Show
-              </th>
               <th className="run-config-col-field" scope="col">
                 Parameter
               </th>
@@ -144,65 +62,41 @@ export default function RunConfigVisibilityTable({ result }) {
             </tr>
           </thead>
           <tbody>
-            {blocks.map((block) => {
-              const visibleFields = block.fields.filter((f) => visibleKeys.has(f));
-              const blockVisibleCount = visibleFields.length;
-              const blockAllOn = blockVisibleCount === block.fields.length;
-              const blockSomeOn = blockVisibleCount > 0 && !blockAllOn;
-              if (!blockVisibleCount) return null;
-              return (
-                <Fragment key={block.id}>
-                  <tr className="run-config-group-row">
-                    <td className="run-config-col-show">
-                      <input
-                        type="checkbox"
-                        className="run-config-group-check"
-                        checked={blockAllOn}
-                        ref={(el) => {
-                          if (el) el.indeterminate = blockSomeOn;
-                        }}
-                        onChange={(e) => setBlockVisible(block, e.target.checked)}
-                        aria-label={`Toggle ${block.title}`}
-                      />
-                    </td>
-                    <td colSpan={2} className="run-config-group-title">
-                      {block.title}
-                    </td>
-                  </tr>
-                  {visibleFields.map((fieldName) => {
-                    const value = merged[fieldName];
-                    const submitted = runConfig?.[fieldName];
-                    const resolvedVal = resolved?.[fieldName];
-                    const differs =
-                      hasResolved &&
-                      submitted !== undefined &&
-                      resolvedVal !== undefined &&
-                      String(submitted) !== String(resolvedVal);
-                    return (
-                      <tr key={`${block.id}-${fieldName}`} className="run-config-field-row">
-                        <td className="run-config-col-show">
-                          <input
-                            type="checkbox"
-                            checked
-                            onChange={(e) => setFieldVisible(fieldName, e.target.checked)}
-                            aria-label={`Show ${formatConfigLabel(fieldName)}`}
-                          />
-                        </td>
-                        <td className="run-config-col-field">{formatConfigLabel(fieldName)}</td>
-                        <td className="run-config-col-value">
-                          <span className="run-config-value-text">{formatConfigValue(fieldName, value)}</span>
-                          {differs ? (
-                            <span className="run-config-value-note muted" title={`Submitted: ${formatConfigValue(fieldName, submitted)}`}>
-                              ≠ submitted
-                            </span>
-                          ) : null}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </Fragment>
-              );
-            })}
+            {blocks.map((block) => (
+              <Fragment key={block.id}>
+                <tr className="run-config-group-row">
+                  <td colSpan={2} className="run-config-group-title">
+                    {block.title}
+                  </td>
+                </tr>
+                {block.fields.map((fieldName) => {
+                  const value = merged[fieldName];
+                  const submitted = runConfig?.[fieldName];
+                  const resolvedVal = resolved?.[fieldName];
+                  const differs =
+                    hasResolved &&
+                    submitted !== undefined &&
+                    resolvedVal !== undefined &&
+                    String(submitted) !== String(resolvedVal);
+                  return (
+                    <tr key={`${block.id}-${fieldName}`} className="run-config-field-row">
+                      <td className="run-config-col-field">{formatConfigLabel(fieldName)}</td>
+                      <td className="run-config-col-value">
+                        <span className="run-config-value-text">{formatConfigValue(fieldName, value)}</span>
+                        {differs ? (
+                          <span
+                            className="run-config-value-note muted"
+                            title={`Submitted: ${formatConfigValue(fieldName, submitted)}`}
+                          >
+                            ≠ submitted
+                          </span>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </Fragment>
+            ))}
           </tbody>
         </table>
       </div>

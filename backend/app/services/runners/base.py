@@ -28,6 +28,7 @@ class RunExecutionResult:
     total_states: int | None = None
     total_state_actions: int | None = None
     decision_graph_edges: int | None = None
+    rollout_runtime_ms: float | None = None
 
 
 AlgorithmRunner = Callable[[RunnerContext], RunExecutionResult]

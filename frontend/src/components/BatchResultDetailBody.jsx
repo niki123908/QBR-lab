@@ -1,12 +1,15 @@
 import { useMemo, useRef, useState } from "react";
 import {
+  batchHasDelayPerEpisodeData,
   batchHasPathMetricsData,
   buildBatchDelayScatterCsv,
   buildBatchPathMetricsCsv,
   buildBatchPathMetricsCsvForDensity,
   densityAxisLabel,
+  downloadBatchDelayPerEpisodeCsv,
   downloadBatchPathMetricsCsv,
-  downloadCsvText
+  downloadCsvText,
+  listDelayPerEpisodeDownloadOptions
 } from "../export/batchRunBuilders.js";
 import PolicyTraceLineChart from "./PolicyTraceLineChart.jsx";
 import {
@@ -1071,11 +1074,47 @@ export default function BatchResultDetailBody({
   scatterYAxisByDensity = null,
   delayAxisByDensity = null
 }) {
+  const [showDelayEpisodePicker, setShowDelayEpisodePicker] = useState(false);
+  const [selectedDelayEpisodeIndexes, setSelectedDelayEpisodeIndexes] = useState(() => new Set());
+
+  const delayEpisodeOptions = useMemo(() => listDelayPerEpisodeDownloadOptions(result), [result]);
+  const hasDelayEpisodeData = batchHasDelayPerEpisodeData(result);
+
   if (!result) return null;
   const topologies = result.topologies ?? [];
   if (!topologies.length) {
     return <div className="empty-topology-state">No topology with results in this batch run.</div>;
   }
+
+  function openDelayEpisodePicker() {
+    setSelectedDelayEpisodeIndexes(new Set(delayEpisodeOptions.map((opt) => Number(opt.topology_index))));
+    setShowDelayEpisodePicker(true);
+  }
+
+  function toggleDelayEpisodeIndex(index) {
+    const key = Number(index);
+    setSelectedDelayEpisodeIndexes((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  function selectAllDelayEpisodeIndexes() {
+    setSelectedDelayEpisodeIndexes(new Set(delayEpisodeOptions.map((opt) => Number(opt.topology_index))));
+  }
+
+  function clearDelayEpisodeIndexes() {
+    setSelectedDelayEpisodeIndexes(new Set());
+  }
+
+  function downloadSelectedDelayEpisodes() {
+    const selected = [...selectedDelayEpisodeIndexes].sort((a, b) => a - b);
+    if (!selected.length) return;
+    downloadBatchDelayPerEpisodeCsv(result, selected);
+  }
+
   return (
     <>
       <BatchSummaryStrip result={result} />
@@ -1099,6 +1138,19 @@ export default function BatchResultDetailBody({
         <button
           type="button"
           className="secondary-cta small"
+          disabled={!hasDelayEpisodeData}
+          title={
+            hasDelayEpisodeData
+              ? "Choose topologies by displayed id (0, 1, 2, …) and download delay_per_episode CSV"
+              : "No delay_per_episode data in this batch result"
+          }
+          onClick={openDelayEpisodePicker}
+        >
+          Download delay_per_episode CSV
+        </button>
+        <button
+          type="button"
+          className="secondary-cta small"
           disabled={!batchHasPathMetricsData(result)}
           title={
             batchHasPathMetricsData(result)
@@ -1110,6 +1162,72 @@ export default function BatchResultDetailBody({
           Download path metrics CSV (all topologies)
         </button>
       </div>
+      {showDelayEpisodePicker ? (
+        <div className="batch-delay-episode-picker">
+          <div className="batch-delay-episode-picker-header">
+            <strong>Select topologies (id)</strong>
+            <span className="muted">
+              {selectedDelayEpisodeIndexes.size}/{delayEpisodeOptions.length} selected
+            </span>
+            <div className="batch-delay-episode-picker-actions">
+              <button type="button" className="secondary-cta small" onClick={selectAllDelayEpisodeIndexes}>
+                Select all
+              </button>
+              <button type="button" className="secondary-cta small" onClick={clearDelayEpisodeIndexes}>
+                Clear
+              </button>
+              <button
+                type="button"
+                className="primary-cta small"
+                disabled={selectedDelayEpisodeIndexes.size === 0}
+                onClick={downloadSelectedDelayEpisodes}
+              >
+                Download selected
+              </button>
+              <button type="button" className="secondary-cta small" onClick={() => setShowDelayEpisodePicker(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+          <div className="batch-delay-episode-picker-table-wrap">
+            <table className="batch-delay-episode-picker-table">
+              <thead>
+                <tr>
+                  <th aria-label="select" />
+                  <th>id</th>
+                  <th>name</th>
+                  <th>nodes</th>
+                  <th>episodes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {delayEpisodeOptions.map((opt) => {
+                  const id = Number(opt.topology_index);
+                  const checked = selectedDelayEpisodeIndexes.has(id);
+                  return (
+                    <tr key={`${opt.topology_id || "topo"}-${id}`}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleDelayEpisodeIndex(id)}
+                          aria-label={`Select topology ${id}`}
+                        />
+                      </td>
+                      <td>
+                        <code>{id}</code>
+                      </td>
+                      <td title={opt.topology_id || undefined}>{opt.topology_name || "—"}</td>
+                      <td>{opt.density_node_count ?? "—"}</td>
+                      <td>{opt.episode_count}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
       {showArtifactFilter ? (
         <div className="results-graph-controls batch-artifact-filter-row">
           <span className="field-label-span">Charts to show per density:</span>

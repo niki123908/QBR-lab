@@ -54,6 +54,7 @@ def build_qbr_run_bundle(
     gamma: float,
     completion_bonus_multiplier: float,
     coverage_reward_enabled: bool,
+    completion_exp_bonus_enabled: bool,
     lambda_param: float,
     trace_threshold: float,
     epsilon_end: float | None,
@@ -91,6 +92,7 @@ def build_qbr_run_bundle(
         "action_aggregation_mode": action_aggregation_mode,
         "completion_bonus_multiplier": completion_bonus_multiplier,
         "coverage_reward_enabled": bool(coverage_reward_enabled),
+        "completion_exp_bonus_enabled": bool(completion_exp_bonus_enabled),
         "lambda_param": lambda_param,
         "trace_threshold": trace_threshold,
         "epsilon_end": epsilon_end,
@@ -202,6 +204,44 @@ def build_cf_cas_run_bundle(
         "run_id": run_id,
         "metrics": summary_payload,
         "policy": {"policy_type": "cf_cas"},
+        "episodes": [{"episode": 1, "delay": delay, "total_reward": 0.0, "path_signature": ""}],
+        "transmission": {"last": transmission_payload, "best": transmission_payload},
+    }
+
+
+def build_milp_run_bundle(
+    *,
+    run_id: str,
+    summary_payload: dict[str, Any],
+    transmission_payload: dict[str, Any],
+    state_action_payload: dict[str, Any],
+) -> dict[str, Any]:
+    delay = int(state_action_payload.get("delay") or summary_payload.get("finished_delay") or 0)
+    return {
+        "schema_version": RUN_BUNDLE_SCHEMA_VERSION,
+        "algorithm_id": "milp",
+        "run_id": run_id,
+        "metrics": summary_payload,
+        "policy": {"policy_type": "milp"},
+        "episodes": [{"episode": 1, "delay": delay, "total_reward": 0.0, "path_signature": ""}],
+        "transmission": {"last": transmission_payload, "best": transmission_payload},
+    }
+
+
+def build_qbr_deploy_run_bundle(
+    *,
+    run_id: str,
+    summary_payload: dict[str, Any],
+    transmission_payload: dict[str, Any],
+    state_action_payload: dict[str, Any],
+) -> dict[str, Any]:
+    delay = int(state_action_payload.get("delay") or summary_payload.get("finished_delay") or 0)
+    return {
+        "schema_version": RUN_BUNDLE_SCHEMA_VERSION,
+        "algorithm_id": "qbr_deploy",
+        "run_id": run_id,
+        "metrics": summary_payload,
+        "policy": {"policy_type": "qbr_deploy"},
         "episodes": [{"episode": 1, "delay": delay, "total_reward": 0.0, "path_signature": ""}],
         "transmission": {"last": transmission_payload, "best": transmission_payload},
     }
