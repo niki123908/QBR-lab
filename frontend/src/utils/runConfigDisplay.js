@@ -53,6 +53,8 @@ export function formatConfigLabel(fieldName) {
 }
 
 export function formatEnumOptionLabel(fieldName, option) {
+  if (fieldName === "completion_bonus_mode") return option === "node_count" ? "Node count (B = N)" : "Fixed value";
+  if (fieldName === "spread_mode" && option === "energy") return "Energy";
   if (fieldName === "action_axis") {
     if (option === "broadcaster") return "Broadcaster";
     if (option === "receiver") return "Receiver";

@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
+from app.api.energy_routes import router as energy_router
 from app.core.db import init_db
 from app.core.errors import AppError
 
@@ -18,6 +19,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(energy_router, prefix="/api/energy")
     app.include_router(api_router, prefix="/api")
 
     @app.on_event("startup")

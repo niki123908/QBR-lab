@@ -1,3 +1,4 @@
+import { modeStorage } from "../appMode.js";
 import {
   DEFAULT_DECISION_TREE_EDGE_OPACITY,
   DEFAULT_DECISION_TREE_EDGE_SCALE,
@@ -16,7 +17,7 @@ function clampNum(value, min, max, fallback) {
 
 export function readStoredDecisionTreeLayout() {
   try {
-    const raw = localStorage.getItem(DECISION_TREE_LAYOUT_STORAGE_KEY);
+    const raw = modeStorage.getItem(DECISION_TREE_LAYOUT_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
@@ -41,7 +42,7 @@ export function saveDecisionTreeLayoutAsDefault(layout) {
     edgeOpacity: clampNum(layout.edgeOpacity, 0.15, 1, DEFAULT_DECISION_TREE_EDGE_OPACITY),
     savedAt: new Date().toISOString()
   };
-  localStorage.setItem(DECISION_TREE_LAYOUT_STORAGE_KEY, JSON.stringify(payload));
+  modeStorage.setItem(DECISION_TREE_LAYOUT_STORAGE_KEY, JSON.stringify(payload));
   return payload;
 }
 

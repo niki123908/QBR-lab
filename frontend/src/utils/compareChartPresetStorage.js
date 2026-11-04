@@ -1,3 +1,4 @@
+import { modeStorage } from "../appMode.js";
 import { normalizeCompareChartMode } from "./compareChartSides.js";
 
 const PRESET_STORAGE_KEY = "qbr.compare-chart-presets";
@@ -49,7 +50,7 @@ function sanitizePresetEntry(raw) {
 
 export function readChartPresets() {
   try {
-    const raw = localStorage.getItem(PRESET_STORAGE_KEY);
+    const raw = modeStorage.getItem(PRESET_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -61,7 +62,7 @@ export function readChartPresets() {
 
 function writeChartPresets(presets) {
   try {
-    localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets.slice(0, MAX_PRESETS)));
+    modeStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets.slice(0, MAX_PRESETS)));
   } catch {
     /* ignore */
   }

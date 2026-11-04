@@ -1,3 +1,4 @@
+import { modeStorage } from "../appMode.js";
 const STORAGE_KEY = "qbr.compare-workspace";
 
 const COMPARE_KINDS = new Set(["batch", "single", "repeat", "chart"]);
@@ -8,7 +9,7 @@ function normalizeCompareKind(value) {
 
 export function readCompareWorkspaceSession() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = modeStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
@@ -26,7 +27,7 @@ export function readCompareWorkspaceSession() {
 
 export function writeCompareWorkspaceSession(session) {
   try {
-    localStorage.setItem(
+    modeStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         version: 2,

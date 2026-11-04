@@ -6,6 +6,7 @@
   --text-muted: #7a809c;
   --border: #e8e9f3;
   --accent: #7e6df2;
+  --accent-rgb: 126, 109, 242;
   --accent-soft: #ede9ff;
   --shadow-sm: 0 4px 14px rgba(20, 24, 40, 0.05);
   --shadow-md: 0 12px 28px rgba(32, 37, 72, 0.08);
@@ -102,7 +103,7 @@ select {
 
 .panel-resizer:hover,
 .panel-resizer:active {
-  background: rgba(126, 109, 242, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 
 .panel-resizer--disabled {
@@ -183,7 +184,7 @@ body.panel-resize-active * {
 .nav-item.active {
   background: var(--accent);
   color: #fff;
-  box-shadow: 0 8px 18px rgba(126, 109, 242, 0.35);
+  box-shadow: 0 8px 18px rgba(var(--accent-rgb), 0.35);
 }
 
 .utility-card {
@@ -247,7 +248,7 @@ body.panel-resize-active * {
 .field-label select:focus,
 .field-label input:not([type="checkbox"]):focus {
   border-color: #c7c1f4;
-  box-shadow: 0 0 0 3px rgba(126, 109, 242, 0.12);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.12);
 }
 
 .topology-list-card ul {
@@ -306,7 +307,7 @@ body.panel-resize-active * {
 }
 
 .batch-topology-list li.active {
-  background: rgba(126, 109, 242, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
   color: #5f4cdf;
 }
 
@@ -426,7 +427,7 @@ body.panel-resize-active * {
 }
 
 .view-mode-toggle button.active {
-  background: #7e6df2;
+  background: var(--accent);
   color: #fff;
 }
 
@@ -459,7 +460,7 @@ body.panel-resize-active * {
 }
 
 .generate-mode-toggle button.active {
-  background: #7e6df2;
+  background: var(--accent);
   color: #fff;
 }
 
@@ -1427,8 +1428,8 @@ body.panel-resize-active * {
 }
 
 .batch-menu-item.active {
-  background: rgba(126, 109, 242, 0.1);
-  border-color: rgba(126, 109, 242, 0.2);
+  background: rgba(var(--accent-rgb), 0.1);
+  border-color: rgba(var(--accent-rgb), 0.2);
 }
 
 .batch-select-btn {
@@ -1507,7 +1508,7 @@ body.panel-resize-active * {
 }
 
 .secondary-cta.is-on {
-  background: #ede9ff;
+  background: var(--accent-soft);
   border-color: #c7bef8;
   color: #4f40b8;
 }
@@ -1889,11 +1890,11 @@ body.panel-resize-active * {
 }
 
 .batch-delay-path-table thead th:first-child {
-  background: rgba(126, 109, 242, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 .batch-delay-path-table thead th {
-  background: rgba(126, 109, 242, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
   font-weight: 600;
 }
 
@@ -2214,7 +2215,7 @@ body.panel-resize-active * {
 }
 
 .worker-row-toolbar--open .batch-toggle.worker-toggle {
-  background: rgba(126, 109, 242, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
   color: #5f4cdf;
 }
 
@@ -2730,8 +2731,8 @@ body.panel-resize-active * {
 }
 
 .run-dropdown-item.active {
-  background: rgba(126, 109, 242, 0.1);
-  border-color: rgba(126, 109, 242, 0.2);
+  background: rgba(var(--accent-rgb), 0.1);
+  border-color: rgba(var(--accent-rgb), 0.2);
 }
 
 .run-dropdown-select-btn {
@@ -3242,7 +3243,7 @@ body.panel-resize-active * {
 
 .topology-card.selected {
   border-color: #b5a8ff;
-  box-shadow: 0 0 0 3px rgba(126, 109, 242, 0.15), 0 10px 20px rgba(126, 109, 242, 0.2);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.15), 0 10px 20px rgba(var(--accent-rgb), 0.2);
 }
 
 .topology-card-checkbox {
@@ -3406,7 +3407,7 @@ body.panel-resize-active * {
   height: 18px;
   background: transparent;
   cursor: pointer;
-  accent-color: #b9abff;
+  accent-color: var(--accent);
 }
 
 .temperature-slider-field input[type="range"]::-webkit-slider-runnable-track {
@@ -4107,7 +4108,7 @@ body.panel-resize-active * {
 
 .primary-cta:hover {
   filter: brightness(1.03);
-  box-shadow: 0 10px 20px rgba(126, 109, 242, 0.3);
+  box-shadow: 0 10px 20px rgba(var(--accent-rgb), 0.3);
 }
 
 .primary-cta:disabled {
@@ -4594,3 +4595,71 @@ body.panel-resize-active * {
     overflow: auto;
   }
 }
+
+/* Energy workspace theme */
+:root[data-mode="energy"] {
+  --bg: #f1faf4;
+  --card-soft: #f8fdf9;
+  --text: #142d22;
+  --text-muted: #6a8274;
+  --border: #dceee1;
+  --accent: #20a864;
+  --accent-rgb: 32, 168, 100;
+  --accent-soft: #e0f7e8;
+  --shadow-sm: 0 4px 14px rgba(22, 83, 46, 0.05);
+  --shadow-md: 0 12px 28px rgba(22, 83, 46, 0.08);
+}
+html[data-mode="energy"] body {
+  background: linear-gradient(150deg, #f6fff8 0%, #eaf8ee 100%);
+}
+.brand-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mode-switch {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  width: 44px; height: 26px; padding: 3px; border: 1px solid var(--border);
+  border-radius: 999px; background: #e4e3ee; cursor: pointer;
+  transition: background 160ms ease;
+}
+.mode-switch span {
+  width: 18px; height: 18px; border-radius: 50%; background: white;
+  box-shadow: 0 1px 4px #0002; transition: transform 160ms ease;
+}
+.mode-switch[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
+.mode-switch[aria-checked="true"] span { transform: translateX(18px); }
+.mode-switch:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+html[data-mode="energy"] input { accent-color: var(--accent); }
+
+html[data-mode="energy"] .temperature-slider-field input[type="range"]::-webkit-slider-runnable-track {
+  background: linear-gradient(90deg, #d7f6e2, #b6edcc); border-color: #a0dfba;
+}
+html[data-mode="energy"] .temperature-slider-field input[type="range"]::-webkit-slider-thumb {
+  background: #41c47d; border-color: #20a864; box-shadow: 0 1px 3px #16844833;
+}
+html[data-mode="energy"] .temperature-slider-field input[type="range"]::-moz-range-track {
+  background: #d7f6e2; border-color: #a0dfba;
+}
+html[data-mode="energy"] .temperature-slider-field input[type="range"]::-moz-range-thumb {
+  background: #41c47d; border-color: #20a864;
+}
+html[data-mode="energy"] .temperature-chart,
+html[data-mode="energy"] .temperature-bar-track { background: linear-gradient(180deg, #f7fdf9, #e7f6ec); }
+html[data-mode="energy"] .temperature-bar-fill { background: linear-gradient(180deg, #74dda2, #22a965); }
+html[data-mode="energy"] .temperature-bar-fill.top { background: linear-gradient(180deg, #47ce80, #137f49); }
+html[data-mode="energy"] .temperature-table th,
+html[data-mode="energy"] .temperature-table-total-row td,
+html[data-mode="energy"] .workers-dropdown-toggle { background: #edf8f0; }
+html[data-mode="energy"] .temperature-table tbody tr:nth-child(even) { background: #f7fcf8; }
+
+.energy-generation-fields { border: 1px solid var(--border); border-radius: 14px; background: var(--card-soft); padding: 16px; margin: 0 0 18px; }
+.energy-generation-fields legend { color: var(--accent); font-weight: 700; padding: 0 6px; }
+.energy-fields-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.energy-generation-fields .muted { margin-bottom: 0; font-size: 12px; }
+
+.energy-display-switch { display: flex; gap: 4px; margin: 8px 0 12px; }
+.energy-display-switch button { flex: 1; padding: 7px 4px; border: 1px solid #cbd5e1; border-radius: 7px; background: white; cursor: pointer; }
+.energy-display-switch button[aria-pressed="true"] { background: #22a66b; border-color: #22a66b; color: white; }
+
+
+[data-mode="energy"] .playground-decision-tree-block,
+[data-mode="energy"] .playground-tree-layout-block { display:none; }
+.energy-cost-float { animation: energy-cost-rise 1.4s ease-out forwards; }
+@keyframes energy-cost-rise { from { opacity:1; transform:translateY(0); } to { opacity:0; transform:translateY(-9px); } }

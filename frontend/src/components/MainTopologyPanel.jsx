@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { downloadEnergyGif } from "../export/energyGifExport.js";
+import { EnergyDisplayContext, rateFraction, rateColor } from "../utils/energyDisplay.js";
+import EnergyGenerationFields from "./EnergyGenerationFields.jsx";
+import { modeStorage, IS_ENERGY_MODE } from "../appMode.js";
+import { useContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BatchGridSection,
   FocusedTopologySection,
@@ -483,7 +488,7 @@ function TemperatureToolWorkspace({
             <tbody>
               {rows.map((row) => (
                 <tr key={`temperature-row-${row.action}`}>
-                  <td>{row.action}</td>
+                  <td>{IS_ENERGY_MODE && row.action === -1 ? "WAIT" : row.action}</td>
                   <td>{row.qValue.toFixed(2)}</td>
                   <td>{Number.isFinite(row.logit) ? row.logit.toFixed(4) : "-"}</td>
                   <td>{(row.probability * 100).toFixed(2)}%</td>
@@ -757,7 +762,7 @@ function UcbToolWorkspace({
             <tbody>
               {rows.map((row) => (
                 <tr key={`ucb-row-${row.action}`} className={row.selected ? "ucb-row-selected" : ""}>
-                  <td>{row.action}</td>
+                  <td>{IS_ENERGY_MODE && row.action === -1 ? "WAIT" : row.action}</td>
                   <td>{row.qValue.toFixed(2)}</td>
                   <td>{row.unvisited ? "0" : row.visitCount}</td>
                   <td>{row.unvisited ? "-" : row.bonus.toFixed(4)}</td>
@@ -1133,8 +1138,12 @@ function TopologyGraph({
   hoveredNodeId = null,
   autoFitToBounds = false,
   latencyAheadById = null,
-  showLatencyAhead = false
+  showLatencyAhead = false,
+  energySnapshot = null,
+  energyEffects = null,
+  energyAnimate = false
 }) {
+  const energyStyle = useContext(EnergyDisplayContext);
   if (!graph) {
     return <div className={`topology-thumb ${className}`} />;
   }
@@ -1308,7 +1317,7 @@ function TopologyGraph({
         </defs>
         <rect x="0" y="0" width={width} height={height} fill="#f7f8fd" />
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${scale})`} transformOrigin={`${width / 2} ${height / 2}`}>
-          {edges.map((edge, idx) => (
+          {edges.filter(edge => edge.directed || edge.lbPath || !energySnapshot?.received || !(edge.from.node_id in energySnapshot.received && edge.to.node_id in energySnapshot.received)).map((edge, idx) => (
             <line
               key={edge.key ?? `${edge.from.node_id}-${edge.to.node_id}-${idx}`}
               x1={edge.from.x}
@@ -1325,13 +1334,26 @@ function TopologyGraph({
           {paintNodes.map((node) => {
             const isSource = node.node_id === 0;
             const radius = isSource ? resolvedSourceRadius : nodeRadius;
+            const fraction = energySnapshot ? (isSource ? null : Math.max(0, Math.min(1, (energySnapshot.energy[node.node_id] ?? 0) / graph.energy_defaults.capacity))) : IS_ENERGY_MODE ? rateFraction(node.harvest_rate, graph.energy_defaults) : null;
+            const rateMode = energySnapshot ? "battery" : IS_ENERGY_MODE ? energyStyle.energy_mode : "normal";
+            const color = fraction == null ? null : rateColor(
+              rateMode === "node" ? energyStyle.rate_node_low : energyStyle.battery_low,
+              rateMode === "node" ? energyStyle.rate_node_high : energyStyle.battery_high, fraction);
             const fill = isSource
               ? sourceNodeColor
-              : (nodeFillById[node.node_id] ?? "#9da5bf");
+              : (rateMode === "node" && color ? color : (nodeFillById[node.node_id] ?? "#9da5bf"));
             const labelX = node.x + Number(labelOffsetX);
             const labelY = height - node.y + Number(labelOffsetY);
             return (
             <g key={node.node_id}>
+              {IS_ENERGY_MODE && <title>{isSource ? "Source: unlimited energy" : energySnapshot ? `Energy: ${energySnapshot.energy[node.node_id] ?? 0} / ${graph.energy_defaults.capacity} EU` : `Harvest: ${node.harvest_rate ?? "—"} EU/slot`}</title>}
+              {rateMode === "battery" && fraction != null && !isSource && (
+                <g className="energy-rate-battery" transform={`translate(${node.x + energyStyle.battery_offset_x}, ${height - node.y + energyStyle.battery_offset_y})`}>
+                  <rect x={-1} y={-2.5} width={2} height={5} rx={0.3} fill="#ffffff" stroke="#64748b" strokeWidth={0.15} />
+                  <rect x={-0.4} y={-2.85} width={0.8} height={0.35} fill="#64748b" />
+                  {Array.from({ length: 5 }, (_, i) => <rect key={i} x={-0.7} y={1.5 - i * 0.9} width={1.4} height={0.7} rx={0.1} fill={i < (energySnapshot ? Math.ceil(fraction * 5) : Math.min(5, 1 + Math.floor(fraction * 5))) ? color : "#e2e8f0"} />)}
+                </g>
+              )}
               <circle
                 cx={node.x}
                 cy={height - node.y}
@@ -1345,6 +1367,15 @@ function TopologyGraph({
                 onMouseLeave={onNodeLeave ?? undefined}
                 onClick={onNodeClick && clickableIdSet.has(node.node_id) ? () => onNodeClick(node.node_id) : undefined}
               />
+              {energySnapshot && <text x={node.x} y={height-node.y+radius+2} textAnchor="middle" fontSize="1.7" fill="#334155">{isSource ? "∞" : `${Number(energySnapshot.energy[node.node_id] ?? 0).toFixed(1)} EU · ${Math.round(fraction*100)}%`}</text>}
+              {energyEffects && (() => {
+                const blocked = energyEffects.blocked?.includes(node.node_id);
+                const tx = energyEffects.transmitters?.includes(node.node_id);
+                const rx = energyEffects.energyResult?.rx?.includes(node.node_id);
+                if (!blocked && !tx && !rx) return null;
+                const cost = tx ? graph.energy_defaults.tx_cost : graph.energy_defaults.rx_cost;
+                return <text key={`${energyEffects.key ?? "preview"}-${node.node_id}`} x={node.x-radius-5} y={height-node.y-1} textAnchor="end" fontSize="2.6" fill={blocked ? "#eaa000" : "#dc2626"} pointerEvents="none" className={energyAnimate ? "energy-cost-float" : ""}>{blocked ? "⚡" : isSource ? "∞" : `−${Number((cost/graph.energy_defaults.capacity*100).toFixed(1))}%`}</text>;
+              })()}
               {showLabels ? (
                 <text
                   x={labelX}
@@ -1931,6 +1962,23 @@ export default function MainTopologyPanel({
   const maxReplaySlot = replayTimeslots.length;
   const replaySlotClamped =
     maxReplaySlot > 0 ? Math.min(Math.max(0, Number(replaySlot) || 0), maxReplaySlot) : 0;
+  const energyReplayActive = IS_ENERGY_MODE && resultsViewMode === "replay" && Boolean(replayTimeslots[0]?.energyResult);
+  const energyReplayStep = replaySlotClamped > 0 ? replayTimeslots[replaySlotClamped - 1] : null;
+  const energyReplaySnapshot = energyReplayActive
+    ? (energyReplayStep?.energyResult?.after ?? replayTimeslots[0]?.energyResult?.before)
+    : null;
+  // Replay percentages and costs use the run's resolved energy overrides.
+  const energyResultsGraph = useMemo(() => {
+    if (!IS_ENERGY_MODE || !focusedGraph) return focusedGraph;
+    return {...focusedGraph, energy_defaults: {
+      ...focusedGraph.energy_defaults,
+      ...(runSummaryPayload?.resolved_energy ?? {})
+    }};
+  }, [focusedGraph, runSummaryPayload?.resolved_energy]);
+  const energyReplayEffects = energyReplayActive && energyReplayStep ? {
+    ...energyReplayStep,
+    key: `${selectedRunId}-${resultsEpochMode}-${selectedEpisodeNum}-${replaySlotClamped}`
+  } : null;
   const coloredByTimeslot = useMemo(
     () => computeReceiveTimeslotMap(currentTransmissionPayload?.timeslots ?? []),
     [currentTransmissionPayload?.timeslots]
@@ -1946,8 +1994,9 @@ export default function MainTopologyPanel({
     [focusedGraph, currentTransmissionPayload?.timeslots, replaySlotClamped]
   );
   const replayEdges = useMemo(
-    () => buildReplayLayeredEdges(focusedGraph, currentTransmissionPayload?.timeslots ?? [], replaySlotClamped),
-    [focusedGraph, currentTransmissionPayload?.timeslots, replaySlotClamped]
+    () => buildReplayLayeredEdges(focusedGraph, currentTransmissionPayload?.timeslots ?? [], replaySlotClamped,
+      IS_ENERGY_MODE ? {hideBaseEdgesAtEnd: Boolean(energyReplaySnapshot?.completed)} : {}),
+    [focusedGraph, currentTransmissionPayload?.timeslots, replaySlotClamped, energyReplaySnapshot?.completed]
   );
   const resultsLowerBoundPathEdges = useMemo(
     () => (showResultsLowerBound && focusedGraph ? computeLowerBoundPathEdges(focusedGraph) : []),
@@ -1983,6 +2032,50 @@ export default function MainTopologyPanel({
     showResultsLowerBound,
     resultsLowerBoundOverlayEdges
   ]);
+  const [energyGifProgress, setEnergyGifProgress] = useState(null);
+  const [energyGifError, setEnergyGifError] = useState("");
+  async function exportEnergyGif() {
+    if (energyGifProgress !== null || !playgroundState?.isComplete || !focusedGraph) return;
+    setEnergyGifProgress(0);
+    setEnergyGifError("");
+    const slots = playgroundState.timeslots;
+    const graph = {...focusedGraph, energy_defaults:{...focusedGraph.energy_defaults,...playgroundState.energyOverrides}};
+    try {
+      await downloadEnergyGif({count:slots.length+1, filename:`${focusedTopo?.topology_name ?? "energy"}_playground`, onProgress:setEnergyGifProgress,
+        renderFrame: slot => {
+          const state = slots[slot-1]?.energyResult?.after ?? {energy:{},received:{0:0}};
+          const fills = {}, strokes = {}, strokeWidths = {};
+          if (showPlaygroundLowerBound) {
+            Object.entries(playgroundHopDist).forEach(([id,hop]) => { if(Number(id)!==0) fills[id]=colorForPlaygroundHopDistance(hop); });
+          } else {
+            Object.entries(computeReceiveTimeslotMap(slots.slice(0,slot))).forEach(([id,ts]) => { if(Number(id)!==0) fills[id]=colorForTimeslot(Number(ts),timeslotColors); });
+          }
+          const adjacency = buildAdjacencyFromGraph(graph);
+          if (!state.completed) graph.nodes.forEach(n => {
+            const id=n.node_id;
+            if (!(id in state.received) || (id!==0 && (state.energy[id]??0)<graph.energy_defaults.tx_cost)) return;
+            if(Array.from(adjacency.get(id)??[]).some(r => !(r in state.received) && (state.energy[r]??0)>=graph.energy_defaults.rx_cost)) {
+              strokes[id]="#d62839"; strokeWidths[id]=0.7;
+            }
+          });
+          const edges = showPlaygroundLowerBound ? [
+            ...buildEdges(graph.nodes,graph.tx_range).map(([from,to])=>({from:from.node_id,to:to.node_id,color:"#d0d5ea",width:graphStyleProps.edgeWidth})),
+            ...playgroundLowerBoundPathEdges.map((e,i)=>({from:e.from,to:e.to,color:LOWER_BOUND_PATH_COLOR,width:1.5,directed:false,lbPath:true,key:`lb-${i}`}))
+          ] : buildReplayLayeredEdges(graph,slots.slice(0,slot),slot,{hideBaseEdgesAtEnd:Boolean(state.completed)});
+          const current = slots[slot-1];
+          return renderToStaticMarkup(<EnergyDisplayContext.Provider value={graphDisplaySettings}><TopologyGraph
+            graph={graph} showLabels energySnapshot={state} nodeFillById={fills}
+            nodeStrokeById={strokes} nodeStrokeWidthById={strokeWidths} customEdges={edges}
+            energyEffects={current ?? null} energyAnimate={Boolean(current)}
+            nodeRadius={graphStyleProps.nodeRadius} labelSize={graphStyleProps.labelSize}
+            labelOffsetX={graphStyleProps.labelOffsetX} labelOffsetY={graphStyleProps.labelOffsetY}
+            edgeWidth={graphStyleProps.edgeWidth} edgeOpacity={graphStyleProps.edgeOpacity}
+            sourceNodeColor={sourceNodeColor} sourceNodeRadius={sourceNodeRadius}
+          /></EnergyDisplayContext.Provider>);
+        }});
+    } catch(error) { setEnergyGifError(error.message || "GIF export failed."); }
+    finally { setEnergyGifProgress(null); }
+  }
   const playgroundLatestSlot = playgroundState?.timeslots?.length ?? 0;
   const playgroundViewSlot = Math.min(Math.max(0, Number(playgroundState?.viewSlot) || 0), playgroundLatestSlot);
   const playgroundHopDist = useMemo(
@@ -1994,7 +2087,7 @@ export default function MainTopologyPanel({
     [playgroundHopDist, focusedTopo?.lower_bound]
   );
   const playgroundIsLatestView = playgroundViewSlot === playgroundLatestSlot;
-  const playgroundActionLocked = !playgroundIsLatestView || Boolean(playgroundState?.isComplete);
+  const playgroundActionLocked = !playgroundIsLatestView || Boolean(playgroundState?.isComplete) || (IS_ENERGY_MODE && playgroundLatestSlot >= 100);
   const playgroundPreview = playgroundActionLocked ? null : playgroundState?.hoverPreview ?? null;
   const playgroundCandidateIds = useMemo(() => {
     if (!focusedGraph || playgroundActionLocked) return [];
@@ -2012,8 +2105,14 @@ export default function MainTopologyPanel({
       });
       return Array.from(receiverSet).sort((a, b) => a - b);
     }
-    return broadcasterCandidates;
-  }, [focusedGraph, playgroundActionLocked, playgroundState?.coveredNodeIds, playgroundState?.mode]);
+    if (!IS_ENERGY_MODE) return broadcasterCandidates;
+    const energy = playgroundState?.timeslots?.at(-1)?.energyResult?.after?.energy ?? {};
+    const config = {...focusedGraph.energy_defaults, ...playgroundState?.energyOverrides};
+    return broadcasterCandidates.filter(id =>
+      (id === 0 || (energy[id] ?? 0) >= config.tx_cost) &&
+      Array.from(adjacency.get(id) ?? []).some(receiver =>
+        !committedCovered.has(receiver) && (energy[receiver] ?? 0) >= config.rx_cost));
+  }, [focusedGraph, playgroundActionLocked, playgroundState?.coveredNodeIds, playgroundState?.mode, playgroundState?.timeslots, playgroundState?.energyOverrides]);
   const playgroundLowerBoundPathEdges = useMemo(
     () => (showPlaygroundLowerBound && focusedGraph ? computeLowerBoundPathEdges(focusedGraph) : []),
     [showPlaygroundLowerBound, focusedGraph]
@@ -2034,7 +2133,7 @@ export default function MainTopologyPanel({
         from: from.node_id,
         to: to.node_id,
         color: "#d0d5ea",
-        width: PLAYGROUND_EDGE_WIDTH
+        width: IS_ENERGY_MODE ? graphStyleProps.edgeWidth : PLAYGROUND_EDGE_WIDTH
       }));
       return [...baseEdges, ...lbEdges];
     }
@@ -2069,6 +2168,7 @@ export default function MainTopologyPanel({
     playgroundState?.timeslots,
     playgroundViewSlot,
     playgroundLowerBoundPathEdges,
+    graphStyleProps.edgeWidth,
     showPlaygroundLowerBound
   ]);
   const playgroundVisual = useMemo(() => {
@@ -2316,7 +2416,7 @@ export default function MainTopologyPanel({
   }, [batchRunResults]);
   /** Multi batch detail: which chart groups to show — not a per-density filter. */
   const [batchArtifactFilter, setBatchArtifactFilter] = useState(() => "all");
-  const isRunDerivedTreeMode = playgroundTreeMode === "run";
+  const isRunDerivedTreeMode = !IS_ENERGY_MODE && playgroundTreeMode === "run";
   const [highlightMergedTransitions, setHighlightMergedTransitions] = useState(false);
 
   const handleExportDecisionTreeJpg = useCallback(async () => {
@@ -2363,7 +2463,7 @@ export default function MainTopologyPanel({
 
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem(RUN_TOPO_PRESET_STORAGE_KEY);
+      const raw = modeStorage.getItem(RUN_TOPO_PRESET_STORAGE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return;
@@ -2761,6 +2861,7 @@ export default function MainTopologyPanel({
 
           {generateMode === "single" ? (
             <form className="generate-form-wrap" onSubmit={handleGenerate}>
+              {IS_ENERGY_MODE && <EnergyGenerationFields value={generateForm.energy} onChange={(energy) => updateGenerateField("energy", energy)} />}
               <div className="generate-inline-form">
                 <label className="field-label">
                   Nodes
@@ -2870,6 +2971,7 @@ export default function MainTopologyPanel({
             </form>
           ) : (
             <form className="generate-form-wrap" onSubmit={handleGenerateMulti}>
+              {IS_ENERGY_MODE && <EnergyGenerationFields value={multiGenerateForm.energy} onChange={(energy) => updateMultiGenerateField("energy", energy)} />}
               <div className="multi-node-grid">
                 {nodeOptions.map((n) => (
                   <label key={n} className="multi-node-option">
@@ -3434,7 +3536,7 @@ export default function MainTopologyPanel({
                   ) : null}
                 </div>
               </div>
-              {selectedRun?.status === "done" &&
+              {!IS_ENERGY_MODE && selectedRun?.status === "done" &&
               selectedRun?.algorithm_id === "qbr" &&
               typeof onDeployRunFromQTable === "function" ? (
                 <div className="batch-progress-actions" style={{ marginBottom: "0.75rem" }}>
@@ -3456,11 +3558,15 @@ export default function MainTopologyPanel({
               Number.isFinite(Number(selectedRun.rollout_runtime_ms)) ? (
                 <p className="muted">
                   Deploy rollout runtime: <strong>{Number(selectedRun.rollout_runtime_ms).toFixed(2)} ms</strong>
-                  {Number.isFinite(Number(selectedRun.finished_delay))
+                  {selectedRun.finished_delay != null && Number.isFinite(Number(selectedRun.finished_delay))
                     ? ` · delay ${selectedRun.finished_delay}`
                     : ""}
                 </p>
               ) : null}
+              {IS_ENERGY_MODE && selectedRun?.status === "done" && <p className="muted">
+                Completed episodes: {selectedRun.completed_episodes ?? "—"} / {selectedRun.run_config?.episodes ?? (selectedRun.algorithm_id === "greedy" ? 1 : "—")}.
+                {selectedRun.truncated ? " Last episode reached the 100-slot limit without completing broadcast." : " Last episode completed broadcast."}
+              </p>}
               {latestHistoryRun?.status === "failed" ? (
                 <p className="action-space-stale-hint run-failed-hint">
                   Run gần nhất <strong>thất bại</strong>
@@ -3483,7 +3589,10 @@ export default function MainTopologyPanel({
               ) : null}
               <div className="hero-canvas-wrap full">
                 <TopologyGraph
-                  graph={focusedGraph}
+                  graph={energyResultsGraph}
+                  energySnapshot={energyReplaySnapshot}
+                  energyEffects={energyReplayEffects}
+                  energyAnimate={energyReplayActive}
                   className="full-graph"
                   interactive
                   showLabels
@@ -3567,7 +3676,7 @@ export default function MainTopologyPanel({
                                 <td className="qtable-statehash-cell" title={row.state_hash}>
                                   {row.state_hash}
                                 </td>
-                                <td>{row.action}</td>
+                                <td>{IS_ENERGY_MODE && row.action === -1 ? "WAIT" : row.action}</td>
                                 <td>{Number.isFinite(row.q_value) ? row.q_value.toFixed(4) : "-"}</td>
                               </tr>
                             ))}
@@ -3884,6 +3993,7 @@ export default function MainTopologyPanel({
               {isTopologyPlayground ? (
                 <div className="playground-shell" ref={playgroundShellRef}>
                   <div className="playground-topo-metrics-bar">
+                    {IS_ENERGY_MODE && <><button type="button" className="secondary-cta" disabled={playgroundActionLocked} onClick={() => commitPlaygroundNode(null)}>Wait · +1 slot</button><span>Energy · slot {playgroundViewSlot}/100 · pin = năng lượng hiện tại</span><button type="button" className="secondary-cta" disabled={!playgroundState?.isComplete || energyGifProgress !== null} onClick={exportEnergyGif} title="Xuất từ slot 0 đến Done, 2 giây mỗi slot, giữ hiệu ứng">{energyGifProgress !== null ? `Exporting GIF… ${energyGifProgress}/${playgroundLatestSlot+1}` : "Export GIF · 2s/slot"}</button>{energyGifError && <span role="alert">{energyGifError}</span>}</>}
                     {showPlaygroundLowerBound ? (
                       <span className="playground-metric-pill">
                         Lower bound: <strong>{playgroundLowerBoundValue}</strong>
@@ -3899,14 +4009,20 @@ export default function MainTopologyPanel({
                     </label>
                   </div>
                   <TopologyGraph
-                    graph={focusedGraph}
+                    graph={IS_ENERGY_MODE && playgroundState?.energyOverrides ? {...focusedGraph, energy_defaults:{...focusedGraph.energy_defaults,...playgroundState.energyOverrides}} : focusedGraph}
+                    energySnapshot={IS_ENERGY_MODE ? (playgroundState?.timeslots?.[playgroundViewSlot-1]?.energyResult?.after ?? {energy:{},received:{0:0}}) : null}
+                    energyEffects={IS_ENERGY_MODE ? (playgroundPreview ?? (playgroundIsLatestView ? playgroundState?.energyAnimation : null)) : null}
+                    energyAnimate={IS_ENERGY_MODE && !playgroundPreview}
                     className="full-graph"
                     interactive
                     showLabels
-                    autoFitToBounds
-                    nodeRadius={PLAYGROUND_NODE_RADIUS}
-                    labelSize={PLAYGROUND_LABEL_SIZE}
-                    edgeWidth={PLAYGROUND_EDGE_WIDTH}
+                    autoFitToBounds={!IS_ENERGY_MODE}
+                    nodeRadius={IS_ENERGY_MODE ? graphStyleProps.nodeRadius : PLAYGROUND_NODE_RADIUS}
+                    labelSize={IS_ENERGY_MODE ? graphStyleProps.labelSize : PLAYGROUND_LABEL_SIZE}
+                    labelOffsetX={IS_ENERGY_MODE ? graphStyleProps.labelOffsetX : 0}
+                    labelOffsetY={IS_ENERGY_MODE ? graphStyleProps.labelOffsetY : 0}
+                    edgeOpacity={IS_ENERGY_MODE ? graphStyleProps.edgeOpacity : 1}
+                    edgeWidth={IS_ENERGY_MODE ? graphStyleProps.edgeWidth : PLAYGROUND_EDGE_WIDTH}
                     edgeColor="#d0d5ea"
                     sourceNodeColor={sourceNodeColor}
                     sourceNodeRadius={sourceNodeRadius}

@@ -152,8 +152,8 @@ function delaysFromResult(result, key) {
 function countConvergedRuns(result) {
   return (result?.topologies ?? []).filter((t) => {
     if (t.status !== "done") return false;
-    const last = Number(t.last_delay);
-    const best = Number(t.best_delay);
+    const last = Number(t.last_delay ?? NaN);
+    const best = Number(t.best_delay ?? NaN);
     return Number.isFinite(last) && Number.isFinite(best) && last === best;
   }).length;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { IS_ENERGY_MODE, toggleAppMode } from "../appMode.js";
 import QueueWorkersPanel from "./QueueWorkersPanel";
 import { sortBatchesWithTopologies } from "../utils/topologyNameSort.js";
 
@@ -44,10 +45,14 @@ export default function DashboardSidebar({
   return (
     <aside className="dashboard-sidebar">
       <section className="sidebar-card brand-card">
+        <div className="brand-heading">
         <button type="button" className="brand-home-btn" onClick={onGoHome}>
           <span className="brand-title">QBR</span>
         </button>
-        <div className="brand-subtitle">Broadcast Lab</div>
+        <button type="button" role="switch" aria-label="Energy mode" aria-checked={IS_ENERGY_MODE}
+          className="mode-switch" onClick={toggleAppMode}><span /></button>
+        </div>
+        <div className="brand-subtitle">{IS_ENERGY_MODE ? "energy mode" : "Broadcast Lab"}</div>
       </section>
 
       <section className="sidebar-card nav-card">

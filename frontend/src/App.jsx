@@ -1,3 +1,6 @@
+import { EnergyDisplayContext } from "./utils/energyDisplay.js";
+import { DEFAULT_ENERGY } from "./components/EnergyGenerationFields.jsx";
+import { modeStorage, IS_ENERGY_MODE } from "./appMode.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DashboardSidebar from "./components/DashboardSidebar";
 import MainTopologyPanel from "./components/MainTopologyPanel";
@@ -25,6 +28,8 @@ import {
   writeGraphDisplaySettings
 } from "./utils/graphDisplaySettings.js";
 import {
+  DEFAULT_SOURCE_NODE_COLOR,
+  DEFAULT_SOURCE_NODE_RADIUS,
   readSourceNodeAppearance,
   writeSourceNodeAppearance
 } from "./utils/sourceNodeAppearanceStorage.js";
@@ -48,7 +53,7 @@ const ACTIVE_MENU_IDS = new Set([
 
 function readStoredActiveMenu() {
   try {
-    const value = localStorage.getItem(ACTIVE_MENU_STORAGE_KEY);
+    const value = modeStorage.getItem(ACTIVE_MENU_STORAGE_KEY);
     return ACTIVE_MENU_IDS.has(value) ? value : "home";
   } catch {
     return "home";
@@ -68,7 +73,7 @@ function clampPanelWidth(value, min, max) {
 
 function readStoredPanelLayout() {
   try {
-    const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
+    const raw = modeStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
     if (!raw) {
       return { sidebarWidth: SIDEBAR_WIDTH_DEFAULT, rightPanelWidth: RIGHT_PANEL_WIDTH_DEFAULT };
     }
@@ -103,6 +108,7 @@ function resolveBackboneId(algorithmId) {
 }
 
 const INITIAL_GENERATE_FORM = {
+  ...(IS_ENERGY_MODE ? { energy: { ...DEFAULT_ENERGY } } : {}),
   num_nodes: 50,
   space_width: 100,
   space_height: 100,
@@ -115,6 +121,7 @@ const INITIAL_GENERATE_FORM = {
   max_retry: 200
 };
 const INITIAL_MULTI_GENERATE_FORM = {
+  ...(IS_ENERGY_MODE ? { energy: { ...DEFAULT_ENERGY } } : {}),
   node_counts: [50, 100],
   count_per_node_count: 2,
   space_width: 100,
@@ -226,6 +233,7 @@ export function playgroundStateHash(coveredNodeIds) {
 }
 
 function countUniqueNextPlaygroundStates(graph, coveredNodeIds, mode, spreadMode = "normal") {
+  if (IS_ENERGY_MODE) return 0;
   if (!graph) return 0;
   const { broadcasterCandidates, receiverCandidates } = derivePlaygroundCandidates(graph, coveredNodeIds);
   const actions = mode === "receiver" ? receiverCandidates : broadcasterCandidates;
@@ -449,10 +457,14 @@ export default function App() {
 
   function resetGraphDisplaySettings() {
     setGraphDisplaySettings(INITIAL_GRAPH_DISPLAY_SETTINGS);
+    if (IS_ENERGY_MODE) {
+      setSourceNodeAppearance(writeSourceNodeAppearance({ color: DEFAULT_SOURCE_NODE_COLOR, radius: DEFAULT_SOURCE_NODE_RADIUS }));
+    }
     setBestDelayOverlayOpacity(1);
   }
 
   function resetPlaygroundState() {
+    energyRequestVersion.current++;
     setPlaygroundState(INITIAL_PLAYGROUND_STATE);
   }
 
@@ -959,7 +971,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      LEGACY_PRESET_LOCAL_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
+      LEGACY_PRESET_LOCAL_STORAGE_KEYS.forEach((key) => modeStorage.removeItem(key));
     } catch {
       // ignore
     }
@@ -1193,7 +1205,7 @@ export default function App() {
     if (activeMenu !== "topologies" || activePanel2Tab !== "playground" || !topologyId) {
       return;
     }
-    fetchPlaygroundTree(topologyId);
+    if (!IS_ENERGY_MODE) fetchPlaygroundTree(topologyId);
   }, [selectedTopology?.topology_id, focusedTopologyId, activeMenu, activePanel2Tab]);
 
   useEffect(() => {
@@ -1207,7 +1219,7 @@ export default function App() {
     ) {
       return;
     }
-    fetchRunDerivedPlaygroundTree(topologyId, playgroundRunSourceId);
+    if (!IS_ENERGY_MODE) fetchRunDerivedPlaygroundTree(topologyId, playgroundRunSourceId);
   }, [
     selectedTopology?.topology_id,
     focusedTopologyId,
@@ -1390,6 +1402,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ...(IS_ENERGY_MODE ? { energy: multiGenerateForm.energy } : {}),
           node_counts: multiGenerateForm.node_counts,
           count_per_node_count: Number(multiGenerateForm.count_per_node_count),
           space_width: Number(multiGenerateForm.space_width),
@@ -1684,14 +1697,16 @@ export default function App() {
   }
 
   function setPlaygroundSpreadMode(spreadMode) {
+    energyRequestVersion.current++;
     setPlaygroundState((prev) => ({
       ...prev,
-      spreadMode: spreadMode === "la" ? "la" : "normal",
+      spreadMode: IS_ENERGY_MODE ? (spreadMode === "energy" ? "energy" : "normal") : (spreadMode === "la" ? "la" : "normal"),
       hoverPreview: null
     }));
   }
 
   function setPlaygroundViewSlot(slot) {
+    energyRequestVersion.current++;
     setPlaygroundState((prev) => ({
       ...prev,
       viewSlot: Math.max(0, Math.min(Number(slot) || 0, prev.timeslots.length)),
@@ -1699,7 +1714,50 @@ export default function App() {
     }));
   }
 
+  const energyRequestVersion = useRef(0);
+  const energyCommitBusy = useRef(false);
+  useEffect(() => {
+    if (!IS_ENERGY_MODE || !playgroundState.energyAnimation) return;
+    const key = playgroundState.energyAnimation.key;
+    const timer = setTimeout(() => setPlaygroundState(prev => prev.energyAnimation?.key === key ? {...prev, energyAnimation:null} : prev), 1450);
+    return () => clearTimeout(timer);
+  }, [playgroundState.energyAnimation?.key]);
+
+  function applyPlaygroundEnergy(energy) {
+    energyRequestVersion.current++;
+    setPlaygroundState(prev => ({...INITIAL_PLAYGROUND_STATE, spreadMode:prev.spreadMode, energyOverrides:energy}));
+  }
+  async function energyPlaygroundAction(nodeId, commit = false) {
+    const topoId = selectedTopology?.topology_id ?? focusedTopologyId;
+    const prev = playgroundState;
+    if (!topoId || energyCommitBusy.current || prev.isComplete || prev.timeslots.length >= 100 || prev.viewSlot !== prev.timeslots.length) return;
+    const version = ++energyRequestVersion.current;
+    if (commit) energyCommitBusy.current = true;
+    try {
+      const response = await fetch(`${API_BASE}/topologies/${topoId}/playground-step`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({actions: prev.timeslots.map(s => ({first_pick: s.firstPick ?? null, spread_mode: s.spreadMode ?? "normal"})), first_pick: nodeId, spread_mode: prev.spreadMode ?? "normal", energy: prev.energyOverrides ?? null})
+      });
+      const data = await response.json();
+      if (version !== energyRequestVersion.current) return;
+      if (!response.ok) { if(commit) setMessage(data.message || "Cannot execute slot."); return; }
+      setPlaygroundState(current => {
+        if (current.timeslots !== prev.timeslots) return current;
+        if (!commit) return {...current, hoverPreview: {nodeId, ...data}};
+        const result = data.energyResult;
+        return {...current, mode:"broadcaster",
+          timeslots:[...current.timeslots,{...data,timeslot:result.slot}],
+          currentSlot:result.slot, viewSlot:result.slot,
+          coveredNodeIds:Object.keys(result.after.received).map(Number),
+          hoverPreview:null, isComplete:result.after.completed, isTruncated:result.after.truncated,
+          energyAnimation: {...data, key:Date.now()}};
+      });
+    } catch { if(commit) setMessage("Cannot reach Energy environment."); }
+    finally { if(commit) energyCommitBusy.current = false; }
+  }
+
   function setPlaygroundHoverNode(nodeId) {
+    if (IS_ENERGY_MODE) { void energyPlaygroundAction(nodeId); return; }
     const topologyId = selectedTopology?.topology_id;
     if (!topologyId) return;
     const graph = graphByTopologyId[topologyId] ?? graphByTopologyId[focusedTopologyId];
@@ -1726,10 +1784,12 @@ export default function App() {
   }
 
   function clearPlaygroundHoverPreview() {
+    if (IS_ENERGY_MODE && !energyCommitBusy.current) energyRequestVersion.current++;
     setPlaygroundState((prev) => (prev.hoverPreview === null ? prev : { ...prev, hoverPreview: null }));
   }
 
   function commitPlaygroundNode(nodeId) {
+    if (IS_ENERGY_MODE) { void energyPlaygroundAction(nodeId, true); return; }
     const topologyId = selectedTopology?.topology_id;
     if (!topologyId) return;
     const graph = graphByTopologyId[topologyId] ?? graphByTopologyId[focusedTopologyId];
@@ -2681,7 +2741,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(
+    modeStorage.setItem(
       PANEL_LAYOUT_STORAGE_KEY,
       JSON.stringify({ sidebarWidth, rightPanelWidth })
     );
@@ -2689,7 +2749,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(ACTIVE_MENU_STORAGE_KEY, activeMenu);
+      modeStorage.setItem(ACTIVE_MENU_STORAGE_KEY, activeMenu);
     } catch {
       /* ignore */
     }
@@ -2746,6 +2806,7 @@ export default function App() {
       ) : null}
 
       <div className="dashboard-column dashboard-column--main">
+        <EnergyDisplayContext.Provider value={graphDisplaySettings}>
         <MainTopologyPanel
         activeMenu={activeMenu}
         activePanel2Tab={activePanel2Tab}
@@ -2840,8 +2901,8 @@ export default function App() {
         onBatchStop={handleBatchStop}
         onBatchResume={handleBatchResume}
         onBatchRetryFailed={handleBatchRetryFailed}
-        onDeployBatchFromQTable={handleDeployBatchFromQTable}
-        onDeployRunFromQTable={handleDeployRunFromQTable}
+        onDeployBatchFromQTable={IS_ENERGY_MODE ? undefined : handleDeployBatchFromQTable}
+        onDeployRunFromQTable={IS_ENERGY_MODE ? undefined : handleDeployRunFromQTable}
         onDeleteBatchRunResult={handleDeleteBatchRunResult}
         onRenameBatchRunResult={handleRenameBatchRunResult}
         graphByTopologyId={graphByTopologyId}
@@ -2859,6 +2920,8 @@ export default function App() {
         }
         setPlaygroundMode={setPlaygroundMode}
         setPlaygroundSpreadMode={setPlaygroundSpreadMode}
+          playgroundEnergySettings={playgroundState.energyOverrides ?? (graphByTopologyId[selectedTopology?.topology_id ?? focusedTopologyId]?.energy_defaults)}
+          applyPlaygroundEnergy={applyPlaygroundEnergy}
         setPlaygroundViewSlot={setPlaygroundViewSlot}
         setPlaygroundHoverNode={setPlaygroundHoverNode}
         clearPlaygroundHoverPreview={clearPlaygroundHoverPreview}
@@ -2945,6 +3008,7 @@ export default function App() {
         onOpenExportModal={() => openExportModal("main")}
         topologyImageExportRef={topologyImageExportRef}
       />
+        </EnergyDisplayContext.Provider>
       </div>
 
       {!hideRightPanel ? (
@@ -3051,6 +3115,8 @@ export default function App() {
           updateUcbFontScale={updateUcbFontScale}
           setPlaygroundMode={setPlaygroundMode}
           setPlaygroundSpreadMode={setPlaygroundSpreadMode}
+          playgroundEnergySettings={playgroundState.energyOverrides ?? (graphByTopologyId[selectedTopology?.topology_id ?? focusedTopologyId]?.energy_defaults)}
+          applyPlaygroundEnergy={applyPlaygroundEnergy}
           setPlaygroundViewSlot={setPlaygroundViewSlot}
           onResetPlayground={resetPlaygroundState}
           decisionTreeRowSpread={decisionTreeRowSpread}

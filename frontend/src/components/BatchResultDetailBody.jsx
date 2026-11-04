@@ -532,8 +532,8 @@ const DELAY_SCATTER_SERIES = [
 ];
 
 function isBestEqLastTopo(p) {
-  const best = Number(p.best_delay);
-  const last = Number(p.last_delay);
+  const best = Number(p.best_delay ?? NaN);
+  const last = Number(p.last_delay ?? NaN);
   return Number.isFinite(best) && Number.isFinite(last) && Math.abs(best - last) <= 1e-9;
 }
 
@@ -692,8 +692,8 @@ function DensityDelayScatterChart({ group, runLabel, yAxis, fitWidth = false }) 
           {points.map((p, idx) => {
             const x = xBase(idx);
             const hidden = hideBestEqLast && isBestEqLastTopo(p);
-            const best = Number(p.best_delay);
-            const last = Number(p.last_delay);
+            const best = Number(p.best_delay ?? NaN);
+            const last = Number(p.last_delay ?? NaN);
             const lower = Number(p.lower_bound);
             const hasBest = Number.isFinite(best);
             const hasLast = Number.isFinite(last);
@@ -954,8 +954,8 @@ export function MiniDelayPerEpisodeChart({ point }) {
   const series = Array.isArray(point?.delay_per_episode) ? point.delay_per_episode.filter((v) => Number.isFinite(Number(v))).map(Number) : [];
   if (!series.length) return null;
   const highlightStableBest =
-    Number.isFinite(Number(point?.last_delay)) &&
-    Number.isFinite(Number(point?.best_delay)) &&
+    Number.isFinite(Number(point?.last_delay ?? NaN)) &&
+    Number.isFinite(Number(point?.best_delay ?? NaN)) &&
     Number(point.last_delay) === Number(point.best_delay);
   const width = 220;
   const height = 108;

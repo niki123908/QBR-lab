@@ -1,3 +1,4 @@
+import { modeStorage } from "../appMode.js";
 import {
   COMPARE_SIDE_IDS,
   MAX_COMPARE_CHART_BATCHES,
@@ -62,7 +63,7 @@ function sanitizeChartConfigs(raw) {
 
 export function readCompareChartWorkspaceSession() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = modeStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
@@ -85,7 +86,7 @@ export function writeCompareChartWorkspaceSession({ slotCount, batchIds, chartCo
       batchIds: sanitizeBatchIds(batchIds),
       chartConfigs: sanitizeChartConfigs(chartConfigs)
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    modeStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch {
     /* quota / private mode */
   }
@@ -93,7 +94,7 @@ export function writeCompareChartWorkspaceSession({ slotCount, batchIds, chartCo
 
 export function clearCompareChartWorkspaceSession() {
   try {
-    localStorage.removeItem(STORAGE_KEY);
+    modeStorage.removeItem(STORAGE_KEY);
   } catch {
     /* ignore */
   }

@@ -1,3 +1,4 @@
+import { IS_ENERGY_MODE } from "../appMode.js";
 import { useEffect, useMemo, useState } from "react";
 import { buildRunConfigResultFromResolved, mergeDisplayConfig } from "../utils/runConfigDisplay.js";
 import {
@@ -51,6 +52,8 @@ function formatConfigLabel(fieldName) {
 }
 
 function formatEnumOptionLabel(fieldName, option) {
+  if (fieldName === "completion_bonus_mode") return option === "node_count" ? "Node count (B = N)" : "Fixed value";
+  if (fieldName === "spread_mode" && option === "energy") return "Energy";
   if (fieldName === "action_axis") {
     if (option === "broadcaster") return "Broadcaster";
     if (option === "receiver") return "Receiver";
@@ -107,7 +110,7 @@ function BackboneToggle({
 }) {
   return (
     <div className={`segmented-toggle${dense ? " segmented-toggle--dense" : ""}`}>
-      {options.map((o) => {
+      {options.filter(o => !IS_ENERGY_MODE || ["qbr", "greedy"].includes(o.id)).map((o) => {
         const meta = (algorithmOptions ?? []).find((item) => item.algorithm_id === o.id) ?? null;
         const disabled = isAlgorithmDisabledForNodeCount(o.id, nodeCount, meta);
         return (
@@ -171,6 +174,8 @@ const POLICY_AXIS_FIELDS = new Set(["policy_type", "action_axis"]);
 /** Logical groups for run-config fields (order preserved within each block). */
 const CONFIG_FIELD_BLOCKS = [
   { id: "training", title: "Training", fields: ["episodes"] },
+  { id: "energy_reward", title: "Energy reward", fields: ["reward_scale", "slot_cost", "completion_bonus_mode", "completion_bonus"] },
+  { id: "energy_costs", title: "Energy per slot · blank = topology default", fields: ["capacity", "tx_cost", "rx_cost"] },
   { id: "rl_core", title: "RL core", fields: ["alpha", "gamma"] },
   { id: "policy", title: "Policy & actions", fields: ["policy_type", "action_axis", "spread_mode"] },
   { id: "epsilon", title: "ε-greedy", fields: ["epsilon_start", "epsilon_end", "epsilon_decay"] },
@@ -226,7 +231,7 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
           : Boolean(currentValue);
     return (
       <label className="field-label inline-checkbox" key={fieldName}>
-        <span>{formatConfigLabel(fieldName)}</span>
+        <span>{IS_ENERGY_MODE ? (fieldSchema?.title ?? formatConfigLabel(fieldName)) : formatConfigLabel(fieldName)}</span>
         <input
           type="checkbox"
           checked={checkedValue}
@@ -253,7 +258,7 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
     if (useSegmentedToggle) {
       return (
         <label className="field-label" key={fieldName}>
-          {formatConfigLabel(fieldName)}
+          {IS_ENERGY_MODE ? (fieldSchema?.title ?? formatConfigLabel(fieldName)) : formatConfigLabel(fieldName)}
           <div className="segmented-toggle segmented-toggle--dense">
             {enumOptions.map((option) => {
               const optionValue = String(option);
@@ -295,7 +300,7 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
     }
     return (
       <label className="field-label" key={fieldName}>
-        {formatConfigLabel(fieldName)}
+        {IS_ENERGY_MODE ? (fieldSchema?.title ?? formatConfigLabel(fieldName)) : formatConfigLabel(fieldName)}
         <select
           value={currentEnumValue}
           onChange={(e) =>
@@ -320,7 +325,7 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
     const minAttr = minAllowedTxOverride != null ? minAllowedTxOverride : undefined;
     return (
       <label className="field-label" key={fieldName}>
-        {formatConfigLabel(fieldName)}
+        {IS_ENERGY_MODE ? (fieldSchema?.title ?? formatConfigLabel(fieldName)) : formatConfigLabel(fieldName)}
         <input
           type="number"
           min={minAttr}
@@ -345,14 +350,14 @@ function renderConfigField(fieldName, fieldSchema, runConfigForm, setRunConfigFo
   }
   return (
     <label className="field-label" key={fieldName}>
-      {formatConfigLabel(fieldName)}
+      {IS_ENERGY_MODE ? (fieldSchema?.title ?? formatConfigLabel(fieldName)) : formatConfigLabel(fieldName)}
       <input
         type={inputType}
         value={currentValue ?? ""}
         onChange={(e) =>
           setRunConfigForm((prev) => ({
             ...prev,
-            [fieldName]: normalizeFieldValue(e.target.value, resolvedType)
+            [fieldName]: e.target.value === "" && Array.isArray(rawType) && rawType.includes("null") ? null : normalizeFieldValue(e.target.value, resolvedType)
           }))
         }
       />
@@ -432,6 +437,7 @@ function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm, min
 
   const temperatureStartMode = String(runConfigForm?.temperature_start_mode ?? "manual");
   const visibleEntries = schemaEntries.filter(([fieldName]) => {
+    if (IS_ENERGY_MODE && fieldName === "completion_bonus" && runConfigForm?.completion_bonus_mode === "node_count") return false;
     if (fieldName === "temperature_start_mode" || fieldName === "temperature_start_multiplier") return false;
     if (fieldName === "temperature_start") return !(selectedPolicyType === "softmax" && temperatureStartMode === "node_count_multiplier");
     return true;
@@ -497,6 +503,8 @@ function DynamicConfigGrid({ schemaEntries, runConfigForm, setRunConfigForm, min
       {blocks.map((block) => (
         <section key={block.id} className={`config-field-block config-field-block--${block.id}`}>
           <h5 className="config-field-block__title">{block.title}</h5>
+          {block.id === "energy_reward" && <p className="muted">r = α × ΔN / (N − 1) − c + B × done<br />B = {runConfigForm?.completion_bonus_mode === "node_count" ? "N (including source)" : (runConfigForm?.completion_bonus ?? 10)} · α is receiver reward weight; learning rate is separate.</p>}
+          {IS_ENERGY_MODE && block.id === "training" && <p className="muted">100 slots / episode · source unlimited · sensors start at 0 E</p>}
           <div className="config-field-block__fields">
             {block.fields.map((fieldName) =>
               renderConfigField(fieldName, schemaByName[fieldName], runConfigForm, setRunConfigForm, fieldOptions)
@@ -2027,6 +2035,15 @@ function DetailPanel({
             <dd>{detail.tx_range}</dd>
             <dt>Seed</dt>
             <dd>{detail.seed ?? "-"}</dd>
+            {IS_ENERGY_MODE && detail.energy_defaults && <>
+              <dt>Harvest distribution</dt><dd>{detail.energy_defaults.distribution}</dd>
+              <dt>Harvest range (EU/slot)</dt><dd>{detail.energy_defaults.harvest_min} – {detail.energy_defaults.harvest_max}</dd>
+              {detail.energy_defaults.distribution === "triangular" && <><dt>Harvest peak (EU/slot)</dt><dd>{detail.energy_defaults.harvest_mode}</dd></>}
+              <dt>Default max energy (EU)</dt><dd>{detail.energy_defaults.capacity}</dd>
+              <dt>Default TX / RX cost (EU)</dt><dd>{detail.energy_defaults.tx_cost} / {detail.energy_defaults.rx_cost}</dd>
+              <dt>Initial sensor energy</dt><dd>0 EU</dd>
+              <dt>Source node 0</dt><dd>Unlimited energy</dd>
+            </>}
             <dt>Finished delay</dt>
             <dd>{detail.finished_delay ?? "-"}</dd>
             <dt>Lower bound</dt>
@@ -2092,12 +2109,28 @@ function clampLayoutValue(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function PlaygroundEnergySettings({ settings, onApply }) {
+  const [draft, setDraft] = useState(null);
+  useEffect(() => { setDraft(settings ? {capacity:settings.capacity, rx_cost:settings.rx_cost, tx_cost:settings.tx_cost} : null); }, [settings?.capacity, settings?.rx_cost, settings?.tx_cost]);
+  if (!draft) return null;
+  const valid = Object.values(draft).every(v => v !== "" && Number.isFinite(Number(v)) && Number(v)>0) && Number(draft.capacity)>=Math.max(Number(draft.rx_cost),Number(draft.tx_cost));
+  return <form className="playground-side-block" onSubmit={e => {e.preventDefault(); if(valid) onApply(Object.fromEntries(Object.entries(draft).map(([k,v])=>[k,Number(v)])));}}>
+    <h5>Energy configuration</h5>
+    {[["capacity","Max E (EU)"],["rx_cost","RX cost (EU)"],["tx_cost","TX cost (EU)"]].map(([key,label]) => <label className="field-label" key={key}>{label}<input type="number" min="0.000001" step="any" required value={draft[key]} onChange={e=>setDraft(prev=>({...prev,[key]:e.target.value}))} /></label>)}
+    {!valid && <p className="muted">Các giá trị phải dương; Max E phải đủ cho một lần TX hoặc RX.</p>}
+    <button type="submit" className="secondary-cta" disabled={!valid}>Apply &amp; reset</button>
+    <p className="muted">Áp dụng cho Playground và bắt đầu lại từ slot 0.</p>
+  </form>;
+}
+
 function PlaygroundPanel({
   selectedTopology,
   playgroundState,
   playgroundNextStateCount,
   setPlaygroundMode,
   setPlaygroundSpreadMode,
+  playgroundEnergySettings,
+  applyPlaygroundEnergy,
   setPlaygroundViewSlot,
   onReset,
   decisionTreeRowSpread,
@@ -2126,6 +2159,7 @@ function PlaygroundPanel({
           Reset
         </button>
       </div>
+      {IS_ENERGY_MODE && <PlaygroundEnergySettings settings={playgroundEnergySettings} onApply={applyPlaygroundEnergy} />}
       <div className="playground-side-block">
         <div className="playground-mode-switch">
           <button
@@ -2138,6 +2172,7 @@ function PlaygroundPanel({
           <button
             type="button"
             className={`tab-pill ${playgroundState?.mode === "receiver" ? "active" : ""}`}
+            disabled={IS_ENERGY_MODE}
             onClick={() => setPlaygroundMode("receiver")}
           >
             Receiver
@@ -2146,14 +2181,22 @@ function PlaygroundPanel({
         <div className="playground-mode-switch">
           <button
             type="button"
-            className={`tab-pill ${playgroundState?.spreadMode !== "la" ? "active" : ""}`}
+            className={`tab-pill ${(playgroundState?.spreadMode ?? "normal") === "normal" ? "active" : ""}`}
             onClick={() => setPlaygroundSpreadMode("normal")}
           >
             Spread: Normal
           </button>
+          {IS_ENERGY_MODE && <button
+            type="button"
+            className={`tab-pill ${playgroundState?.spreadMode === "energy" ? "active" : ""}`}
+            onClick={() => setPlaygroundSpreadMode("energy")}
+          >
+            Spread: Energy
+          </button>}
           <button
             type="button"
             className={`tab-pill ${playgroundState?.spreadMode === "la" ? "active" : ""}`}
+            disabled={IS_ENERGY_MODE}
             onClick={() => setPlaygroundSpreadMode("la")}
           >
             Spread: LA
@@ -2171,9 +2214,9 @@ function PlaygroundPanel({
           <dt>Covered nodes</dt>
           <dd>{totalCovered}</dd>
           <dt>Status</dt>
-          <dd>{playgroundState?.isComplete ? "Done" : isLatestView ? "Ready" : "History"}</dd>
-          <dt>Next unique states</dt>
-          <dd>{playgroundState?.isComplete ? 0 : isLatestView ? playgroundNextStateCount ?? 0 : "-"}</dd>
+          <dd>{playgroundState?.isComplete ? "Done" : playgroundState?.isTruncated ? "100-slot limit" : isLatestView ? "Ready" : "History"}</dd>
+          <dt>{IS_ENERGY_MODE ? "State tree" : "Next unique states"}</dt>
+          <dd>{IS_ENERGY_MODE ? "Disabled" : playgroundState?.isComplete ? 0 : isLatestView ? playgroundNextStateCount ?? 0 : "-"}</dd>
         </dl>
         {totalSlots > 0 ? (
           <label className="field-label">
@@ -2575,6 +2618,27 @@ function TopoStyleExportPanel({
         Adjust drawing style. Export keeps node colors, node ids, and transmission edges from the current Results view.
       </p>
 
+      {IS_ENERGY_MODE && (
+        <fieldset className="energy-generation-fields">
+          <legend>Harvest rate display</legend>
+          <div role="group" aria-label="Harvest rate display" className="energy-display-switch">
+            {[["normal", "Default"], ["battery", "Battery"], ["node", "Node color"]].map(([value, label]) => (
+              <button key={value} type="button" aria-pressed={settings.energy_mode === value} onClick={() => updateField("energy_mode", value)}>{label}</button>
+            ))}
+          </div>
+          {settings.energy_mode !== "normal" && <>
+            <div className="display-settings-grid">
+              {[ ["low", "Low rate color"], ["high", "High rate color"] ].map(([end, label]) => {
+                const field = `${settings.energy_mode === "battery" ? "battery" : "rate_node"}_${end}`;
+                return <label key={end} className="field-label">{label}<input type="color" value={settings[field]} onChange={e => updateField(field, e.target.value)} /></label>;
+              })}
+              {settings.energy_mode === "battery" && ["x", "y"].map(axis => <label key={axis} className="field-label">Battery offset {axis.toUpperCase()}<input type="number" min="-20" max="20" step="0.25" value={settings[`battery_offset_${axis}`]} onChange={e => updateField(`battery_offset_${axis}`, Number(e.target.value))} /></label>)}
+            </div>
+            <p className="muted">Harvest rate relative to the topology's original range. Source keeps its own color. Changes save automatically.</p>
+          </>}
+        </fieldset>
+      )}
+
       <div className="display-settings-grid">
         <label className="field-label">
           Node size
@@ -2806,6 +2870,7 @@ function EditTopologyPanel({
                 <th>ID</th>
                 <th>X</th>
                 <th>Y</th>
+                {IS_ENERGY_MODE && <th>Harvest<br />(EU/slot)</th>}
               </tr>
             </thead>
             <tbody>
@@ -2828,6 +2893,9 @@ function EditTopologyPanel({
                       onKeyDown={(e) => onNodeKeyDown(e, node.node_id, "y")}
                     />
                   </td>
+                  {IS_ENERGY_MODE && <td title={node.source_unlimited ? "Unlimited source energy" : String(node.harvest_rate)}>
+                    {node.source_unlimited ? "Unlimited" : Number(node.harvest_rate).toPrecision(6)}
+                  </td>}
                 </tr>
               ))}
             </tbody>
@@ -2987,6 +3055,8 @@ export default function RightControlPanel({
   updateUcbFontScale,
   setPlaygroundMode,
   setPlaygroundSpreadMode,
+  playgroundEnergySettings,
+  applyPlaygroundEnergy,
   setPlaygroundViewSlot,
   onResetPlayground,
   decisionTreeRowSpread,
@@ -3210,6 +3280,8 @@ export default function RightControlPanel({
               playgroundNextStateCount={playgroundNextStateCount}
               setPlaygroundMode={setPlaygroundMode}
               setPlaygroundSpreadMode={setPlaygroundSpreadMode}
+              playgroundEnergySettings={playgroundEnergySettings}
+              applyPlaygroundEnergy={applyPlaygroundEnergy}
               setPlaygroundViewSlot={setPlaygroundViewSlot}
               onReset={onResetPlayground}
               decisionTreeRowSpread={decisionTreeRowSpread}

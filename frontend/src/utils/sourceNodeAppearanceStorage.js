@@ -1,7 +1,8 @@
+import { modeStorage, IS_ENERGY_MODE } from "../appMode.js";
 export const SOURCE_NODE_APPEARANCE_STORAGE_KEY = "qbr.source-node-appearance";
 
-export const DEFAULT_SOURCE_NODE_COLOR = "#ec5bb8";
-export const DEFAULT_SOURCE_NODE_RADIUS = 1.6;
+export const DEFAULT_SOURCE_NODE_COLOR = IS_ENERGY_MODE ? "#ff0000" : "#ec5bb8";
+export const DEFAULT_SOURCE_NODE_RADIUS = IS_ENERGY_MODE ? 2.5 : 1.6;
 
 function clampNum(value, min, max, fallback) {
   const n = Number(value);
@@ -28,7 +29,7 @@ export function normalizeSourceNodeAppearance(input = {}) {
 
 export function readSourceNodeAppearance() {
   try {
-    const raw = localStorage.getItem(SOURCE_NODE_APPEARANCE_STORAGE_KEY);
+    const raw = modeStorage.getItem(SOURCE_NODE_APPEARANCE_STORAGE_KEY);
     if (!raw) return normalizeSourceNodeAppearance();
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return normalizeSourceNodeAppearance();
@@ -41,7 +42,7 @@ export function readSourceNodeAppearance() {
 export function writeSourceNodeAppearance(appearance) {
   const next = normalizeSourceNodeAppearance(appearance);
   try {
-    localStorage.setItem(SOURCE_NODE_APPEARANCE_STORAGE_KEY, JSON.stringify(next));
+    modeStorage.setItem(SOURCE_NODE_APPEARANCE_STORAGE_KEY, JSON.stringify(next));
   } catch {
     // ignore quota / private mode
   }

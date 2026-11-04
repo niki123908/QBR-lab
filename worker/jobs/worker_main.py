@@ -24,6 +24,7 @@ from app.repositories.run_repo import (
     requeue_stale_runs,
     run_is_owned_by_worker,
 )
+from app.services.energy_run_service import claim_energy_run, execute_energy_run
 from app.services.run_engine_service import execute_queued_batch_run, execute_queued_single_run
 
 
@@ -61,6 +62,11 @@ def run_worker_loop(stop_event: threading.Event | None = None, *, worker_id: str
 
             claimed = claim_next_queued_run(WORKER_ID, modes=("single", "batch"))
             if claimed is None:
+                energy_run_id = claim_energy_run(WORKER_ID)
+                if energy_run_id:
+                    print(f"[worker] claimed Energy run {energy_run_id}")
+                    execute_energy_run(energy_run_id, WORKER_ID)
+                    continue
                 if stop_event is None:
                     time.sleep(POLL_INTERVAL_SEC)
                 else:

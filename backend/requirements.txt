@@ -8,3 +8,5 @@ python-multipart
 python-dotenv
 psycopg[binary]
 numpy
+
+Pillow>=11.1.0
